@@ -1,1 +1,2255 @@
-# teste1
+-- Farm reconstruido sem bibliotecas externas de HUD.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local CoreGui = game:GetService("CoreGui")
+local player = Players.LocalPlayer
+
+if shared.__uiRootCleanup then pcall(shared.__uiRootCleanup) end
+
+local CONFIGS = {
+	[6174994284] = { name = "SavannahLife", farm = Vector3.new(-6245.2, 10, 4664.3), dangerY = -100 },
+	[18214855317] = { name = "SavannahLife", farm = Vector3.new(-6245.2, 10, 4664.3), dangerY = -100 },
+	[9237322219] = { name = "JungleLife", farm = Vector3.new(1166.8350830078125, 24.75099754333496, -358.32073974609375), dangerY = -100 },
+}
+local config = CONFIGS[game.GameId] or CONFIGS[18214855317]
+local isDinoLife = game.PlaceId == 75541741887441
+local DINO_DRINK_POSITION = Vector3.new(-552.27, 41.46, -520.35)
+local state = {
+	autoEat = false,
+	autoDrink = false,
+	escapeTerrain = false,
+	growExisting = false,
+	growNew = false,
+	farmCoins = false,
+	newSlotGender = "Female",
+	busy = false,
+	alive = true,
+}
+local connections = {}
+local renders
+local runtimeMessage = "Anti-AFK ativo"
+local completionSpawnParts = {}
+local selectedCompletionSpawn
+
+-- Inicia sozinho e simula uma entrada somente quando o Roblox detecta inatividade.
+table.insert(connections, player.Idled:Connect(function()
+	pcall(function()
+		VirtualUser:CaptureController()
+		local camera = workspace.CurrentCamera
+		VirtualUser:Button2Down(Vector2.zero, camera and camera.CFrame or CFrame.new())
+		task.wait(0.25)
+		VirtualUser:Button2Up(Vector2.zero, camera and camera.CFrame or CFrame.new())
+		runtimeMessage = "Anti-AFK acionado"
+	end)
+end))
+
+local function refreshCompletionSpawns()
+	completionSpawnParts = {}
+	local spawns = workspace:FindFirstChild("Spawns")
+	if spawns then
+		for _, object in ipairs(spawns:GetDescendants()) do
+			if object:IsA("BasePart") then table.insert(completionSpawnParts, object) end
+		end
+	end
+	table.sort(completionSpawnParts, function(a, b) return a:GetFullName() < b:GetFullName() end)
+	if selectedCompletionSpawn and not selectedCompletionSpawn.Parent then selectedCompletionSpawn = nil end
+end
+local function findAquaticNestRock()
+	-- No Dino Life, AquaticNestRock1/2 ficam na água e servem só de PASSAGEM
+	-- pra sair do void — não são o destino final.
+	local spawns = workspace:FindFirstChild("Spawns")
+	if not spawns then return nil end
+	for _, object in ipairs(spawns:GetDescendants()) do
+		if object:IsA("BasePart") and (object.Name == "AquaticNestRock1" or object.Name == "AquaticNestRock2") then
+			return object
+		end
+	end
+	return nil
+end
+
+local function findNestRock1()
+	-- Destino final em terra firme de verdade.
+	local spawns = workspace:FindFirstChild("Spawns")
+	if not spawns then return nil end
+	local part = spawns:FindFirstChild("NestRock1", true)
+	if part and part:IsA("BasePart") then return part end
+	return nil
+end
+
+-- CONFIGS não tem entrada pro GameId do Dino Life, então config.farm cai no
+-- fallback (coordenadas do Savannah) — completamente inválido nesse mapa.
+-- Essa função resolve um ponto seguro de verdade pra teleportes avulsos
+-- (não é a rotina de escape do void — essa é a escapeDinoToSafety abaixo).
+local function getSafeFarmPosition()
+	if isDinoLife then
+		local nestRock1 = findNestRock1()
+		if nestRock1 then return nestRock1.Position end
+		local aquatic = findAquaticNestRock()
+		if aquatic then return aquatic.Position end
+	end
+	return config.farm
+end
+
+local CARNIVORES = {
+	Lion=true, Tiger=true, Cheetah=true, Crocodile=true, Leopard=true, Hyena=true, WildDog=true,
+	-- Dino Life
+	TRex=true, ["T-Rex"]=true, Rex=true, Raptor=true, Velociraptor=true, Spinosaurus=true,
+	Allosaurus=true, Carnotaurus=true, Baryonyx=true, Giganotosaurus=true, Utahraptor=true,
+	Deinonychus=true, Dilophosaurus=true, Compsognathus=true, Megalosaurus=true, Ceratosaurus=true,
+}
+local CARNIVORE_NAMES_LOWER = {}
+for name in pairs(CARNIVORES) do CARNIVORE_NAMES_LOWER[name:lower()] = true end
+
+-- Hippo e Crocodile bebem em água funda sem chão embaixo (a barreira normal
+-- só trava X/Z, nunca a profundidade) — sem isso eles afundam pra sempre.
+local AQUATIC_ANIMALS = { hippo = true, crocodile = true }
+
+-- Comparação case-insensitive + fallback pelo atributo AnimalType (ex:
+-- "Carnivore"), que é mais confiável do que só bater o nome exato — o
+-- Crocodile não estava sendo reconhecido e ia procurar grama por causa disso.
+local function isCarnivoreCharacter(character)
+	if not character then return false end
+	local animal = character:GetAttribute("AnimalName")
+	if type(animal) == "string" and CARNIVORE_NAMES_LOWER[animal:lower()] then return true end
+	local animalType = character:GetAttribute("AnimalType")
+	if type(animalType) == "string" and animalType:lower():find("carn", 1, true) then return true end
+	return false
+end
+local AskSubState = ReplicatedStorage:FindFirstChild("AskServerToSetSubStateRemoteFunction")
+local SpawnRemote = ReplicatedStorage:WaitForChild("SpawnAsCharacterRemoteFunction", 15)
+local ResetRemote = ReplicatedStorage:WaitForChild("CustomCharacterResetRemoteFunction", 15)
+local CreateRemote = ReplicatedStorage:WaitForChild("CreateNewCharacterRemoteFunction", 15)
+local CarcassRemote = ReplicatedStorage:FindFirstChild("StartEatingCarcassesRemotEvent")
+if not CarcassRemote then
+	for _, object in ipairs(ReplicatedStorage:GetDescendants()) do
+		if (object:IsA("RemoteEvent") or object:IsA("RemoteFunction"))
+			and object.Name:lower():find("carcass") then
+			CarcassRemote = object
+			break
+		end
+	end
+end
+local GameUtils, AnimalConfig
+pcall(function()
+	GameUtils = require(ReplicatedStorage:WaitForChild("AnimalGameFrameworkShared"):WaitForChild("Utils"))
+	AnimalConfig = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("AnimalConfig"))
+end)
+local blockClientSubState = false
+local originalNamecall
+if AskSubState and type(hookmetamethod) == "function" and type(checkcaller) == "function" then
+	pcall(function()
+		originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+			if blockClientSubState and self == AskSubState and not checkcaller() then
+				return true
+			end
+			return originalNamecall(self, ...)
+		end)
+	end)
+end
+
+local function characterParts()
+	local character = player.Character
+	return character,
+		character and character:FindFirstChild("HumanoidRootPart"),
+		character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function setSubState(name)
+	if AskSubState then
+		blockClientSubState = true
+		pcall(AskSubState.InvokeServer, AskSubState, name)
+	end
+end
+
+-- Teleporte ragdoll com retry e confirmação de distância (baseado no confirmedTP do script 1)
+local TP_TOLERANCE = 18
+local lastRagdollTeleportAt = 0
+local function ragdollTeleport(position, maxAttempts, faceTowards)
+	maxAttempts = maxAttempts or 8
+	if state.busy then
+		-- Se state.busy ficou travado por mais de 8s (uma tentativa anterior
+		-- travou/errou sem liberar), autodestrava — senão o script nunca
+		-- mais consegue teleportar sozinho, mesmo clicando manualmente ele
+		-- funcionaria (o clique também passa por essa mesma trava).
+		if tick() - lastRagdollTeleportAt > 8 then
+			state.busy = false
+		else
+			return false
+		end
+	end
+	state.busy = true
+	lastRagdollTeleportAt = tick()
+	local character, root, humanoid = characterParts()
+	if not character or not root or not humanoid then state.busy = false return false end
+
+	local confirmed = false
+	for attempt = 1, maxAttempts do
+		root.Anchored = false
+		humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+		for _ = 1, 60 do
+			if not character.Parent or not root.Parent then break end
+			character:PivotTo(CFrame.new(position + Vector3.new(0, 3, 0)))
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			task.wait()
+		end
+		task.wait(0.3)
+		lastRagdollTeleportAt = tick()
+
+		-- Vira o animal de frente pro alvo (ex: carcaça) antes de levantar.
+		-- Sem isso, animais grandes (Rex) caem em cima do alvo virados pro lado
+		-- errado e o jogo não detecta proximidade/foco corretamente.
+		if faceTowards and root.Parent then
+			local flatDirection = Vector3.new(faceTowards.X - root.Position.X, 0, faceTowards.Z - root.Position.Z)
+			if flatDirection.Magnitude > 0.5 then
+				character:PivotTo(CFrame.lookAt(root.Position, root.Position + flatDirection.Unit))
+			end
+		end
+
+		if humanoid.Parent then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
+		for _ = 1, 6 do
+			if not character.Parent then break end
+			character:SetAttribute("MovementDisabled", false)
+			task.wait(0.1)
+		end
+
+		local dist = root.Parent and (root.Position - position).Magnitude or math.huge
+		if dist <= TP_TOLERANCE then
+			confirmed = true
+			break
+		end
+	end
+
+	state.busy = false
+	return confirmed
+end
+
+local terrainParams = RaycastParams.new()
+terrainParams.FilterType = Enum.RaycastFilterType.Include
+terrainParams.FilterDescendantsInstances = { workspace.Terrain }
+terrainParams.IgnoreWater = false
+local failedGrassAreas = {}
+
+local function rememberFailedGrass(position)
+	if not position then return end
+	for _, area in ipairs(failedGrassAreas) do
+		if (area.position - position).Magnitude <= 50 then
+			area.expiresAt = tick() + 300
+			return
+		end
+	end
+	table.insert(failedGrassAreas, { position = position, expiresAt = tick() + 300 })
+end
+
+local function grassAreaRecentlyFailed(position)
+	local now = tick()
+	for index = #failedGrassAreas, 1, -1 do
+		local area = failedGrassAreas[index]
+		if now >= area.expiresAt then
+			table.remove(failedGrassAreas, index)
+		elseif (area.position - position).Magnitude <= 50 then
+			return true
+		end
+	end
+	return false
+end
+
+local function findMaterial(origin, material, maximumRadius)
+	for radius = 8, maximumRadius, 8 do
+		for index = 0, 15 do
+			local angle = index / 16 * math.pi * 2
+			local probe = origin + Vector3.new(math.cos(angle) * radius, 90, math.sin(angle) * radius)
+			local hit = workspace:Raycast(probe, Vector3.new(0, -190, 0), terrainParams)
+			if hit and hit.Material == material then return hit.Position end
+		end
+	end
+end
+
+local function grassIsAwayFromOtherPlayers(position, minimumDistance)
+	minimumDistance = minimumDistance or 35
+	for _, otherPlayer in ipairs(Players:GetPlayers()) do
+		if otherPlayer ~= player then
+			local otherCharacter = otherPlayer.Character
+			local otherRoot = otherCharacter and otherCharacter:FindFirstChild("HumanoidRootPart")
+			local otherHumanoid = otherCharacter and otherCharacter:FindFirstChildOfClass("Humanoid")
+			if otherRoot and (not otherHumanoid or otherHumanoid.Health > 0) then
+				local horizontalDistance = (Vector3.new(position.X, 0, position.Z)
+					- Vector3.new(otherRoot.Position.X, 0, otherRoot.Position.Z)).Magnitude
+				if horizontalDistance < minimumDistance then return false end
+			end
+		end
+	end
+	return true
+end
+
+local function findNearestGrass(origin)
+	for _, radius in ipairs({ 6, 12, 24, 48 }) do
+		for index = 0, 3 do
+			local angle = index / 4 * math.pi * 2
+			local probe = origin + Vector3.new(math.cos(angle) * radius, 40, math.sin(angle) * radius)
+			local hit = workspace:Raycast(probe, Vector3.new(0, -80, 0), terrainParams)
+			if hit and hit.Material == Enum.Material.Grass then return hit.Position end
+		end
+	end
+end
+
+local function findDistantGrass(origin)
+	local angleOffset = (player.UserId % 360) * math.pi / 180
+	for radius = 96, 576, 32 do
+		for index = 0, 15 do
+			local angle = angleOffset + index / 16 * math.pi * 2
+			local probe = origin + Vector3.new(math.cos(angle) * radius, 90, math.sin(angle) * radius)
+			local hit = workspace:Raycast(probe, Vector3.new(0, -180, 0), terrainParams)
+			if hit and hit.Material == Enum.Material.Grass then return hit.Position end
+		end
+	end
+end
+
+local function moveToGrass(grassPosition)
+	if state.busy then return false end
+	state.busy = true
+	local character, root, humanoid = characterParts()
+	if not character or not root or not humanoid then state.busy = false return false end
+	local height = math.max(humanoid.HipHeight, 1.5)
+	local goalPosition = grassPosition + Vector3.new(0, height, 0)
+	local direction = goalPosition - root.Position
+	if direction.Magnitude > 1 then goalPosition = goalPosition - direction.Unit end
+	local startCFrame = root.CFrame
+	local flatDirection = Vector3.new(direction.X, 0, direction.Z)
+	if flatDirection.Magnitude < 0.01 then flatDirection = root.CFrame.LookVector end
+	local goalCFrame = CFrame.lookAt(goalPosition, goalPosition + flatDirection)
+	local duration = math.clamp((goalPosition - root.Position).Magnitude / 55, 0.15, 8)
+	local startedAt = tick()
+	while state.alive and character.Parent and root.Parent do
+		local alpha = math.clamp((tick() - startedAt) / duration, 0, 1)
+		root.CFrame = startCFrame:Lerp(goalCFrame, alpha)
+		root.AssemblyLinearVelocity = Vector3.zero
+		if alpha >= 1 then break end
+		RunService.Heartbeat:Wait()
+	end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	state.busy = false
+	return (root.Position - goalPosition).Magnitude <= 12
+end
+
+local ignoredCarcasses = {} -- [carcaça] = tick() em que o bloqueio expira
+
+local function ignoreCarcass(carcass, seconds)
+	if not carcass then return end
+	ignoredCarcasses[carcass] = tick() + (seconds or 120)
+end
+
+local function carcassIsIgnored(carcass)
+	local expiresAt = ignoredCarcasses[carcass]
+	if not expiresAt then return false end
+	if tick() >= expiresAt then
+		ignoredCarcasses[carcass] = nil
+		return false
+	end
+	return true
+end
+
+local function isPositionUnderwater(position)
+	-- Raycasta de cima pra baixo no ponto exato E em 4 pontos ao redor
+	-- (pega carcaça na beiradinha da água, não só afundada).
+	local offsets = {
+		Vector3.new(0, 0, 0),
+		Vector3.new(6, 0, 0), Vector3.new(-6, 0, 0),
+		Vector3.new(0, 0, 6), Vector3.new(0, 0, -6),
+	}
+	for _, offset in ipairs(offsets) do
+		local hit = workspace:Raycast(position + offset + Vector3.new(0, 12, 0), Vector3.new(0, -24, 0), terrainParams)
+		if hit and hit.Material == Enum.Material.Water then return true end
+	end
+	return false
+end
+
+local function detectAvailableFood(character)
+	if not GameUtils or not AnimalConfig or not character:FindFirstChild("Head") then return nil end
+	local animalType = character:GetAttribute("AnimalType")
+	local animalName = character:GetAttribute("AnimalName")
+	local configForAnimal = animalType and animalName and AnimalConfig[animalType] and AnimalConfig[animalType][animalName]
+	if not configForAnimal then return nil end
+	local ok, result = pcall(GameUtils.CanEatDrink.DetectMeatGrassWater, character, configForAnimal)
+	return ok and result or nil
+end
+
+local function nearestCarcass(root)
+	local best, bestRoot, distance = nil, nil, math.huge
+
+	local function consider(object, part)
+		if carcassIsIgnored(object) then return end
+		if isPositionUnderwater(part.Position) then
+			ignoreCarcass(object, 180)
+			return
+		end
+		local current = (part.Position - root.Position).Magnitude
+		if current < distance then best, bestRoot, distance = object, part, current end
+	end
+
+	local function scan(container)
+		for _, object in ipairs(container:GetDescendants()) do
+			if object:IsA("Model") then
+				local part = object:FindFirstChild("HumanoidRootPart") or object:FindFirstChildWhichIsA("BasePart", true)
+				if part then consider(object, part) end
+			end
+		end
+	end
+
+	local storage = workspace:FindFirstChild("CarcassesStorageModel")
+	if storage then scan(storage) end
+
+	-- Fallback: Dino Life (ou qualquer jogo) pode guardar as carcacas em outro lugar/nome
+	if not best then
+		for _, object in ipairs(workspace:GetDescendants()) do
+			if object:IsA("Model")
+				and object.Parent ~= storage
+				and (object.Name:lower():find("carcass") or object.Name:lower():find("dead") or object.Name:lower():find("carcaca")) then
+				local part = object:FindFirstChild("HumanoidRootPart") or object:FindFirstChildWhichIsA("BasePart", true)
+				if part then consider(object, part) end
+			end
+		end
+	end
+
+	return best, bestRoot
+end
+
+local RAGDOLL_STATES = {
+	[Enum.HumanoidStateType.Physics] = true,
+	[Enum.HumanoidStateType.FallingDown] = true,
+	[Enum.HumanoidStateType.Ragdoll] = true,
+	[Enum.HumanoidStateType.Freefall] = true,
+	[Enum.HumanoidStateType.GettingUp] = true,
+}
+
+local carcassEatBusy = false
+local function approachCarcass(carcassRoot, distance)
+	local character, root = characterParts()
+	if not character or not root then return false end
+	local approachDirection = Vector3.new(root.Position.X - carcassRoot.Position.X, 0, root.Position.Z - carcassRoot.Position.Z)
+	if approachDirection.Magnitude < 0.5 then
+		approachDirection = root.CFrame.LookVector * -1
+	end
+	approachDirection = approachDirection.Unit
+	local standTarget = carcassRoot.Position + approachDirection * distance
+	return ragdollTeleport(standTarget, 3, carcassRoot.Position)
+end
+
+local function eatCarcass(carcass, carcassRoot)
+	if carcassEatBusy or not carcass or not carcassRoot then return end
+	local character, root, humanoid = characterParts()
+	if not character or not root or not humanoid then return end
+	carcassEatBusy = true
+	activeCarcass = carcass
+
+	-- Não pousa em cima da carcaça (carcaça pequena some embaixo de um
+	-- animal grande), mas também não pode ficar longe demais — se passar
+	-- do alcance de detecção do jogo, o botão "Eat" nem aparece.
+	-- Começa perto (5 studs) e só se afasta um pouco se precisar.
+	local standoffDistance = 5
+
+	if (root.Position - carcassRoot.Position).Magnitude > 12 then
+		approachCarcass(carcassRoot, standoffDistance)
+		task.wait(0.2)
+	end
+
+	character, root, humanoid = characterParts()
+	if not character or not root or not humanoid then carcassEatBusy = false return end
+
+	-- Se autoEat foi desligado nesse meio tempo (ex: o script está saindo
+	-- da água por causa do autoDrink), aborta e não segura a posição —
+	-- senão essa rotina briga com o teleporte de saída da água.
+	if not state.autoEat then
+		carcassEatBusy = false
+		return
+	end
+
+	-- Se mesmo depois do teleporte o animal ficou nadando, a carcaça está
+	-- na água (ou embaixo dela) e essa detecção de "underwater" pode ter
+	-- falhado antes (ex: correnteza moveu a carcaça). Ignora e desiste.
+	if humanoid:GetState() == Enum.HumanoidStateType.Swimming then
+		runtimeMessage = "Carcaça na água; ignorando e procurando outra"
+		ignoreCarcass(carcass, 180)
+		if activeCarcass == carcass then activeCarcass = nil end
+		carcassEatBusy = false
+		return
+	end
+
+	-- Se o botão "Eat" não apareceu, tenta uma vez bem mais perto (2 studs)
+	-- antes de desistir — a distância padrão pode ter ficado longe demais
+	-- dependendo do alcance de detecção específico desse jogo.
+	if detectAvailableFood(character) ~= "Eat" then
+		approachCarcass(carcassRoot, 2)
+		task.wait(0.2)
+		character, root, humanoid = characterParts()
+		if not character or not root or not humanoid then carcassEatBusy = false return end
+	end
+
+	-- Não ancora (isso pode travar animação/física e conflitar com o servidor).
+	-- Em vez disso segura a posição perto da carcaça zerando a velocidade e
+	-- corrigindo se o animal escorregar, igual à barreira de natação.
+	local holdPosition = root.Position
+
+	setSubState("Eating")
+	if CarcassRemote then pcall(CarcassRemote.FireServer, CarcassRemote, carcass) end
+	runtimeMessage = "Comendo carcaça"
+
+	local startFood = character:GetAttribute("Food") or 0
+	local foodEverRose = false
+	local deadline = tick() + 6
+	while tick() < deadline do
+		task.wait(0.3)
+		character, root, humanoid = characterParts()
+		if not character or not root or not humanoid then break end
+		if not carcass.Parent then break end -- carcaça sumiu (foi consumida)
+
+		-- Autodrink pode ter assumido o controle pra sair da água — solta
+		-- imediatamente pra não brigar com o teleporte.
+		if not state.autoEat then
+			runtimeMessage = "Comer pausado (outra rotina assumiu)"
+			break
+		end
+
+		-- Caiu na água durante o ciclo (ex: maré/correnteza): aborta e ignora.
+		if humanoid:GetState() == Enum.HumanoidStateType.Swimming then
+			runtimeMessage = "Carcaça na água; ignorando e procurando outra"
+			ignoreCarcass(carcass, 180)
+			if activeCarcass == carcass then activeCarcass = nil end
+			break
+		end
+
+		-- Se o jogo está oferecendo "Drink" em vez de "Eat" aqui, é sinal
+		-- de que a carcaça está na beiradinha da água. Troca de carcaça.
+		if detectAvailableFood(character) == "Drink" then
+			runtimeMessage = "Carcaça na beira da água (oferecendo beber); trocando"
+			ignoreCarcass(carcass, 180)
+			if activeCarcass == carcass then activeCarcass = nil end
+			break
+		end
+
+		local curFood = character:GetAttribute("Food") or 0
+		if curFood > startFood then
+			startFood = curFood
+			foodEverRose = true
+			deadline = tick() + 4 -- ainda subindo, estende o prazo
+		end
+		if curFood >= (preSwitchFoodTarget or 92) then break end
+
+		root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+		if (root.Position - holdPosition).Magnitude > 6 then
+			root.CFrame = CFrame.new(holdPosition) * root.CFrame.Rotation
+		end
+
+		if RAGDOLL_STATES[humanoid:GetState()] then
+			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		end
+
+		if CarcassRemote then pcall(CarcassRemote.FireServer, CarcassRemote, carcass) end
+		setSubState("Eating")
+	end
+
+	character, root = characterParts()
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	-- Watchdog: se passou o tempo todo tentando e a comida nunca subiu nem
+	-- um pouco, essa carcaça não é comível daqui (posição ruim, presa em
+	-- algo, etc). Ignora por um tempo pra não ficar insistindo pra sempre.
+	if not foodEverRose and carcass.Parent then
+		runtimeMessage = "Não consegui comer essa carcaça; ignorando e trocando"
+		ignoreCarcass(carcass, 90)
+	end
+
+	if not carcass.Parent then activeCarcass = nil end
+	if activeCarcass == carcass and not foodEverRose then activeCarcass = nil end
+	carcassEatBusy = false
+end
+local drinkingToFull = false
+local eatingToFull = false
+-- Quando definidos (por growthStep, antes de trocar de slot), sobrescrevem
+-- os tetos normais de "já tá bom" (92% comida / 98% água) para forçar
+-- encher de verdade até perto de 100%, dando uma margem de segurança.
+local preSwitchFoodTarget = nil
+local preSwitchWaterTarget = nil
+-- Fica true enquanto forcePostDrinkTeleport ou ensureOnSolidGround estão
+-- ativamente controlando o personagem (saindo da água/void). Enquanto isso,
+-- nenhuma outra rotina (comer, beber, trocar de slot) pode mexer no
+-- personagem — senão ficam brigando pra teleportar pra lugares diferentes
+-- ao mesmo tempo (foi isso que matou um Rex no Dino Life).
+local criticalRecoveryActive = false
+local eatingSourcePosition
+local eatingTargetReachedAt
+local activeCarcass
+local drinkingSourcePosition
+local swimBarrier
+local swimAnchorPosition
+local ignoredGrassPosition
+local ignoredGrassUntil = 0
+local lastObservedFood
+local lastFoodIncreaseAt = tick()
+local nextEmergencyGrassCheck = 0
+
+local function resetEatingSearch(food)
+	eatingSourcePosition = nil
+	eatingTargetReachedAt = nil
+	ignoredGrassPosition = nil
+	ignoredGrassUntil = 0
+	lastObservedFood = food
+	lastFoodIncreaseAt = tick()
+end
+
+local function removeSwimBarrier()
+	if swimBarrier then swimBarrier:Destroy(); swimBarrier = nil end
+	swimAnchorPosition = nil
+end
+
+local function updateSwimBarrier(root, resetAnchor)
+	if not swimBarrier then
+		swimBarrier = Instance.new("Folder")
+		swimBarrier.Name = "FarmLocalSwimBarrier"
+		swimBarrier.Parent = workspace
+		for index = 1, 4 do
+			local wall = Instance.new("Part")
+			wall.Name = "Wall" .. index
+			wall.Anchored = true
+			wall.CanCollide = true
+			wall.CanTouch = false
+			wall.CanQuery = false
+			wall.Transparency = 1
+			wall.Parent = swimBarrier
+		end
+	end
+	if resetAnchor or not swimAnchorPosition then swimAnchorPosition = root.Position end
+	local center = Vector3.new(swimAnchorPosition.X, root.Position.Y, swimAnchorPosition.Z)
+	local walls = swimBarrier:GetChildren()
+	if #walls >= 4 then
+		walls[1].Size, walls[1].CFrame = Vector3.new(16,18,2), CFrame.new(center + Vector3.new(0,0,7))
+		walls[2].Size, walls[2].CFrame = Vector3.new(16,18,2), CFrame.new(center + Vector3.new(0,0,-7))
+		walls[3].Size, walls[3].CFrame = Vector3.new(2,18,16), CFrame.new(center + Vector3.new(7,0,0))
+		walls[4].Size, walls[4].CFrame = Vector3.new(2,18,16), CFrame.new(center + Vector3.new(-7,0,0))
+	end
+end
+
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local eatingStuckSince
+local lastEatWatchdogFood
+
+local function virtualEatKick()
+	local character, root = characterParts()
+	if not character or not root then return end
+
+	local animal = character:GetAttribute("AnimalName") or ""
+	if isCarnivoreCharacter(character) then
+		runtimeMessage = "Comer sumiu (carnivoro); refazendo teleporte na carcaça"
+		activeCarcass = nil -- força procurar carcaça de novo, pode ter sido consumida/sumido
+		local carcass, carcassRoot = nearestCarcass(root)
+		if carcass and carcassRoot and not carcassEatBusy then
+			task.spawn(eatCarcass, carcass, carcassRoot)
+		elseif not carcass then
+			runtimeMessage = "Comer sumiu (carnivoro); nenhuma carcaça encontrada por perto"
+		end
+
+		eatingStuckSince = nil
+		return
+	end
+
+	runtimeMessage = "Comer sumiu; forcando na grama com tecla E"
+
+	local grass = findNearestGrass(root.Position) or findDistantGrass(root.Position)
+	if grass then moveToGrass(grass) end
+	task.wait(0.2)
+
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+		task.wait(0.05)
+		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+	end)
+	task.wait(0.2)
+
+	state.autoEat = false
+	if renders and renders.autoEat then renders.autoEat() end
+	task.wait(0.3)
+	state.autoEat = true
+	if renders and renders.autoEat then renders.autoEat() end
+
+	setSubState("Eating")
+	eatingStuckSince = nil
+end
+
+local function autoEatStep()
+	if not state.autoEat or state.busy or drinkingToFull or criticalRecoveryActive then return end
+	local character, root = characterParts()
+	if not character or not root then return end
+	if carcassEatBusy then return end
+	local food = character:GetAttribute("Food") or 100
+	local foodCap = preSwitchFoodTarget or 92
+	if food >= foodCap then
+		eatingToFull = false
+		resetEatingSearch(food)
+		activeCarcass = nil
+		eatingStuckSince = nil
+		return
+	end
+	eatingToFull = true
+
+	if lastEatWatchdogFood == nil or food > lastEatWatchdogFood then
+		lastEatWatchdogFood = food
+		eatingStuckSince = tick()
+	elseif not eatingStuckSince then
+		eatingStuckSince = tick()
+	end
+	if eatingStuckSince and tick() - eatingStuckSince >= 15 then
+		lastEatWatchdogFood = food
+		eatingStuckSince = tick()
+		virtualEatKick()
+		return
+	end
+	local animal = character:GetAttribute("AnimalName") or ""
+	if isCarnivoreCharacter(character) then
+		if carcassEatBusy then return end
+		local carcass = activeCarcass
+		local carcassRoot = carcass and (carcass:FindFirstChild("HumanoidRootPart") or carcass:FindFirstChildWhichIsA("BasePart", true))
+		if not carcassRoot then carcass, carcassRoot = nearestCarcass(root) end
+		if carcass and carcassRoot then
+			task.spawn(eatCarcass, carcass, carcassRoot)
+		else
+			runtimeMessage = "Carnivoro sem carcaça por perto"
+		end
+		return
+	end
+
+	if food <= 55 and tick() >= nextEmergencyGrassCheck then
+		nextEmergencyGrassCheck = tick() + 120
+		local distantGrass = findDistantGrass(root.Position)
+		if distantGrass then
+			runtimeMessage = "Fome critica; teleportando para outra area com grama"
+			resetEatingSearch(food)
+			ragdollTeleport(distantGrass)
+			task.wait(0.4)
+			return
+		else
+			runtimeMessage = "Fome critica; nenhuma area distante encontrada"
+		end
+	end
+
+	if detectAvailableFood(character) == "Eat" then
+		eatingSourcePosition = root.Position
+		eatingTargetReachedAt = tick()
+		runtimeMessage = "Comendo a grama proxima"
+		setSubState("Eating")
+		return
+	end
+
+	if eatingSourcePosition and eatingTargetReachedAt
+		and (root.Position - eatingSourcePosition).Magnitude <= 10
+		and tick() - eatingTargetReachedAt < 5 then
+		runtimeMessage = "Tentando comer na grama atual"
+		setSubState("Eating")
+		return
+	end
+
+	local grass = findNearestGrass(root.Position)
+	if not grass then
+		runtimeMessage = "Nenhuma grama detectada por perto"
+		return
+	end
+	runtimeMessage = "Indo para uma grama proxima"
+	moveToGrass(grass)
+	task.wait(0.2)
+	eatingSourcePosition = grass
+	eatingTargetReachedAt = tick()
+	local detectedAfterMove = detectAvailableFood(character)
+	if detectedAfterMove == "Eat" or not GameUtils or not AnimalConfig then setSubState("Eating") end
+end
+
+local function isPositionInWaterTerrain(position)
+	-- Lê o material do terreno exatamente na posição (voxel), em vez de
+	-- confiar só num raycast fino que pode "passar batido" se o personagem
+	-- estiver afundado ou o terreno abaixo não for o mesmo voxel da água.
+	local ok, materials = pcall(function()
+		local region = Region3.new(position - Vector3.new(2, 2, 2), position + Vector3.new(2, 2, 2)):ExpandToGrid(4)
+		local m = workspace.Terrain:ReadVoxels(region, 4)
+		return m
+	end)
+	if not ok or not materials then return false end
+	local material = materials[1] and materials[1][1] and materials[1][1][1]
+	return material == Enum.Material.Water
+end
+
+local function isStandingInWater(root)
+	if not root then return false end
+	if isPositionInWaterTerrain(root.Position) then return true end
+	local hit = workspace:Raycast(root.Position + Vector3.new(0, 1, 0), Vector3.new(0, -3, 0), terrainParams)
+	if hit and hit.Material == Enum.Material.Water then return true end
+	local _, _, humanoid = characterParts()
+	return humanoid ~= nil and humanoid:GetState() == Enum.HumanoidStateType.Swimming
+end
+
+local forcingPostDrinkTeleport = false
+
+local function ensureOnSolidGround(targetPosition, label)
+	label = label or "solo seguro"
+	criticalRecoveryActive = true
+
+	-- Desliga comer/beber durante TODA a tentativa de sair do void/água —
+	-- essas rotinas ficam mexendo na posição e brigam com o teleporte,
+	-- fazendo o personagem cair de novo.
+	state.autoEat, state.autoDrink = false, false
+	if renders then
+		if renders.autoEat then renders.autoEat() end
+		if renders.autoDrink then renders.autoDrink() end
+	end
+
+	local totalAttempts = 14
+	for attempt = 1, totalAttempts do
+		ragdollTeleport(targetPosition, 8)
+		task.wait(0.3)
+
+		local character, root = characterParts()
+		if character and root then
+			local inVoid = root.Position.Y < config.dangerY
+			local inWater = isStandingInWater(root)
+			if not inVoid and not inWater then
+				runtimeMessage = "Confirmado em " .. label
+				criticalRecoveryActive = false
+				return true
+			end
+			runtimeMessage = string.format(
+				"Ainda preso (void:%s agua:%s); tentando de novo (%d/%d)",
+				tostring(inVoid), tostring(inWater), attempt, totalAttempts
+			)
+		end
+		task.wait(0.2)
+	end
+
+	runtimeMessage = "Não consegui confirmar saída do void/água após várias tentativas"
+	criticalRecoveryActive = false
+	return false
+end
+
+-- No Dino Life os AquaticNestRock1/2 ficam na água e são só uma PASSAGEM
+-- pra sair do void — não são o destino final. Fluxo correto: 1) teleporta
+-- pro Aquatic mais próximo e CONFIRMA que saiu do void, 2) só então
+-- teleporta pro NestRock1 (destino final, em terra firme de verdade).
+local function escapeDinoToSafety(label)
+	label = label or "solo seguro"
+
+	local aquatic = findAquaticNestRock()
+	if aquatic then
+		ensureOnSolidGround(aquatic.Position, "AquaticNestRock (saindo do void)")
+	end
+
+	local nestRock1 = findNestRock1()
+	if nestRock1 then
+		return ensureOnSolidGround(nestRock1.Position, "NestRock1")
+	end
+
+	-- Sem NestRock1 no mapa: pelo menos já confirmamos saída do void via Aquatic.
+	if not aquatic then
+		runtimeMessage = "Nem AquaticNestRock nem NestRock1 encontrados"
+	end
+	return aquatic ~= nil
+end
+
+local function forcePostDrinkTeleport()
+	if forcingPostDrinkTeleport then return end
+	forcingPostDrinkTeleport = true
+	runtimeMessage = "Agua cheia; teleportando para sair da agua"
+
+	if isDinoLife then
+		local waterPart = workspace:FindFirstChild("MainWaterPart")
+		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
+		escapeDinoToSafety("saindo da água")
+	else
+		local ok = pcall(function()
+			refreshCompletionSpawns()
+			local candidates = {}
+			if selectedCompletionSpawn and selectedCompletionSpawn.Parent then
+				table.insert(candidates, selectedCompletionSpawn.Position)
+			end
+			for _, part in ipairs(completionSpawnParts) do table.insert(candidates, part.Position) end
+			table.insert(candidates, config.farm)
+
+			local succeeded = false
+			for _, position in ipairs(candidates) do
+				if ensureOnSolidGround(position, "ponto de saída da água") then
+					succeeded = true
+					break
+				end
+			end
+			if not succeeded then
+				runtimeMessage = "Nao foi possivel sair da agua; tentando novamente no proximo ciclo"
+			end
+		end)
+		if not ok then runtimeMessage = "Falha ao sair da agua; retomando mesmo assim" end
+	end
+
+	resetEatingSearch(nil)
+	drinkingSourcePosition = nil
+	state.autoEat, state.autoDrink = true, true
+	if renders then
+		if renders.autoEat then renders.autoEat() end
+		if renders.autoDrink then renders.autoDrink() end
+	end
+	forcingPostDrinkTeleport = false
+end
+
+local drinkingStuckSince
+-- Segura a posição com alta frequência enquanto bebe no Dino Life. O
+-- autoDrinkStep só roda 1x/segundo — frequência baixa demais pra evitar o
+-- jitter físico de ficar em pé numa água com CanCollide=true (que estava
+-- causando dano de queda). Essa rotina corrige a cada 0.25s até encher.
+local dinoDrinkHoldBusy = false
+local function holdDinoDrinkPosition(targetPosition)
+	if dinoDrinkHoldBusy then return end
+	dinoDrinkHoldBusy = true
+	while drinkingToFull and state.autoDrink and not criticalRecoveryActive do
+		local character, root, humanoid = characterParts()
+		if not character or not root or not humanoid then break end
+		local water = character:GetAttribute("Water") or 100
+		if water >= (preSwitchWaterTarget or 98) then break end
+		if (root.Position - targetPosition).Magnitude > 24 then break end -- afastou demais, deixa o autoDrinkStep reagir de novo
+
+		local velocity = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(0, math.clamp(velocity.Y, -1, 1), 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+		if (root.Position - targetPosition).Magnitude > 8 then
+			root.CFrame = CFrame.new(targetPosition) * root.CFrame.Rotation
+		end
+		setSubState("Drinking")
+		task.wait(0.25)
+	end
+	dinoDrinkHoldBusy = false
+end
+local lastDrinkWatchdogWater
+
+local function virtualDrinkKick()
+	local character, root = characterParts()
+	if not character or not root then return end
+	runtimeMessage = "Beber travado; forcando com tecla E"
+
+	if isDinoLife then
+		ragdollTeleport(DINO_DRINK_POSITION)
+	elseif drinkingSourcePosition then
+		ragdollTeleport(drinkingSourcePosition)
+	end
+	task.wait(0.2)
+
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+		task.wait(0.05)
+		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+	end)
+	task.wait(0.2)
+
+	state.autoDrink = false
+	if renders and renders.autoDrink then renders.autoDrink() end
+	task.wait(0.3)
+	state.autoDrink = true
+	if renders and renders.autoDrink then renders.autoDrink() end
+
+	setSubState("Drinking")
+	drinkingStuckSince = nil
+end
+
+local function autoDrinkStep()
+	if not state.autoDrink or state.busy or criticalRecoveryActive then return end
+	local character, root = characterParts()
+	if not character or not root then return end
+	local water = character:GetAttribute("Water") or 100
+	if water <= 75 then
+		drinkingToFull = true
+		eatingToFull = false
+		eatingSourcePosition = nil
+		activeCarcass = nil
+		runtimeMessage = "Indo beber agua"
+	end
+	if drinkingToFull and water >= (preSwitchWaterTarget or 98) then
+		drinkingToFull = false
+		removeSwimBarrier()
+		task.spawn(forcePostDrinkTeleport)
+		return
+	end
+	if not drinkingToFull then return end
+
+	if lastDrinkWatchdogWater == nil or water > lastDrinkWatchdogWater then
+		lastDrinkWatchdogWater = water
+		drinkingStuckSince = tick()
+	elseif not drinkingStuckSince then
+		drinkingStuckSince = tick()
+	end
+	if drinkingStuckSince and tick() - drinkingStuckSince >= 15 then
+		lastDrinkWatchdogWater = water
+		drinkingStuckSince = tick()
+		virtualDrinkKick()
+		return
+	end
+
+	if isDinoLife then
+		local waterPart = workspace:FindFirstChild("MainWaterPart")
+		if drinkingSourcePosition and (root.Position - drinkingSourcePosition).Magnitude <= 16 then
+			runtimeMessage = "Bebendo ate encher"
+			task.spawn(holdDinoDrinkPosition, drinkingSourcePosition)
+			return
+		end
+		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
+		ragdollTeleport(DINO_DRINK_POSITION)
+		drinkingSourcePosition = DINO_DRINK_POSITION
+		task.wait(0.25)
+		for _ = 1, 3 do
+			setSubState("Drinking")
+			task.wait(0.2)
+		end
+		return
+	end
+
+	if drinkingSourcePosition and (root.Position - drinkingSourcePosition).Magnitude <= 16 then
+		runtimeMessage = "Bebendo ate encher"
+		setSubState("Drinking")
+		return
+	end
+	local waterPart = workspace:FindFirstChild("MainWaterPart")
+	local waterPosition = waterPart and waterPart:IsA("BasePart")
+		and Vector3.new(root.Position.X, waterPart.Position.Y, root.Position.Z)
+		or findMaterial(root.Position, Enum.Material.Water, 384)
+	if waterPosition then
+		ragdollTeleport(waterPosition - Vector3.new(0, 3, 0))
+		drinkingSourcePosition = waterPosition
+		task.wait(0.25)
+		local _, newRoot = characterParts()
+		if newRoot then updateSwimBarrier(newRoot, true) end
+		for _ = 1, 3 do
+			setSubState("Drinking")
+			task.wait(0.2)
+		end
+	end
+end
+
+local function isInsideTerrain(character, root)
+	if not character or not root then return false end
+	local region = Region3.new(root.Position - Vector3.new(2,2,2), root.Position + Vector3.new(2,2,2)):ExpandToGrid(4)
+	local ok, _, occupancy = pcall(function()
+		local materials, values = workspace.Terrain:ReadVoxels(region, 4)
+		return materials, values
+	end)
+	return ok and occupancy and occupancy[1][1][1] > 0.55
+end
+
+local function resolveReplication()
+	if shared._playerDataReplication and type(shared._playerDataReplication.GetKeyData) == "function" then
+		return shared._playerDataReplication
+	end
+	for _, root in ipairs({ ReplicatedStorage, player:FindFirstChild("PlayerScripts"), player:FindFirstChild("PlayerGui") }) do
+		local module = root and root:FindFirstChild("PlayerDataReplication", true)
+		if module and module:IsA("ModuleScript") then
+			local ok, result = pcall(require, module)
+			if ok and type(result) == "table" and type(result.GetKeyData) == "function" then
+				shared._playerDataReplication = result
+				return result
+			end
+		end
+	end
+end
+
+local function savedCharacters()
+	local replication = resolveReplication()
+	if not replication then runtimeMessage = "Dados de slots nao encontrados"; return {} end
+	local ok, records = pcall(replication.GetKeyData, "SavedCharacters")
+	if (not ok or type(records) ~= "table") and type(replication.GetData) == "function" then
+		local dataOk, data = pcall(replication.GetData)
+		if dataOk and type(data) == "table" then
+			records = data.SavedCharacters
+			ok = type(records) == "table"
+		end
+	end
+	if not ok or type(records) ~= "table" then
+		runtimeMessage = "Falha ao ler SavedCharacters"
+		return {}
+	end
+
+	local normalized = {}
+	for key, entry in pairs(records) do
+		if type(entry) == "table" then
+			if not entry.CharacterName and type(key) == "string" then
+				entry.CharacterName = key
+			end
+			table.insert(normalized, entry)
+		end
+	end
+	table.sort(normalized, function(a, b)
+		return tostring(a.CharacterName or "") < tostring(b.CharacterName or "")
+	end)
+	return normalized
+end
+
+local function motherNameFor(entry)
+	if type(entry) ~= "table" or (entry.GrowthPercentage or 1) > 0.01 then return nil end
+	local remote = ReplicatedStorage:FindFirstChild("BabySpawnsRequestMotherNamesRemoteFunction")
+	if not remote then return nil end
+	local ok, result = pcall(remote.InvokeServer, remote, entry.AnimalName)
+	if not ok then return nil end
+	if type(result) == "string" then return result end
+	if type(result) == "table" then
+		for _, value in pairs(result) do
+			if type(value) == "string" then return value end
+			if type(value) == "table" then return value.PlayerName or value.Name or value.Username end
+		end
+	end
+end
+
+local function spawnSlot(entry)
+	local uniqueName = type(entry) == "table" and (entry.UniqueCharacterName or entry.CharacterName)
+	if not SpawnRemote or not uniqueName then return false end
+	runtimeMessage = "Trocando para " .. tostring(entry.CharacterName)
+	local mother = motherNameFor(entry)
+	local ok = pcall(function()
+		if mother then SpawnRemote:InvokeServer(uniqueName, mother)
+		else SpawnRemote:InvokeServer(uniqueName) end
+	end)
+	if not ok then runtimeMessage = "Spawn falhou: " .. tostring(entry.CharacterName); return false end
+	local deadline = tick() + 12
+	repeat task.wait(0.25) until tick() >= deadline or (player.Character and player.Character:FindFirstChild("HumanoidRootPart"))
+	local character = player.Character
+	if not character or not character:FindFirstChild("HumanoidRootPart") then runtimeMessage = "Personagem nao apareceu"; return false end
+	task.wait(1)
+	ragdollTeleport(getSafeFarmPosition())
+	runtimeMessage = "Crescendo " .. tostring(entry.CharacterName)
+	return true
+end
+
+local slotIndex = 0
+local sessionCompletedSlots = {}
+local function isGrowthComplete(value)
+	value = tonumber(value)
+	if value == nil then return false end
+	if value <= 1 then return value >= 0.999 end
+	return value >= 99.9
+end
+
+local function nextExistingSlot(animalName, records)
+	records = records or savedCharacters()
+	if #records == 0 then return nil end
+	local currentCharacter = player.Character
+	local currentName = currentCharacter and currentCharacter:GetAttribute("CharacterName")
+	for _ = 1, #records do
+		slotIndex = slotIndex % #records + 1
+		local entry = records[slotIndex]
+		local name = type(entry) == "table" and entry.CharacterName
+		if type(name) == "string" and name ~= ""
+			and name ~= currentName and not sessionCompletedSlots[name]
+			and (not animalName or entry.AnimalName == animalName)
+			and not isGrowthComplete(entry.GrowthPercentage) then
+			runtimeMessage = string.format(
+				"Testando slot: %s (salvo: %s)",
+				name,
+				tostring(entry.GrowthPercentage or "?")
+			)
+			return entry
+		end
+	end
+end
+
+local NAMES = { "Jack","John","Evian","Aiman","Adam","Alex","Ben","Sam","Max","Leo","Noah","Liam","Omar","Zain","Ali","Ryan","Ethan","Mason","Dylan","Lucas","Harry","Jacob","Henry","Isaac","Yusuf","Amir","Daniel","David","Aaron","Oscar","Toby","Kian","Kai","Jay","Sean","Chris","Kevin","Mark" }
+local function uniqueName()
+	local used = {}
+	for _, entry in ipairs(savedCharacters()) do if entry.CharacterName then used[entry.CharacterName] = true end end
+	for _, name in ipairs(NAMES) do if not used[name] then return name end end
+	return "Slot" .. tostring(math.floor(os.clock() * 1000))
+end
+
+local function createNextSlot()
+	if not CreateRemote or not ResetRemote then return false end
+	local character = player.Character
+	if not character then return false end
+	local entry = {
+		CharacterName = uniqueName(),
+		AnimalName = character:GetAttribute("AnimalName") or "Elephant",
+		Gender = state.newSlotGender or character:GetAttribute("Gender") or "Female",
+		Skin = character:GetAttribute("Skin") or "Default",
+		GrowthPercentage = 0,
+	}
+	pcall(ResetRemote.InvokeServer, ResetRemote)
+	task.wait(2)
+	local ok = pcall(CreateRemote.InvokeServer, CreateRemote, entry.CharacterName, entry.AnimalName, entry.Gender, entry.Skin)
+	if not ok then return false end
+	task.wait(2)
+	return spawnSlot(entry)
+end
+
+local growthBusy = false
+local preSwitchTopUpActive = false -- true enquanto estamos no meio de encher comida/água antes de trocar
+local MAX_SLOTS = 40
+
+local function findNamedSpawnPart(name)
+	local spawns = workspace:FindFirstChild("Spawns")
+	if not spawns then return nil end
+	return spawns:FindFirstChild(name, true)
+end
+
+local function teleportBeforeSlotChange()
+	-- Teleporta pro ponto de troca certo de cada jogo e só considera pronto
+	-- quando CONFIRMAR que o personagem está em terra firme (sem água, sem
+	-- void). Isso já desliga comer/beber durante toda a tentativa.
+	-- Savannah/Jungle usam PrideRockSpawn1; Dino Life usa NestRock3
+	-- (nomes diferentes por jogo — usar o nome errado faz cair no fallback
+	-- errado e o personagem nunca confirma terra firme).
+	local spawnName = isDinoLife and "NestRock3" or "PrideRockSpawn1"
+	local namedSpawn = findNamedSpawnPart(spawnName)
+	local target = namedSpawn and namedSpawn.Position or (selectedCompletionSpawn and selectedCompletionSpawn.Parent and selectedCompletionSpawn.Position) or getSafeFarmPosition()
+	local label = namedSpawn and spawnName or "ponto de troca"
+	return ensureOnSolidGround(target, label)
+end
+
+local function growthStep()
+	if state.farmCoins or growthBusy or state.busy or not (state.growExisting or state.growNew) then return end
+	-- Se uma rotina crítica (saída de água/void) estiver no controle do
+	-- personagem, o growthStep NÃO pode religar autoEat/autoDrink nem fazer
+	-- nada — senão as duas rotinas brigam pra teleportar o personagem pra
+	-- lugares diferentes ao mesmo tempo (isso já matou um Rex no Dino Life).
+	if criticalRecoveryActive then return end
+	state.autoEat, state.autoDrink = true, true
+	if renders then
+		if renders.autoEat then renders.autoEat() end
+		if renders.autoDrink then renders.autoDrink() end
+	end
+	local character = player.Character
+	if not character then return end
+	local growth = character:GetAttribute("GrowthPercentage")
+	if type(growth) ~= "number" or not isGrowthComplete(growth) then return end
+
+	-- Antes de trocar de slot: comida e água precisam estar com boa margem.
+	-- Só dispara o "encher" se algum dos dois cair abaixo de 85% (histerese
+	-- — não fica reativando à toa). Quando dispara, enche os dois até perto
+	-- de 100% (15% de margem), NA ORDEM: primeiro toda a comida, só depois
+	-- a água — beber nunca interrompe o comer no meio. Depois de encher os
+	-- dois, para e não tenta de novo até algum cair abaixo de 85% de novo.
+	local food = character:GetAttribute("Food") or 100
+	local water = character:GetAttribute("Water") or 100
+
+	if not preSwitchTopUpActive and (food < 85 or water < 85) then
+		preSwitchTopUpActive = true
+	end
+
+	if preSwitchTopUpActive then
+		if food < 99 then
+			preSwitchFoodTarget = 100
+			drinkingToFull = false -- beber não pode interromper o comer agora
+			runtimeMessage = string.format("Filling up before slot switch (Food %d%%  Water %d%%)", math.floor(food), math.floor(water))
+			return
+		end
+		preSwitchFoodTarget = nil
+
+		if water < 99 then
+			preSwitchWaterTarget = 100
+			drinkingToFull = true
+			runtimeMessage = string.format("Filling up before slot switch (Food %d%%  Water %d%%)", math.floor(food), math.floor(water))
+			return
+		end
+		preSwitchWaterTarget = nil
+		preSwitchTopUpActive = false -- terminou; só reativa se cair abaixo de 85% de novo
+	end
+
+	local completedName = character:GetAttribute("CharacterName")
+	local completedAnimal = character:GetAttribute("AnimalName")
+	local previousEntry
+	for _, candidate in ipairs(savedCharacters()) do
+		if candidate.CharacterName == completedName then
+			previousEntry = candidate
+			break
+		end
+	end
+	if type(completedName) == "string" and completedName ~= "" then
+		sessionCompletedSlots[completedName] = true
+	end
+	growthBusy = true
+	preSwitchTopUpActive = false
+	preSwitchFoodTarget = nil
+	preSwitchWaterTarget = nil
+
+	-- 1+2+3: para de comer/beber e teleporta pro PrideRockSpawn1 ANTES de
+	-- qualquer troca de slot, seja crescendo existentes ou criando novos.
+	-- Se não conseguir CONFIRMAR terra firme (sem void, sem água), aborta
+	-- essa tentativa e deixa o próximo ciclo do growthStep tentar de novo
+	-- — nunca troca de slot estando dentro do void ou da água.
+	local landedSafely = teleportBeforeSlotChange()
+	if not landedSafely then
+		runtimeMessage = "Não confirmei terra firme; adiando troca de slot"
+		state.autoEat, state.autoDrink = true, true
+		if renders then
+			if renders.autoEat then renders.autoEat() end
+			if renders.autoDrink then renders.autoDrink() end
+		end
+		growthBusy = false
+		return
+	end
+	task.wait(0.5)
+
+	local entry
+	if state.growExisting then
+		runtimeMessage = "Abrindo lista de " .. tostring(completedAnimal or "animais")
+		if ResetRemote then pcall(ResetRemote.InvokeServer, ResetRemote) end
+		task.wait(2.5)
+		local refreshed = savedCharacters()
+		entry = nextExistingSlot(completedAnimal, refreshed)
+		if not previousEntry then
+			for _, candidate in ipairs(refreshed) do
+				if candidate.CharacterName == completedName then
+					previousEntry = candidate
+					break
+				end
+			end
+		end
+	end
+	if entry then
+		spawnSlot(entry)
+	elseif state.growNew then
+		local totalSlots = #savedCharacters()
+		if totalSlots >= MAX_SLOTS then
+			runtimeMessage = "Limite de " .. MAX_SLOTS .. " slots atingido; ativando Farm Coins"
+			state.growExisting, state.growNew = false, false
+			state.farmCoins = true
+			if previousEntry then spawnSlot(previousEntry) end
+		else
+			runtimeMessage = "Criando novo slot"
+			createNextSlot()
+		end
+	elseif state.growExisting then
+		runtimeMessage = "Sem " .. tostring(completedAnimal or "animal") .. " incompleto; ativando Farm Coins"
+		if previousEntry then
+			spawnSlot(previousEntry)
+		end
+		state.growExisting, state.growNew = false, false
+		state.farmCoins = true
+	end
+	state.autoEat, state.autoDrink = true, true
+	if renders then
+		for _, key in ipairs({ "growExisting", "growNew", "farmCoins", "autoEat", "autoDrink" }) do
+			if renders[key] then renders[key]() end
+		end
+	end
+	growthBusy = false
+end
+
+-- ============================================================
+-- HUD
+-- ============================================================
+local TweenService = game:GetService("TweenService")
+
+local COLOR_BG        = Color3.fromRGB(10, 6, 12)
+local COLOR_HEADER    = Color3.fromRGB(16, 9, 16)
+local COLOR_CARD      = Color3.fromRGB(22, 12, 20)
+local COLOR_CARD_ON   = Color3.fromRGB(32, 14, 27)
+local COLOR_ACCENT    = Color3.fromRGB(255, 46, 122)
+local COLOR_ACCENT_DK = Color3.fromRGB(18, 4, 10)
+local COLOR_TEXT      = Color3.fromRGB(240, 226, 233)
+local COLOR_SUBTEXT   = Color3.fromRGB(168, 122, 145)
+local FONT_TITLE      = Enum.Font.GothamBold
+local FONT_BODY       = Enum.Font.Gotham
+local FONT_BUTTON     = Enum.Font.GothamSemibold
+
+local WINDOW_MIN = Vector2.new(300, 380)
+local WINDOW_MAX = Vector2.new(560, 700)
+
+local function corner(inst, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 8)
+	c.Parent = inst
+	return c
+end
+
+local function stroke(inst, color, thickness)
+	local s = Instance.new("UIStroke")
+	s.Color = color or Color3.fromRGB(52, 26, 44)
+	s.Thickness = thickness or 1
+	s.Parent = inst
+	return s
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "UI_Root"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 9999
+gui.Parent = CoreGui
+
+-- ============================================================
+-- Main window
+-- ============================================================
+local window = Instance.new("Frame")
+window.Size = UDim2.fromOffset(360, 460)
+window.Position = UDim2.fromOffset(18, 45)
+window.BackgroundColor3 = COLOR_BG
+window.BorderSizePixel = 0
+window.ClipsDescendants = true
+window.Parent = gui
+corner(window, 12)
+stroke(window, COLOR_ACCENT, 1).Transparency = 0.35
+
+local windowGradient = Instance.new("UIGradient")
+windowGradient.Rotation = 90
+windowGradient.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(24, 10, 22)),
+	ColorSequenceKeypoint.new(0.5, COLOR_BG),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(8, 4, 10)),
+})
+windowGradient.Parent = window
+
+local windowShadow = Instance.new("ImageLabel")
+windowShadow.Image = "rbxassetid://1316045217"
+windowShadow.ImageColor3 = Color3.new(0, 0, 0)
+windowShadow.ImageTransparency = 0.55
+windowShadow.ScaleType = Enum.ScaleType.Slice
+windowShadow.SliceCenter = Rect.new(10, 10, 118, 118)
+windowShadow.BackgroundTransparency = 1
+-- Fica do mesmo tamanho da janela (não maior) — ClipsDescendants do Roblox
+-- corta em retângulo reto, não segue a curva arredondada, então uma sombra
+-- maior que a janela "vazava" nas quinas como pedacinhos quadrados.
+windowShadow.Size = UDim2.new(1, 0, 1, 0)
+windowShadow.Position = UDim2.new(0, 0, 0, 0)
+windowShadow.ZIndex = -1
+windowShadow.Parent = window
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 46)
+header.BackgroundColor3 = COLOR_HEADER
+header.BorderSizePixel = 0
+header.Active = true
+header.Parent = window
+corner(header, 12)
+local headerMask = Instance.new("Frame") -- cobre o corner de baixo pra não arredondar a base do header
+headerMask.Size = UDim2.new(1, 0, 0, 12)
+headerMask.Position = UDim2.new(0, 0, 1, -12)
+headerMask.BackgroundColor3 = COLOR_HEADER
+headerMask.BorderSizePixel = 0
+headerMask.Parent = header
+
+local titleMark = Instance.new("ImageLabel")
+titleMark.Size = UDim2.fromOffset(28, 28)
+titleMark.Position = UDim2.fromOffset(10, 9)
+titleMark.BackgroundTransparency = 1
+titleMark.Image = "rbxassetid://99719285301998"
+titleMark.ScaleType = Enum.ScaleType.Fit
+titleMark.Parent = header
+corner(titleMark, 14)
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, -120, 1, 0)
+titleLabel.Position = UDim2.fromOffset(46, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Font = Enum.Font.GothamBlack
+titleLabel.Text = "MMB HUB"
+titleLabel.TextColor3 = COLOR_TEXT
+titleLabel.TextSize = 18
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Parent = header
+
+local statusDot = Instance.new("Frame")
+statusDot.Size = UDim2.fromOffset(7, 7)
+statusDot.Position = UDim2.new(1, -78, 0.5, -3)
+statusDot.BackgroundColor3 = Color3.fromRGB(90, 220, 130)
+statusDot.BorderSizePixel = 0
+statusDot.Parent = header
+corner(statusDot, 4)
+
+local minimizeButton = Instance.new("TextButton")
+minimizeButton.Size = UDim2.fromOffset(30, 30)
+minimizeButton.Position = UDim2.new(1, -38, 0.5, -15)
+minimizeButton.BackgroundColor3 = COLOR_CARD
+minimizeButton.BorderSizePixel = 0
+minimizeButton.Font = FONT_BUTTON
+minimizeButton.Text = "-"
+minimizeButton.TextColor3 = COLOR_TEXT
+minimizeButton.TextSize = 18
+minimizeButton.AutoButtonColor = false
+minimizeButton.Parent = header
+corner(minimizeButton, 8)
+
+-- Drag da janela pelo header
+do
+	local dragging, dragStart, startPos
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = window.Position
+		end
+	end)
+	header.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			local newX = startPos.X.Offset + delta.X
+			local newY = startPos.Y.Offset + delta.Y
+			local camera = workspace.CurrentCamera
+			if camera then
+				local vp = camera.ViewportSize
+				newX = math.clamp(newX, 0, math.max(0, vp.X - window.AbsoluteSize.X))
+				newY = math.clamp(newY, 0, math.max(0, vp.Y - window.AbsoluteSize.Y))
+			end
+			window.Position = UDim2.fromOffset(newX, newY)
+		end
+	end))
+end
+
+-- ============================================================
+-- Tab bar
+-- ============================================================
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, 0, 0, 36)
+tabBar.Position = UDim2.fromOffset(0, 46)
+tabBar.BackgroundColor3 = COLOR_HEADER
+tabBar.BorderSizePixel = 0
+tabBar.Parent = window
+local tabLayout = Instance.new("UIListLayout", tabBar)
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local TAB_NAMES = { "Survival", "Growth", "Teleport" }
+local tabButtons, tabContents = {}, {}
+
+local contentContainer = Instance.new("ScrollingFrame")
+contentContainer.Position = UDim2.fromOffset(0, 82)
+contentContainer.Size = UDim2.new(1, 0, 1, -142)
+contentContainer.BackgroundTransparency = 1
+contentContainer.BorderSizePixel = 0
+contentContainer.ScrollBarThickness = 4
+contentContainer.ScrollBarImageColor3 = COLOR_ACCENT
+contentContainer.CanvasSize = UDim2.new()
+contentContainer.AutomaticCanvasSize = Enum.AutomaticSize.Y
+contentContainer.Parent = window
+local contentPadding = Instance.new("UIPadding", contentContainer)
+contentPadding.PaddingTop, contentPadding.PaddingBottom = UDim.new(0, 18), UDim.new(0, 20)
+-- A barra de rolagem fica dentro da área direita, então a direita precisa
+-- de mais respiro que a esquerda pra não parecer que os botões estão
+-- "colados" nela — sem isso a borda direita fica visivelmente mais
+-- apertada que a esquerda.
+contentPadding.PaddingLeft, contentPadding.PaddingRight = UDim.new(0, 12), UDim.new(0, 12)
+
+local tabIndicators = {}
+
+local function setActiveTab(name)
+	for tabName, button in pairs(tabButtons) do
+		local active = tabName == name
+		button.BackgroundColor3 = active and COLOR_CARD_ON or COLOR_HEADER
+		button.TextColor3 = active and COLOR_ACCENT or COLOR_SUBTEXT
+		if tabIndicators[tabName] then tabIndicators[tabName].Visible = active end
+	end
+	for tabName, content in pairs(tabContents) do
+		content.Visible = tabName == name
+	end
+end
+
+for i, name in ipairs(TAB_NAMES) do
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1 / #TAB_NAMES, 0, 1, 0)
+	button.LayoutOrder = i
+	button.BackgroundColor3 = COLOR_HEADER
+	button.BorderSizePixel = 0
+	button.Font = FONT_BUTTON
+	button.Text = name
+	button.TextColor3 = COLOR_SUBTEXT
+	button.TextSize = 13
+	button.AutoButtonColor = false
+	button.Parent = tabBar
+	tabButtons[name] = button
+
+	local indicator = Instance.new("Frame")
+	indicator.Size = UDim2.new(1, -16, 0, 2)
+	indicator.Position = UDim2.new(0, 8, 1, -2)
+	indicator.BackgroundColor3 = COLOR_ACCENT
+	indicator.BorderSizePixel = 0
+	indicator.Visible = false
+	indicator.Parent = button
+	tabIndicators[name] = indicator
+
+	button.MouseEnter:Connect(function()
+		if tabContents[name] and not tabContents[name].Visible then
+			button.TextColor3 = Color3.fromRGB(200, 205, 213)
+		end
+	end)
+	button.MouseLeave:Connect(function()
+		if tabContents[name] and not tabContents[name].Visible then
+			button.TextColor3 = COLOR_SUBTEXT
+		end
+	end)
+
+	local content = Instance.new("Frame")
+	content.Size = UDim2.new(1, -16, 0, 0)
+	content.AutomaticSize = Enum.AutomaticSize.Y
+	content.BackgroundTransparency = 1
+	content.Visible = false
+	content.Parent = contentContainer
+	local contentList = Instance.new("UIListLayout", content)
+	contentList.Padding = UDim.new(0, 8)
+	contentList.SortOrder = Enum.SortOrder.LayoutOrder
+	tabContents[name] = content
+
+	button.Activated:Connect(function() setActiveTab(name) end)
+end
+
+-- ============================================================
+-- Status footer
+-- ============================================================
+local statusBar = Instance.new("Frame")
+statusBar.Size = UDim2.new(1, -16, 0, 52)
+statusBar.Position = UDim2.new(0, 8, 1, -60)
+statusBar.BackgroundColor3 = COLOR_CARD
+statusBar.BorderSizePixel = 0
+statusBar.Parent = window
+corner(statusBar, 8)
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -16, 1, -8)
+status.Position = UDim2.fromOffset(8, 4)
+status.BackgroundTransparency = 1
+status.Font = FONT_BODY
+status.TextColor3 = COLOR_TEXT
+status.TextSize = 11
+status.TextWrapped = true
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.Parent = statusBar
+
+-- Handle de redimensionar (canto inferior direito)
+local resizeHandle = Instance.new("TextButton")
+resizeHandle.Size = UDim2.fromOffset(18, 18)
+resizeHandle.Position = UDim2.new(1, -20, 1, -20)
+resizeHandle.BackgroundTransparency = 1
+resizeHandle.Text = "◢"
+resizeHandle.TextColor3 = COLOR_SUBTEXT
+resizeHandle.Font = FONT_BODY
+resizeHandle.TextSize = 14
+resizeHandle.AutoButtonColor = false
+resizeHandle.Parent = window
+
+do
+	local resizing, resizeStart, startSize
+	resizeHandle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			resizing = true
+			resizeStart = input.Position
+			startSize = window.Size
+		end
+	end)
+	resizeHandle.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			resizing = false
+		end
+	end)
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - resizeStart
+			local newW = math.clamp(startSize.X.Offset + delta.X, WINDOW_MIN.X, WINDOW_MAX.X)
+			local newH = math.clamp(startSize.Y.Offset + delta.Y, WINDOW_MIN.Y, WINDOW_MAX.Y)
+			window.Size = UDim2.fromOffset(newW, newH)
+		end
+	end))
+end
+
+-- ============================================================
+-- Minimizar para bolinha flutuante
+-- ============================================================
+local ball = Instance.new("TextButton")
+ball.Size = UDim2.fromOffset(52, 52)
+ball.Position = UDim2.fromOffset(18, 45)
+ball.BackgroundColor3 = COLOR_ACCENT
+ball.BorderSizePixel = 0
+ball.Text = ""
+ball.AutoButtonColor = false
+ball.Visible = false
+ball.ClipsDescendants = true
+ball.Parent = gui
+corner(ball, 26)
+stroke(ball, Color3.fromRGB(255, 255, 255), 1)
+
+local ballIcon = Instance.new("ImageLabel")
+ballIcon.Size = UDim2.fromScale(1, 1)
+ballIcon.BackgroundTransparency = 1
+ballIcon.Image = "rbxassetid://99719285301998"
+ballIcon.ScaleType = Enum.ScaleType.Fit
+ballIcon.Parent = ball
+
+local function setMinimized(minimized)
+	window.Visible = not minimized
+	ball.Visible = minimized
+end
+
+minimizeButton.Activated:Connect(function() setMinimized(true) end)
+
+do
+	local dragging, dragStart, startPos, moved
+	ball.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			dragStart = input.Position
+			startPos = ball.Position
+		end
+	end)
+	ball.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+			if not moved then setMinimized(false) end -- clique (sem arrastar) reabre a janela
+		end
+	end)
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 4 then moved = true end
+			local newX = startPos.X.Offset + delta.X
+			local newY = startPos.Y.Offset + delta.Y
+			local camera = workspace.CurrentCamera
+			if camera then
+				local vp = camera.ViewportSize
+				newX = math.clamp(newX, 0, math.max(0, vp.X - ball.AbsoluteSize.X))
+				newY = math.clamp(newY, 0, math.max(0, vp.Y - ball.AbsoluteSize.Y))
+			end
+			ball.Position = UDim2.fromOffset(newX, newY)
+		end
+	end))
+end
+
+-- ============================================================
+-- Toggle helper (usado nas abas Survival/Growth)
+-- ============================================================
+renders = {}
+local function toggle(parent, label, key, order)
+	local row = Instance.new("TextButton")
+	row.Size = UDim2.new(1, 0, 0, UserInputService.TouchEnabled and 46 or 40)
+	row.LayoutOrder = order or 0
+	row.BackgroundColor3 = COLOR_CARD
+	row.BorderSizePixel = 0
+	row.ClipsDescendants = true
+	row.Text = ""
+	row.AutoButtonColor = false
+	row.Parent = parent
+	corner(row, 999) -- Roblox limita automaticamente à metade da altura -> pílula completa nas duas pontas
+	local rowStroke = stroke(row, Color3.fromRGB(48, 24, 42), 1)
+
+	local labelText = Instance.new("TextLabel")
+	labelText.Size = UDim2.new(1, -66, 1, 0)
+	labelText.Position = UDim2.fromOffset(14, 0)
+	labelText.BackgroundTransparency = 1
+	labelText.Font = FONT_BUTTON
+	labelText.Text = label
+	labelText.TextSize = 12
+	labelText.TextColor3 = COLOR_TEXT
+	labelText.TextXAlignment = Enum.TextXAlignment.Left
+	labelText.Parent = row
+
+	-- Switch de verdade (trilho + bolinha), em vez de um botão que só muda
+	-- de cor — a bolinha desliza e fecha redonda nas duas pontas.
+	local track = Instance.new("Frame")
+	track.Size = UDim2.fromOffset(38, 20)
+	track.AnchorPoint = Vector2.new(1, 0.5)
+	track.Position = UDim2.new(1, -14, 0.5, 0)
+	track.BackgroundColor3 = Color3.fromRGB(50, 27, 44)
+	track.BorderSizePixel = 0
+	track.Parent = row
+	corner(track, 10)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.Position = UDim2.fromOffset(2, 2)
+	knob.BackgroundColor3 = Color3.fromRGB(220, 224, 230)
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+	corner(knob, 8)
+
+	local hovering = false
+	local function applyVisual()
+		local on = state[key]
+		if on then
+			row.BackgroundColor3 = COLOR_CARD_ON
+			rowStroke.Color = COLOR_ACCENT
+		elseif hovering then
+			row.BackgroundColor3 = Color3.fromRGB(38, 20, 34)
+			rowStroke.Color = Color3.fromRGB(70, 34, 58)
+		else
+			row.BackgroundColor3 = COLOR_CARD
+			rowStroke.Color = Color3.fromRGB(48, 24, 42)
+		end
+	end
+	local function render()
+		local on = state[key]
+		labelText.TextColor3 = on and COLOR_ACCENT or COLOR_TEXT
+		TweenService:Create(track, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
+			BackgroundColor3 = on and COLOR_ACCENT or Color3.fromRGB(50, 27, 44),
+		}):Play()
+		TweenService:Create(knob, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
+			Position = on and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2),
+		}):Play()
+		applyVisual()
+	end
+	renders[key] = render
+	row.MouseEnter:Connect(function() hovering = true; applyVisual() end)
+	row.MouseLeave:Connect(function() hovering = false; applyVisual() end)
+	row.Activated:Connect(function()
+		state[key] = not state[key]
+		if key == "farmCoins" and state[key] then
+			state.growExisting, state.growNew = false, false
+			state.autoEat, state.autoDrink = true, true
+			runtimeMessage = "AFK coin farming active"
+		elseif (key == "growExisting" or key == "growNew") and state[key] then
+			state.farmCoins = false
+		end
+		for _, changedKey in ipairs({ key, "farmCoins", "growExisting", "growNew", "autoEat", "autoDrink" }) do
+			if renders[changedKey] then renders[changedKey]() end
+		end
+	end)
+	render()
+	return row
+end
+
+local function sectionLabel(parent, text, order)
+	local wrap = Instance.new("Frame")
+	wrap.Size = UDim2.new(1, 0, 0, 18)
+	wrap.LayoutOrder = order or 0
+	wrap.BackgroundTransparency = 1
+	wrap.Parent = parent
+
+	local mark = Instance.new("Frame")
+	mark.Size = UDim2.fromOffset(3, 11)
+	mark.Position = UDim2.new(0, 0, 0.5, -5)
+	mark.BackgroundColor3 = COLOR_ACCENT
+	mark.BorderSizePixel = 0
+	mark.Parent = wrap
+	corner(mark, 2)
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, -10, 1, 0)
+	label.Position = UDim2.fromOffset(9, 0)
+	label.BackgroundTransparency = 1
+	label.Font = FONT_BUTTON
+	label.Text = text
+	label.TextColor3 = COLOR_SUBTEXT
+	label.TextSize = 11
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = wrap
+	return wrap
+end
+
+-- ============================================================
+-- Aba: Survival
+-- ============================================================
+sectionLabel(tabContents.Survival, "SURVIVAL", 0)
+toggle(tabContents.Survival, "Auto Eat", "autoEat", 1)
+toggle(tabContents.Survival, "Auto Drink", "autoDrink", 2)
+toggle(tabContents.Survival, "Escape Terrain Clip", "escapeTerrain", 3)
+sectionLabel(tabContents.Survival, "AUTOMATION", 4)
+toggle(tabContents.Survival, "AFK Coin Farm", "farmCoins", 5)
+
+-- ============================================================
+-- Aba: Growth
+-- ============================================================
+sectionLabel(tabContents.Growth, "GROWTH MODE", 0)
+toggle(tabContents.Growth, "Grow Existing Slots", "growExisting", 1)
+toggle(tabContents.Growth, "Grow New Slots", "growNew", 2)
+
+sectionLabel(tabContents.Growth, "NEW SLOT GENDER", 3)
+local genderRow = Instance.new("Frame")
+genderRow.Size = UDim2.new(1, 0, 0, 32)
+genderRow.LayoutOrder = 4
+genderRow.BackgroundTransparency = 1
+genderRow.Parent = tabContents.Growth
+local genderLayout = Instance.new("UIListLayout", genderRow)
+genderLayout.FillDirection = Enum.FillDirection.Horizontal
+genderLayout.Padding = UDim.new(0, 8)
+
+local function genderButton(text, value)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(0.5, -4, 1, 0)
+	button.BackgroundColor3 = COLOR_CARD
+	button.BorderSizePixel = 0
+	button.Font = FONT_BUTTON
+	button.Text = text
+	button.TextSize = 12
+	button.AutoButtonColor = false
+	button.Parent = genderRow
+	corner(button, 16)
+	stroke(button, Color3.fromRGB(48, 24, 42), 1)
+	return button
+end
+local maleButton = genderButton("Male", "Male")
+local femaleButton = genderButton("Female", "Female")
+
+local function renderGender()
+	maleButton.BackgroundColor3 = state.newSlotGender == "Male" and COLOR_ACCENT or COLOR_CARD
+	maleButton.TextColor3 = state.newSlotGender == "Male" and COLOR_ACCENT_DK or COLOR_TEXT
+	femaleButton.BackgroundColor3 = state.newSlotGender == "Female" and COLOR_ACCENT or COLOR_CARD
+	femaleButton.TextColor3 = state.newSlotGender == "Female" and COLOR_ACCENT_DK or COLOR_TEXT
+end
+maleButton.Activated:Connect(function() state.newSlotGender = "Male"; renderGender() end)
+femaleButton.Activated:Connect(function() state.newSlotGender = "Female"; renderGender() end)
+renderGender()
+
+local genderNote = Instance.new("TextLabel")
+genderNote.Size = UDim2.new(1, 0, 0, 28)
+genderNote.LayoutOrder = 5
+genderNote.BackgroundTransparency = 1
+genderNote.Font = FONT_BODY
+genderNote.Text = "Applies only to slots created by \"Grow New Slots\"."
+genderNote.TextColor3 = COLOR_SUBTEXT
+genderNote.TextSize = 10
+genderNote.TextWrapped = true
+genderNote.TextXAlignment = Enum.TextXAlignment.Left
+genderNote.Parent = tabContents.Growth
+
+-- ============================================================
+-- Aba: Teleport
+-- ============================================================
+sectionLabel(tabContents.Teleport, "TELEPORT LOCATIONS", 0)
+
+refreshCompletionSpawns()
+local function completionSpawnLabel(part)
+	if not part then return "Unknown location" end
+	local spawns = workspace:FindFirstChild("Spawns")
+	local fullName = part:GetFullName()
+	if spawns then
+		local marker = spawns:GetFullName() .. "."
+		fullName = fullName:gsub("^" .. marker:gsub("([%.%-])", "%%%1"), "")
+	end
+	return fullName
+end
+
+local spawnList = Instance.new("Frame")
+spawnList.Size = UDim2.new(1, 0, 0, 0)
+spawnList.AutomaticSize = Enum.AutomaticSize.Y
+spawnList.LayoutOrder = 1
+spawnList.BackgroundColor3 = COLOR_CARD
+spawnList.BorderSizePixel = 0
+spawnList.Parent = tabContents.Teleport
+corner(spawnList, 8)
+local spawnPadding = Instance.new("UIPadding", spawnList)
+spawnPadding.PaddingTop, spawnPadding.PaddingBottom = UDim.new(0, 6), UDim.new(0, 6)
+spawnPadding.PaddingLeft, spawnPadding.PaddingRight = UDim.new(0, 6), UDim.new(0, 6)
+local spawnListLayout = Instance.new("UIListLayout", spawnList)
+spawnListLayout.Padding = UDim.new(0, 6)
+
+local function rebuildTeleportList()
+	refreshCompletionSpawns()
+	for _, child in ipairs(spawnList:GetChildren()) do
+		if child:IsA("TextButton") or child:IsA("TextLabel") then child:Destroy() end
+	end
+	if #completionSpawnParts == 0 then
+		local empty = Instance.new("TextLabel")
+		empty.Size = UDim2.new(1, 0, 0, 34)
+		empty.BackgroundTransparency = 1
+		empty.Font = FONT_BODY
+		empty.TextColor3 = COLOR_SUBTEXT
+		empty.TextSize = 11
+		empty.Text = "No locations found in workspace.Spawns"
+		empty.Parent = spawnList
+		return
+	end
+	for _, part in ipairs(completionSpawnParts) do
+		local destination = part
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.new(1, 0, 0, UserInputService.TouchEnabled and 36 or 30)
+		button.BackgroundColor3 = COLOR_CARD_ON
+		button.BorderSizePixel = 0
+		button.Font = FONT_BUTTON
+		button.TextColor3 = COLOR_TEXT
+		button.TextSize = 11
+		button.TextWrapped = true
+		button.Text = completionSpawnLabel(destination)
+		button.AutoButtonColor = false
+		button.Parent = spawnList
+		corner(button, 15)
+		button.Activated:Connect(function()
+			if not destination.Parent then
+				runtimeMessage = "That location no longer exists"
+				rebuildTeleportList()
+				return
+			end
+			selectedCompletionSpawn = destination
+			runtimeMessage = "Teleporting to " .. completionSpawnLabel(destination)
+			local currentCharacter = player.Character
+			resetEatingSearch(currentCharacter and currentCharacter:GetAttribute("Food") or nil)
+			task.spawn(ragdollTeleport, destination.Position)
+		end)
+	end
+end
+rebuildTeleportList()
+local spawnsModel = workspace:FindFirstChild("Spawns")
+if spawnsModel then
+	table.insert(connections, spawnsModel.DescendantAdded:Connect(function() task.defer(rebuildTeleportList) end))
+	table.insert(connections, spawnsModel.DescendantRemoving:Connect(function() task.defer(rebuildTeleportList) end))
+end
+
+local farmButton = Instance.new("TextButton")
+farmButton.Size = UDim2.new(1, 0, 0, 34)
+farmButton.LayoutOrder = 2
+farmButton.BackgroundColor3 = COLOR_ACCENT
+farmButton.BorderSizePixel = 0
+farmButton.Font = FONT_TITLE
+farmButton.Text = "Teleport to Farm"
+farmButton.TextColor3 = COLOR_ACCENT_DK
+farmButton.TextSize = 12
+farmButton.AutoButtonColor = false
+farmButton.Parent = tabContents.Teleport
+corner(farmButton, 8)
+farmButton.Activated:Connect(function()
+	local currentCharacter = player.Character
+	resetEatingSearch(currentCharacter and currentCharacter:GetAttribute("Food") or nil)
+	task.spawn(ragdollTeleport, getSafeFarmPosition())
+end)
+
+setActiveTab("Survival")
+
+table.insert(connections, RunService.Heartbeat:Connect(function()
+	local character, root, humanoid = characterParts()
+	if state.autoDrink and drinkingToFull and not state.busy and root and humanoid then
+		updateSwimBarrier(root)
+		local velocity = root.AssemblyLinearVelocity
+		local animalName = character and character:GetAttribute("AnimalName")
+		local isAquatic = type(animalName) == "string" and AQUATIC_ANIMALS[animalName:lower()]
+
+		if isAquatic and swimAnchorPosition then
+			-- Trava também a profundidade (não só X/Z) — sem chão embaixo
+			-- na água funda, a gravidade nunca para de puxar pra baixo.
+			root.AssemblyLinearVelocity = Vector3.new(0, math.max(velocity.Y, 0), 0)
+			if root.Position.Y < swimAnchorPosition.Y - 1 then
+				root.CFrame = CFrame.new(root.Position.X, swimAnchorPosition.Y, root.Position.Z) * root.CFrame.Rotation
+			end
+		else
+			root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+		end
+
+		if swimAnchorPosition then
+			local horizontalOffset = Vector3.new(root.Position.X - swimAnchorPosition.X, 0, root.Position.Z - swimAnchorPosition.Z)
+			if horizontalOffset.Magnitude > 2.5 then
+				local heldPosition = Vector3.new(swimAnchorPosition.X, root.Position.Y, swimAnchorPosition.Z)
+				root.CFrame = CFrame.new(heldPosition) * root.CFrame.Rotation
+			end
+		end
+	elseif swimBarrier then
+		removeSwimBarrier()
+	end
+end))
+
+-- ============================================================
+-- HUD compacta no topo direito: slot, animal, crescimento, modo
+-- ============================================================
+local cornerHud = Instance.new("Frame")
+cornerHud.Size = UDim2.fromOffset(220, 94)
+cornerHud.Position = UDim2.new(1, -228, 0, 8)
+cornerHud.BackgroundColor3 = COLOR_BG
+cornerHud.BackgroundTransparency = 0.05
+cornerHud.BorderSizePixel = 0
+cornerHud.Parent = gui
+corner(cornerHud, 10)
+stroke(cornerHud, Color3.fromRGB(48, 24, 42), 1)
+
+local cornerAccent = Instance.new("Frame")
+cornerAccent.Size = UDim2.new(0, 3, 1, -14)
+cornerAccent.Position = UDim2.new(0, 0, 0, 7)
+cornerAccent.BackgroundColor3 = COLOR_ACCENT
+cornerAccent.BorderSizePixel = 0
+cornerAccent.Parent = cornerHud
+corner(cornerAccent, 2)
+
+local function cornerLabel(y, size, bold)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.new(1, -16, 0, size + 2)
+	l.Position = UDim2.new(0, 12, 0, y)
+	l.BackgroundTransparency = 1
+	l.TextColor3 = COLOR_TEXT
+	l.TextSize = size
+	l.Font = bold and FONT_TITLE or FONT_BODY
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextTruncate = Enum.TextTruncate.AtEnd
+	l.Parent = cornerHud
+	return l
+end
+
+local cornerSlotLabel = cornerLabel(6, 13, true)     -- "Name  [x slots]"
+local cornerAnimalLabel = cornerLabel(24, 11, false) -- "Animal: Elephant"
+local cornerGrowthLabel = cornerLabel(41, 11, true)  -- "Growth: 42%"
+local cornerModeLabel = cornerLabel(58, 11, false)   -- "Growing existing slots"
+local cornerMsgLabel = cornerLabel(75, 10, false)    -- runtimeMessage curta
+
+local cornerBarBg = Instance.new("Frame")
+cornerBarBg.Size = UDim2.new(1, -24, 0, 4)
+cornerBarBg.Position = UDim2.new(0, 12, 0, 53)
+cornerBarBg.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+cornerBarBg.BorderSizePixel = 0
+cornerBarBg.Parent = cornerHud
+corner(cornerBarBg, 4)
+
+local cornerBarFill = Instance.new("Frame")
+cornerBarFill.Size = UDim2.new(0, 0, 1, 0)
+cornerBarFill.BackgroundColor3 = COLOR_ACCENT
+cornerBarFill.BorderSizePixel = 0
+cornerBarFill.Parent = cornerBarBg
+corner(cornerBarFill, 4)
+
+local lastSlotCountCheck = 0
+local cachedSlotCount, cachedSlotAnimal = 0, nil
+
+-- ============================================================
+-- Mensagem de boas-vindas
+-- ============================================================
+local function showWelcomeToast()
+	local toast = Instance.new("Frame")
+	toast.Size = UDim2.fromOffset(280, 56)
+	toast.AnchorPoint = Vector2.new(0.5, 0)
+	toast.Position = UDim2.new(0.5, 0, 0, -70)
+	toast.BackgroundColor3 = COLOR_HEADER
+	toast.BorderSizePixel = 0
+	toast.Parent = gui
+	corner(toast, 10)
+	stroke(toast, COLOR_ACCENT, 1)
+
+	local icon = Instance.new("TextLabel")
+	icon.Size = UDim2.fromOffset(30, 30)
+	icon.Position = UDim2.fromOffset(10, 13)
+	icon.BackgroundTransparency = 1
+	icon.Text = "✓"
+	icon.TextColor3 = COLOR_ACCENT
+	icon.TextSize = 20
+	icon.Font = FONT_TITLE
+	icon.Parent = toast
+
+	local msg = Instance.new("TextLabel")
+	msg.Size = UDim2.new(1, -56, 1, -12)
+	msg.Position = UDim2.fromOffset(48, 6)
+	msg.BackgroundTransparency = 1
+	msg.Font = FONT_BODY
+	msg.TextColor3 = COLOR_TEXT
+	msg.TextSize = 12
+	msg.TextWrapped = true
+	msg.TextXAlignment = Enum.TextXAlignment.Left
+	msg.Text = "MMB HUB loaded. Drag the header to move, tap - to minimize."
+	msg.Parent = toast
+
+	TweenService:Create(toast, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, 0, 0, 16) }):Play()
+	task.delay(4, function()
+		if toast.Parent then
+			local outTween = TweenService:Create(toast, TweenInfo.new(0.3), { Position = UDim2.new(0.5, 0, 0, -70) })
+			outTween:Play()
+			outTween.Completed:Wait()
+			if toast.Parent then toast:Destroy() end
+		end
+	end)
+end
+showWelcomeToast()
+
+task.spawn(function()
+	while state.alive do
+		local character = player.Character
+		local slotName = character and character:GetAttribute("CharacterName") or "-"
+		local animalName = character and character:GetAttribute("AnimalName") or "-"
+		local growth = character and character:GetAttribute("GrowthPercentage") or 0
+
+		if animalName ~= cachedSlotAnimal or tick() - lastSlotCountCheck >= 3 then
+			lastSlotCountCheck = tick()
+			cachedSlotAnimal = animalName
+			local count = 0
+			for _, entry in ipairs(savedCharacters()) do
+				if entry.AnimalName == animalName then count = count + 1 end
+			end
+			cachedSlotCount = count
+		end
+
+		cornerSlotLabel.Text = string.format("%s  [%d %s]", slotName, cachedSlotCount, cachedSlotCount == 1 and "slot" or "slots")
+		cornerAnimalLabel.Text = "Animal: " .. tostring(animalName)
+
+		local growthPct = growth > 1 and (growth / 100) or growth
+		growthPct = math.clamp(growthPct, 0, 1)
+		cornerGrowthLabel.Text = string.format("Growth: %d%%", math.floor(growthPct * 100))
+		if growthPct < 0.5 then
+			cornerGrowthLabel.TextColor3 = Color3.fromRGB(255, math.floor(growthPct * 2 * 200), 60)
+		else
+			cornerGrowthLabel.TextColor3 = Color3.fromRGB(math.floor((1 - growthPct) * 2 * 255), 210, 60)
+		end
+		cornerBarFill.Size = UDim2.new(growthPct, 0, 1, 0)
+
+		local mode, color
+		if state.growExisting then
+			mode, color = "Growing existing slots", Color3.fromRGB(80, 200, 120)
+		elseif state.growNew then
+			mode, color = "Growing new slots", Color3.fromRGB(255, 150, 80)
+		elseif state.farmCoins then
+			mode, color = "AFK coin farming", Color3.fromRGB(255, 200, 50)
+		else
+			mode, color = "Idle", Color3.fromRGB(120, 120, 120)
+		end
+		cornerModeLabel.Text = mode
+		cornerModeLabel.TextColor3 = color
+		cornerAccent.BackgroundColor3 = color
+		cornerMsgLabel.Text = runtimeMessage
+
+		task.wait(0.5)
+	end
+end)
+
+task.spawn(function()
+	while state.alive do
+		local character, root = characterParts()
+		if character and root then
+			local food = character:GetAttribute("Food") or 0
+			local water = character:GetAttribute("Water") or 0
+			local growth = character:GetAttribute("GrowthPercentage") or 0
+			status.Text = string.format("%s | %s\nGrowth %d%%  Food %d%%  Water %d%%\n%s", tostring(character:GetAttribute("CharacterName") or "Slot"), tostring(character:GetAttribute("AnimalName") or "Animal"), math.floor(growth*100), math.floor(food), math.floor(water), runtimeMessage)
+			if state.escapeTerrain and isInsideTerrain(character, root) and not state.busy then root.CFrame = root.CFrame + Vector3.new(0,8,0) end
+			if root.Position.Y < config.dangerY and not state.busy then
+				if isDinoLife then
+					task.spawn(escapeDinoToSafety, "terra firme (saiu do void)")
+				else
+					task.spawn(ensureOnSolidGround, getSafeFarmPosition(), "terra firme (saiu do void)")
+				end
+			end
+		end
+		task.wait(0.5)
+	end
+end)
+task.spawn(function()
+	while state.alive do
+		pcall(autoDrinkStep)
+		if not drinkingToFull then pcall(autoEatStep) end
+		pcall(growthStep)
+		local character = player.Character
+		if state.farmCoins then
+			state.autoEat, state.autoDrink = true, true
+		end
+		if not state.autoEat and not state.autoDrink
+			or character and (character:GetAttribute("Food") or 100) >= 92
+				and (character:GetAttribute("Water") or 100) >= 98 then
+			blockClientSubState = false
+		end
+		task.wait(1)
+	end
+end)
+
+shared.__uiRootCleanup = function()
+	state.alive = false
+	removeSwimBarrier()
+	for _, connection in ipairs(connections) do connection:Disconnect() end
+	gui:Destroy()
+	shared.__uiRootCleanup = nil
+end
+print("Script carregado com sucesso!")
+
+task.spawn(function()
+	for attempt = 1, 10 do
+		local success = pcall(function()
+			game:GetService("StarterGui"):SetCore("SendNotification", {
+				Title = "MMB Key System",
+				Text = "Autenticado com sucesso!",
+				Duration = 5,
+			})
+		end)
+
+		if success then return end
+		task.wait(0.5)
+	end
+end)
