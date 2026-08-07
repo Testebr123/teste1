@@ -248,6 +248,58 @@ local function ragdollTeleport(position, maxAttempts, faceTowards)
 	return confirmed
 end
 
+-- Pouso especial pra entrar na água colidível (Hippo/Croco): teleporta bem
+-- mais alto acima da superfície e mantém o personagem inclinado com a
+-- frente pra CIMA durante a queda, então quando solta a física ele bate
+-- primeiro com a barriga/patas/parte traseira, em vez de mergulhar de
+-- cabeça (o que fazia atravessar a colisão e afundar).
+local function ragdollTeleportTiltedOntoWater(position, liftHeight, pitchDegrees)
+	liftHeight = liftHeight or 12
+	pitchDegrees = pitchDegrees or -65
+	if state.busy then
+		if tick() - lastRagdollTeleportAt > 8 then state.busy = false else return false end
+	end
+	state.busy = true
+	lastRagdollTeleportAt = tick()
+	local character, root, humanoid = characterParts()
+	if not character or not root or not humanoid then state.busy = false return false end
+
+	local liftedPosition = position + Vector3.new(0, liftHeight, 0)
+	local horizontalLook = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+	if horizontalLook.Magnitude < 0.01 then horizontalLook = Vector3.new(0, 0, -1) end
+	horizontalLook = horizontalLook.Unit
+	local tiltedCFrame = CFrame.lookAt(liftedPosition, liftedPosition + horizontalLook) * CFrame.Angles(math.rad(pitchDegrees), 0, 0)
+
+	root.Anchored = false
+	humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+	for _ = 1, 45 do
+		if not character.Parent or not root.Parent then break end
+		character:PivotTo(tiltedCFrame)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		task.wait()
+	end
+	lastRagdollTeleportAt = tick()
+
+	-- Solta a física já inclinado (nariz pra cima) e deixa cair naturalmente
+	-- até bater na água — assim toca primeiro com a parte de trás/patas.
+	for _ = 1, 20 do
+		if not root.Parent then break end
+		task.wait()
+	end
+
+	if humanoid.Parent then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
+	for _ = 1, 6 do
+		if not character.Parent then break end
+		character:SetAttribute("MovementDisabled", false)
+		task.wait(0.1)
+	end
+
+	local dist = root.Parent and (root.Position - position).Magnitude or math.huge
+	state.busy = false
+	return dist <= 30
+end
+
 local terrainParams = RaycastParams.new()
 terrainParams.FilterType = Enum.RaycastFilterType.Include
 terrainParams.FilterDescendantsInstances = { workspace.Terrain }
@@ -1099,10 +1151,11 @@ local function autoDrinkStep()
 		-- não embaixo — antes pousava 3 studs ABAIXO da superfície, ou seja,
 		-- nascia dentro do bloco sólido e a física empurrava/atravessava ele.
 		-- Não-aquáticos: água continua sem colisão, ficam um pouco submersos.
-		local landingPosition = isAquatic
-			and (waterPosition + Vector3.new(0, 2, 0))
-			or (waterPosition - Vector3.new(0, 3, 0))
-		ragdollTeleport(landingPosition)
+		if isAquatic then
+			ragdollTeleportTiltedOntoWater(waterPosition)
+		else
+			ragdollTeleport(waterPosition - Vector3.new(0, 3, 0))
+		end
 		drinkingSourcePosition = waterPosition
 		task.wait(0.25)
 		local _, newRoot = characterParts()
