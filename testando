@@ -782,8 +782,19 @@ local function updateSwimBarrier(root, resetAnchor)
 end
 
 -- Crocodile: rota exclusiva de bebida pela margem.
--- A agua enterrada sob o Terrain e ignorada: so conta se Water for o PRIMEIRO
--- material atingido por um raycast vertical vindo de cima.
+-- MainWaterPart cobre uma area enorme e continua por baixo do Terrain.
+-- Por isso NAO procuramos "onde existe agua" no X/Z: ela existe praticamente
+-- em todo lugar. A margem e encontrada comparando o topo do Terrain SOLIDO
+-- com a altura da superficie da MainWaterPart. Enquanto o Terrain estiver
+-- acima da agua, ela esta enterrada e e ignorada. Quando o Terrain desce para
+-- baixo do nivel da agua, aquela agua passa a estar exposta.
+CROC.solidTerrainParams = RaycastParams.new()
+CROC.solidTerrainParams.FilterType = Enum.RaycastFilterType.Include
+CROC.solidTerrainParams.FilterDescendantsInstances = { workspace.Terrain }
+CROC.solidTerrainParams.IgnoreWater = true
+CROC.lastShoreDirection = nil
+CROC.lastShorePosition = nil
+
 function CROC.findPrideRockSpawn1()
 	local spawns = workspace:FindFirstChild("Spawns")
 	if not spawns then return nil end
@@ -792,76 +803,84 @@ function CROC.findPrideRockSpawn1()
 	return nil
 end
 
-function CROC.topTerrainHitAt(position, castY)
-	local y = castY or (position.Y + 240)
+function CROC.getWaterSurfaceY()
+	local waterPart = workspace:FindFirstChild("MainWaterPart")
+	if not waterPart or not waterPart:IsA("BasePart") then return nil, nil end
+	return waterPart.Position.Y + waterPart.Size.Y / 2, waterPart
+end
+
+function CROC.solidTerrainHitAt(position, castY)
 	return workspace:Raycast(
-		Vector3.new(position.X, y, position.Z),
-		Vector3.new(0, -700, 0),
-		terrainParams
+		Vector3.new(position.X, castY, position.Z),
+		Vector3.new(0, -1200, 0),
+		CROC.solidTerrainParams
 	)
 end
 
-function CROC.findNearestExposedWater(origin, maximumRadius)
-	maximumRadius = maximumRadius or 700
-	local castY = origin.Y + 260
-	local angleOffset = (player.UserId % 360) * math.pi / 180
-	for radius = 12, maximumRadius, 8 do
-		for index = 0, 31 do
-			local angle = angleOffset + index / 32 * math.pi * 2
-			local probe = origin + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
-			local hit = CROC.topTerrainHitAt(probe, castY)
-			if hit and hit.Material == Enum.Material.Water then return hit.Position end
-		end
-	end
-	return nil
-end
-
 function CROC.findVisibleShoreFrom(origin)
-	local exposedWater = CROC.findNearestExposedWater(origin, 700)
-	if not exposedWater then return nil end
+	local waterY = CROC.getWaterSurfaceY()
+	if not waterY then return nil end
 
-	local flat = Vector3.new(exposedWater.X - origin.X, 0, exposedWater.Z - origin.Z)
-	if flat.Magnitude < 1 then return nil end
-	local direction = flat.Unit
-	local distance = flat.Magnitude
-	local castY = math.max(origin.Y, exposedWater.Y) + 260
-	local lastLandHit = CROC.topTerrainHitAt(origin, castY)
-	local lastLandDistance = 0
-	local firstWaterDistance
+	local castY = math.max(origin.Y, waterY) + 350
+	local maxRadius = 900
+	local step = 5
+	local directions = 72
+	local exposureDepth = 0.75
+	local bestPosition, bestDirection, bestDistance
 
-	for d = 2, distance + 4, 2 do
-		local probe = origin + direction * math.min(d, distance)
-		local hit = CROC.topTerrainHitAt(probe, castY)
-		if hit then
-			if hit.Material == Enum.Material.Water then
-				firstWaterDistance = math.min(d, distance)
+	local function waterIsExposedAt(position)
+		local hit = CROC.solidTerrainHitAt(position, castY)
+		-- Sem Terrain solido acima/na superficie = agua visivel.
+		if not hit then return true, nil end
+		return hit.Position.Y <= waterY - exposureDepth, hit
+	end
+
+	for index = 0, directions - 1 do
+		local angle = index / directions * math.pi * 2
+		local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
+		local lastDryDistance = nil
+		local lastDryHit = nil
+
+		for distance = 0, maxRadius, step do
+			local probe = origin + direction * distance
+			local exposed, hit = waterIsExposedAt(probe)
+
+			if exposed then
+				if lastDryDistance and lastDryHit then
+					-- Refina a transicao terra -> agua para achar a margem real.
+					local low = lastDryDistance
+					local high = distance
+					for _ = 1, 8 do
+						local mid = (low + high) / 2
+						local midExposed = waterIsExposedAt(origin + direction * mid)
+						if midExposed then
+							high = mid
+						else
+							low = mid
+						end
+					end
+
+					-- Fica um pouco ANTES do inicio da agua. Assim o corpo permanece
+					-- no Terrain, mas a cabeca fica perto o bastante para beber.
+					local shoreDistance = math.max(0, low - 1.25)
+					local shoreProbe = origin + direction * shoreDistance
+					local shoreHit = CROC.solidTerrainHitAt(shoreProbe, castY) or lastDryHit
+
+					if shoreHit and (not bestDistance or shoreDistance < bestDistance) then
+						bestDistance = shoreDistance
+						bestPosition = shoreHit.Position
+						bestDirection = direction
+					end
+				end
 				break
-			else
-				lastLandHit = hit
-				lastLandDistance = math.min(d, distance)
 			end
-		end
-	end
-	if not lastLandHit or not firstWaterDistance then return nil end
 
-	local low, high = lastLandDistance, firstWaterDistance
-	for _ = 1, 7 do
-		local mid = (low + high) / 2
-		local hit = CROC.topTerrainHitAt(origin + direction * mid, castY)
-		if hit and hit.Material == Enum.Material.Water then
-			high = mid
-		elseif hit then
-			low = mid
-			lastLandHit = hit
-		else
-			high = mid
+			lastDryDistance = distance
+			lastDryHit = hit
 		end
 	end
 
-	local safeProbe = origin + direction * math.max(0, low - 1.5)
-	local safeHit = CROC.topTerrainHitAt(safeProbe, castY)
-	if safeHit and safeHit.Material ~= Enum.Material.Water then lastLandHit = safeHit end
-	return lastLandHit.Position
+	return bestPosition, bestDirection, bestDistance
 end
 
 function CROC.teleportToPrideRock(prideRock)
@@ -897,11 +916,13 @@ function CROC.approachDrink()
 	CROC.approachBusy = true
 	removeSwimBarrier()
 	drinkingSourcePosition = nil
+	CROC.lastShoreDirection = nil
+	CROC.lastShorePosition = nil
 
-	-- Croco nao usa colisao da MainWaterPart: ele fica em terra, na margem.
-	-- Assim a agua/part enterrada embaixo do Terrain nao interfere no caminho.
-	local waterPart = workspace:FindFirstChild("MainWaterPart")
-	if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
+	-- Para o Croco a agua fica colidivel. A diferenca agora e que ele NAO e
+	-- teleportado para ela: sai do PrideRock e chega fisicamente ate a margem.
+	local _, waterPart = CROC.getWaterSurfaceY()
+	if waterPart then waterPart.CanCollide = true end
 
 	local prideRock = CROC.findPrideRockSpawn1()
 	if not prideRock then
@@ -910,39 +931,48 @@ function CROC.approachDrink()
 		return false
 	end
 
-	runtimeMessage = "Croco: TP -> PrideRockSpawn1"
-	if not CROC.teleportToPrideRock(prideRock) then
-		runtimeMessage = "Croco: falhou TP PrideRockSpawn1"
-		CROC.approachBusy = false
-		return false
+	local _, currentRoot = characterParts()
+	local prideDistance = currentRoot and (currentRoot.Position - prideRock.Position).Magnitude or math.huge
+	if prideDistance > 28 then
+		runtimeMessage = "Croco: TP -> PrideRockSpawn1"
+		if not CROC.teleportToPrideRock(prideRock) then
+			runtimeMessage = "Croco: falhou TP PrideRockSpawn1"
+			CROC.approachBusy = false
+			return false
+		end
+	else
+		runtimeMessage = "Croco: ja esta no PrideRockSpawn1"
 	end
 
-	task.wait(0.15)
+	task.wait(0.2)
 	character, root = characterParts()
 	if not character or not root or not CROC.isCharacter(character) then
 		CROC.approachBusy = false
 		return false
 	end
 
-	runtimeMessage = "Croco: procurando agua exposta"
-	local shorePosition = CROC.findVisibleShoreFrom(root.Position)
+	runtimeMessage = "Croco: procurando onde a agua sai do Terrain"
+	local shorePosition, shoreDirection, shoreDistance = CROC.findVisibleShoreFrom(root.Position)
 	if not shorePosition then
-		runtimeMessage = "Croco: margem exposta nao encontrada"
+		runtimeMessage = "Croco: nao achei transicao Terrain -> agua"
 		CROC.approachBusy = false
 		return false
 	end
 
-	-- Mesma funcao usada para ir ate a grama.
-	runtimeMessage = "Croco: andando ate a margem"
+	CROC.lastShoreDirection = shoreDirection
+	CROC.lastShorePosition = shorePosition
+	runtimeMessage = string.format("Croco: margem a %d studs; indo ate ela", math.floor(shoreDistance or 0))
+
+	-- Usa exatamente o mesmo movimento utilizado pelo farm de grama.
 	local moved = moveToGrass(shorePosition)
-	task.wait(0.2)
+	task.wait(0.25)
 	character, root = characterParts()
 	if character and root and CROC.isCharacter(character) then
 		drinkingSourcePosition = root.Position
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
-		runtimeMessage = "Croco: bebendo na margem"
-		for _ = 1, 4 do
+		runtimeMessage = "Croco: na margem; bebendo"
+		for _ = 1, 5 do
 			setSubState("Drinking")
 			task.wait(0.2)
 		end
@@ -1265,6 +1295,8 @@ local function virtualDrinkKick()
 	elseif CROC.isCharacter(character) then
 		drinkingSourcePosition = nil
 		removeSwimBarrier()
+		local _, waterPart = CROC.getWaterSurfaceY()
+		if waterPart then waterPart.CanCollide = true end
 		CROC.approachDrink()
 	elseif drinkingSourcePosition then
 		ragdollTeleport(drinkingSourcePosition)
@@ -1360,11 +1392,11 @@ local function autoDrinkStep()
 
 
 	if CROC.isCharacter(character) then
-		local waterPart = workspace:FindFirstChild("MainWaterPart")
-		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
+		local _, waterPart = CROC.getWaterSurfaceY()
+		if waterPart then waterPart.CanCollide = true end
 
 		if drinkingSourcePosition and (root.Position - drinkingSourcePosition).Magnitude <= 14 then
-			runtimeMessage = "Croco: bebendo na margem"
+			runtimeMessage = "Croco: na margem; bebendo"
 			setSubState("Drinking")
 			return
 		end
