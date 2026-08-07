@@ -107,11 +107,32 @@ for name in pairs(CARNIVORES) do CARNIVORE_NAMES_LOWER[name:lower()] = true end
 -- só trava X/Z, nunca a profundidade) — sem isso eles afundam pra sempre.
 local AQUATIC_ANIMALS = { hippo = true, crocodile = true }
 
--- Comparação case-insensitive + fallback pelo atributo AnimalType (ex:
--- "Carnivore"), que é mais confiável do que só bater o nome exato — o
--- Crocodile não estava sendo reconhecido e ia procurar grama por causa disso.
+local function isAquaticCharacter(character)
+	if not character then return false end
+	local animal = character:GetAttribute("AnimalName")
+	return type(animal) == "string" and AQUATIC_ANIMALS[animal:lower()] == true
+end
+
+-- Lê o AnimalClass direto do model do jogador na workspace (acha pelo nome
+-- do jogador, sempre na hora — nunca cacheia, então funciona certinho
+-- mesmo depois de trocar de animal). É a fonte mais confiável de dieta:
+-- "Herbivore" come grama, "Carnivore" come carcaça.
+local function getAnimalClass(character)
+	local model = workspace:FindFirstChild(player.Name)
+	local target = (model and model:IsA("Model") and model) or character
+	if not target then return nil end
+	local class = target:GetAttribute("AnimalClass")
+	if type(class) == "string" and class ~= "" then return class end
+	return nil
+end
+
 local function isCarnivoreCharacter(character)
 	if not character then return false end
+	local class = getAnimalClass(character)
+	if class then return class:lower():find("carn", 1, true) ~= nil end
+
+	-- Fallback (só se o AnimalClass não existir por algum motivo): nome
+	-- conhecido ou o antigo atributo AnimalType.
 	local animal = character:GetAttribute("AnimalName")
 	if type(animal) == "string" and CARNIVORE_NAMES_LOWER[animal:lower()] then return true end
 	local animalType = character:GetAttribute("AnimalType")
@@ -867,6 +888,8 @@ local function forcePostDrinkTeleport()
 		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
 		escapeDinoToSafety("saindo da água")
 	else
+		local waterPart = workspace:FindFirstChild("MainWaterPart")
+		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
 		local ok = pcall(function()
 			refreshCompletionSpawns()
 			local candidates = {}
@@ -973,6 +996,13 @@ local function autoDrinkStep()
 	if drinkingToFull and water >= (preSwitchWaterTarget or 98) then
 		drinkingToFull = false
 		removeSwimBarrier()
+		-- Reverte a água pra não-colidível (só era sólida pra Hippo/Crocodile
+		-- beberem sem afundar) — senão fica sólida pra sempre e atrapalha
+		-- outros animais nadando/andando por ela depois.
+		if isAquaticCharacter(character) then
+			local waterPart = workspace:FindFirstChild("MainWaterPart")
+			if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
+		end
 		task.spawn(forcePostDrinkTeleport)
 		return
 	end
@@ -1009,12 +1039,22 @@ local function autoDrinkStep()
 		return
 	end
 
+	local isAquatic = isAquaticCharacter(character)
+
 	if drinkingSourcePosition and (root.Position - drinkingSourcePosition).Magnitude <= 16 then
 		runtimeMessage = "Bebendo ate encher"
+		if isAquatic then
+			local waterPart = workspace:FindFirstChild("MainWaterPart")
+			-- Só pra Hippo/Crocodile: deixa a água colidível pra eles terem
+			-- chão de verdade em vez de afundar. Nunca acontece pros outros
+			-- animais, que nem entram nesse "if isAquatic".
+			if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
+		end
 		setSubState("Drinking")
 		return
 	end
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
+	if isAquatic and waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
 	local waterPosition = waterPart and waterPart:IsA("BasePart")
 		and Vector3.new(root.Position.X, waterPart.Position.Y, root.Position.Z)
 		or findMaterial(root.Position, Enum.Material.Water, 384)
@@ -1184,6 +1224,8 @@ end
 
 local growthBusy = false
 local preSwitchTopUpActive = false -- true enquanto estamos no meio de encher comida/água antes de trocar
+local preSwitchTopUpStartedAt = nil
+local PRE_SWITCH_TOP_UP_TIMEOUT = 90 -- segundos: desiste de esperar 100% (ex: sem carcaça por perto) e troca mesmo assim
 local MAX_SLOTS = 40
 
 local function findNamedSpawnPart(name)
@@ -1234,25 +1276,38 @@ local function growthStep()
 
 	if not preSwitchTopUpActive and (food < 85 or water < 85) then
 		preSwitchTopUpActive = true
+		preSwitchTopUpStartedAt = tick()
 	end
 
 	if preSwitchTopUpActive then
-		if food < 99 then
+		local waitedTooLong = preSwitchTopUpStartedAt and (tick() - preSwitchTopUpStartedAt) >= PRE_SWITCH_TOP_UP_TIMEOUT
+
+		if waitedTooLong and food >= 50 and water >= 50 then
+			-- Desiste de esperar 100% (ex: carnívoro sem carcaça disponível
+			-- por perto — foi isso que travou o Rex pra sempre no Dino Life)
+			-- e troca de slot mesmo assim, já que está num nível seguro.
+			runtimeMessage = string.format("Não consegui encher 100%% a tempo (Food %d%%  Water %d%%); trocando mesmo assim", math.floor(food), math.floor(water))
+			preSwitchFoodTarget = nil
+			preSwitchWaterTarget = nil
+			preSwitchTopUpActive = false
+			preSwitchTopUpStartedAt = nil
+		elseif food < 99 then
 			preSwitchFoodTarget = 100
 			drinkingToFull = false -- beber não pode interromper o comer agora
 			runtimeMessage = string.format("Filling up before slot switch (Food %d%%  Water %d%%)", math.floor(food), math.floor(water))
 			return
-		end
-		preSwitchFoodTarget = nil
-
-		if water < 99 then
+		elseif water < 99 then
+			preSwitchFoodTarget = nil
 			preSwitchWaterTarget = 100
 			drinkingToFull = true
 			runtimeMessage = string.format("Filling up before slot switch (Food %d%%  Water %d%%)", math.floor(food), math.floor(water))
 			return
+		else
+			preSwitchFoodTarget = nil
+			preSwitchWaterTarget = nil
+			preSwitchTopUpActive = false
+			preSwitchTopUpStartedAt = nil
 		end
-		preSwitchWaterTarget = nil
-		preSwitchTopUpActive = false -- terminou; só reativa se cair abaixo de 85% de novo
 	end
 
 	local completedName = character:GetAttribute("CharacterName")
@@ -1269,6 +1324,7 @@ local function growthStep()
 	end
 	growthBusy = true
 	preSwitchTopUpActive = false
+	preSwitchTopUpStartedAt = nil
 	preSwitchFoodTarget = nil
 	preSwitchWaterTarget = nil
 
@@ -2010,19 +2066,11 @@ table.insert(connections, RunService.Heartbeat:Connect(function()
 	if state.autoDrink and drinkingToFull and not state.busy and root and humanoid then
 		updateSwimBarrier(root)
 		local velocity = root.AssemblyLinearVelocity
-		local animalName = character and character:GetAttribute("AnimalName")
-		local isAquatic = type(animalName) == "string" and AQUATIC_ANIMALS[animalName:lower()]
 
-		if isAquatic and swimAnchorPosition then
-			-- Trava também a profundidade (não só X/Z) — sem chão embaixo
-			-- na água funda, a gravidade nunca para de puxar pra baixo.
-			root.AssemblyLinearVelocity = Vector3.new(0, math.max(velocity.Y, 0), 0)
-			if root.Position.Y < swimAnchorPosition.Y - 1 then
-				root.CFrame = CFrame.new(root.Position.X, swimAnchorPosition.Y, root.Position.Z) * root.CFrame.Rotation
-			end
-		else
-			root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
-		end
+		-- Hippo/Crocodile: a água fica colidível pra eles (ver autoDrinkStep),
+		-- então o chão de verdade já resolve a profundidade — só precisa
+		-- segurar o X/Z como todo mundo, sem hack de CFrame em Y.
+		root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
 
 		if swimAnchorPosition then
 			local horizontalOffset = Vector3.new(root.Position.X - swimAnchorPosition.X, 0, root.Position.Z - swimAnchorPosition.Z)
