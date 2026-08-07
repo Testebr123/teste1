@@ -121,8 +121,7 @@ end
 local function isCrocodileCharacter(character)
 	local animal = getWorkspaceAnimalName(character)
 	if not animal then return false end
-	animal = animal:lower()
-	return animal == "crocodile" or animal == "croco"
+	return animal:lower():find("croc", 1, true) ~= nil
 end
 
 local function isAquaticCharacter(character)
@@ -524,35 +523,56 @@ local function moveCrocodileTowardWater(waterPosition)
 	local character, root, humanoid = characterParts()
 	if not character or not root or not humanoid then state.busy = false return false end
 
-	local height = math.max(humanoid.HipHeight, 1.5)
-	local goalPosition = waterPosition + Vector3.new(0, height, 0)
-	local direction = goalPosition - root.Position
-	local flatDirection = Vector3.new(direction.X, 0, direction.Z)
-	if flatDirection.Magnitude < 0.01 then flatDirection = root.CFrame.LookVector end
-	local startCFrame = root.CFrame
-	local goalCFrame = CFrame.lookAt(goalPosition, goalPosition + flatDirection)
-	local duration = math.clamp(direction.Magnitude / 55, 0.15, 8)
+	-- Croco precisa ir fisicamente andando. CFrame/PivotTo atravessa a colisao
+	-- do MainWaterPart, que era justamente o problema do teleporte antigo.
+	local flatTarget = Vector3.new(waterPosition.X, root.Position.Y, waterPosition.Z)
+	local direction = flatTarget - root.Position
+	if direction.Magnitude > 0.5 then
+		local flatDirection = Vector3.new(direction.X, 0, direction.Z)
+		if flatDirection.Magnitude > 0.01 then
+			character:PivotTo(CFrame.lookAt(root.Position, root.Position + flatDirection.Unit))
+		end
+	end
+
 	local startedAt = tick()
+	local lastPosition = root.Position
+	local lastMovedAt = tick()
 	local detectedDrink = false
 
-	while state.alive and character.Parent and root.Parent do
-		local alpha = math.clamp((tick() - startedAt) / duration, 0, 1)
-		root.CFrame = startCFrame:Lerp(goalCFrame, alpha)
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-
+	humanoid:MoveTo(waterPosition)
+	while state.alive and character.Parent and root.Parent and humanoid.Parent and tick() - startedAt < 15 do
 		if detectAvailableFood(character) == "Drink" then
 			detectedDrink = true
 			break
 		end
-		if alpha >= 1 then break end
-		RunService.Heartbeat:Wait()
+
+		local moved = (root.Position - lastPosition).Magnitude
+		if moved >= 0.75 then
+			lastPosition = root.Position
+			lastMovedAt = tick()
+		elseif tick() - lastMovedAt >= 1.25 then
+			-- Parou na colisao da agua: fica exatamente na margem e tenta beber daqui.
+			break
+		end
+
+		if humanoid:GetState() == Enum.HumanoidStateType.Swimming then
+			-- Segurança: se por qualquer motivo entrou na agua, volta ao ultimo ponto
+			-- em terra e nao continua avançando.
+			character:PivotTo(CFrame.new(lastPosition) * root.CFrame.Rotation)
+			break
+		end
+
+		humanoid:MoveTo(waterPosition)
+		task.wait(0.1)
 	end
 
+	humanoid:MoveTo(root.Position)
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
+
+	if detectAvailableFood(character) == "Drink" then detectedDrink = true end
 	state.busy = false
-	return detectedDrink or (root.Position - goalPosition).Magnitude <= 12
+	return detectedDrink
 end
 
 local function nearestCarcass(root)
@@ -888,7 +908,7 @@ local function approachCrocodileDrink()
 	character, root = characterParts()
 	if character and root and isCrocodileCharacter(character) then
 		drinkingSourcePosition = root.Position
-		updateSwimBarrier(root, true)
+		runtimeMessage = reached and "Croco: bebendo na margem" or "Croco: na margem; tentando beber"
 		for _ = 1, 3 do
 			setSubState("Drinking")
 			task.wait(0.2)
@@ -1309,7 +1329,8 @@ local function autoDrinkStep()
 	end
 
 	-- EXCLUSIVO do Crocodile: nada de teleportar em cima da agua.
-	-- Vai primeiro ao PrideRockSpawn1 e anda ate a agua, igual ao movimento da grama.
+	-- Vai primeiro ao PrideRockSpawn1 e depois usa Humanoid:MoveTo ate a margem.
+	-- Assim a colisao da agua e respeitada e nao existe teleporte/CFrame para dentro dela.
 	if isCrocodileCharacter(character) then
 		local waterPart = workspace:FindFirstChild("MainWaterPart")
 		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
