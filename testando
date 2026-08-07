@@ -107,9 +107,26 @@ for name in pairs(CARNIVORES) do CARNIVORE_NAMES_LOWER[name:lower()] = true end
 -- só trava X/Z, nunca a profundidade) — sem isso eles afundam pra sempre.
 local AQUATIC_ANIMALS = { hippo = true, crocodile = true }
 
+-- Sempre lê o AnimalName direto do model atual do jogador na workspace.
+-- Não cacheia, então trocar de animal/slot atualiza a detecção imediatamente.
+local function getWorkspaceAnimalName(character)
+	local model = workspace:FindFirstChild(player.Name)
+	local target = (model and model:IsA("Model") and model) or character or player.Character
+	if not target then return nil end
+	local animal = target:GetAttribute("AnimalName")
+	if type(animal) == "string" and animal ~= "" then return animal end
+	return nil
+end
+
+local function isCrocodileCharacter(character)
+	local animal = getWorkspaceAnimalName(character)
+	if not animal then return false end
+	animal = animal:lower()
+	return animal == "crocodile" or animal == "croco"
+end
+
 local function isAquaticCharacter(character)
-	if not character then return false end
-	local animal = character:GetAttribute("AnimalName")
+	local animal = getWorkspaceAnimalName(character)
 	return type(animal) == "string" and AQUATIC_ANIMALS[animal:lower()] == true
 end
 
@@ -479,6 +496,65 @@ local function detectAvailableFood(character)
 	return ok and result or nil
 end
 
+-- Rota exclusiva do Crocodile para beber no Savannah/Jungle:
+-- teleporta primeiro para PrideRockSpawn1 e, dali, anda ate a agua.
+local function findPrideRockSpawn1()
+	local spawns = workspace:FindFirstChild("Spawns")
+	if not spawns then return nil end
+	local part = spawns:FindFirstChild("PrideRockSpawn1", true)
+	if part and part:IsA("BasePart") then return part end
+	return nil
+end
+
+local function closestWaterSurfacePoint(waterPart, origin)
+	if not waterPart or not waterPart:IsA("BasePart") then return nil end
+	local localPos = waterPart.CFrame:PointToObjectSpace(origin)
+	local halfX = waterPart.Size.X / 2
+	local halfZ = waterPart.Size.Z / 2
+	local insetX = math.min(6, math.max(0, halfX - 0.1))
+	local insetZ = math.min(6, math.max(0, halfZ - 0.1))
+	local x = math.clamp(localPos.X, -halfX + insetX, halfX - insetX)
+	local z = math.clamp(localPos.Z, -halfZ + insetZ, halfZ - insetZ)
+	return waterPart.CFrame:PointToWorldSpace(Vector3.new(x, waterPart.Size.Y / 2, z))
+end
+
+local function moveCrocodileTowardWater(waterPosition)
+	if state.busy then return false end
+	state.busy = true
+	local character, root, humanoid = characterParts()
+	if not character or not root or not humanoid then state.busy = false return false end
+
+	local height = math.max(humanoid.HipHeight, 1.5)
+	local goalPosition = waterPosition + Vector3.new(0, height, 0)
+	local direction = goalPosition - root.Position
+	local flatDirection = Vector3.new(direction.X, 0, direction.Z)
+	if flatDirection.Magnitude < 0.01 then flatDirection = root.CFrame.LookVector end
+	local startCFrame = root.CFrame
+	local goalCFrame = CFrame.lookAt(goalPosition, goalPosition + flatDirection)
+	local duration = math.clamp(direction.Magnitude / 55, 0.15, 8)
+	local startedAt = tick()
+	local detectedDrink = false
+
+	while state.alive and character.Parent and root.Parent do
+		local alpha = math.clamp((tick() - startedAt) / duration, 0, 1)
+		root.CFrame = startCFrame:Lerp(goalCFrame, alpha)
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+
+		if detectAvailableFood(character) == "Drink" then
+			detectedDrink = true
+			break
+		end
+		if alpha >= 1 then break end
+		RunService.Heartbeat:Wait()
+	end
+
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	state.busy = false
+	return detectedDrink or (root.Position - goalPosition).Magnitude <= 12
+end
+
 local function nearestCarcass(root)
 	local best, bestRoot, distance = nil, nil, math.huge
 
@@ -759,6 +835,68 @@ local function updateSwimBarrier(root, resetAnchor)
 		walls[3].Size, walls[3].CFrame = Vector3.new(2,18,16), CFrame.new(center + Vector3.new(7,0,0))
 		walls[4].Size, walls[4].CFrame = Vector3.new(2,18,16), CFrame.new(center + Vector3.new(-7,0,0))
 	end
+end
+
+local crocDrinkApproachBusy = false
+local function approachCrocodileDrink()
+	if crocDrinkApproachBusy or criticalRecoveryActive then return false end
+	local character = player.Character
+	if not character or not isCrocodileCharacter(character) then return false end
+
+	local prideRock = findPrideRockSpawn1()
+	if not prideRock then
+		runtimeMessage = "Croco: PrideRockSpawn1 nao encontrado"
+		return false
+	end
+
+	crocDrinkApproachBusy = true
+	removeSwimBarrier()
+	drinkingSourcePosition = nil
+
+	local waterPart = workspace:FindFirstChild("MainWaterPart")
+	if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
+
+	runtimeMessage = "Croco: indo para PrideRockSpawn1"
+	local teleported = ragdollTeleport(prideRock.Position, 8)
+	if not teleported then
+		runtimeMessage = "Croco: falha ao chegar no PrideRockSpawn1"
+		crocDrinkApproachBusy = false
+		return false
+	end
+
+	task.wait(0.2)
+	character, root = characterParts()
+	if not character or not root or not isCrocodileCharacter(character) then
+		crocDrinkApproachBusy = false
+		return false
+	end
+
+	local waterPosition = findMaterial(root.Position, Enum.Material.Water, 384)
+	if not waterPosition and waterPart and waterPart:IsA("BasePart") then
+		waterPosition = closestWaterSurfacePoint(waterPart, root.Position)
+	end
+	if not waterPosition then
+		runtimeMessage = "Croco: agua nao encontrada perto do PrideRockSpawn1"
+		crocDrinkApproachBusy = false
+		return false
+	end
+
+	runtimeMessage = "Croco: andando ate a agua"
+	local reached = moveCrocodileTowardWater(waterPosition)
+	task.wait(0.15)
+
+	character, root = characterParts()
+	if character and root and isCrocodileCharacter(character) then
+		drinkingSourcePosition = root.Position
+		updateSwimBarrier(root, true)
+		for _ = 1, 3 do
+			setSubState("Drinking")
+			task.wait(0.2)
+		end
+	end
+
+	crocDrinkApproachBusy = false
+	return reached
 end
 
 local VirtualInputManager = game:GetService("VirtualInputManager")
@@ -1063,6 +1201,7 @@ local function holdDinoDrinkPosition(targetPosition)
 	dinoDrinkHoldBusy = false
 end
 local lastDrinkWatchdogWater
+local lastDrinkAnimalName
 
 local function virtualDrinkKick()
 	local character, root = characterParts()
@@ -1071,6 +1210,10 @@ local function virtualDrinkKick()
 
 	if isDinoLife then
 		ragdollTeleportTiltedOntoWater(DINO_DRINK_POSITION + Vector3.new(0, surfaceStandOffset(character), 0))
+	elseif isCrocodileCharacter(character) then
+		drinkingSourcePosition = nil
+		removeSwimBarrier()
+		approachCrocodileDrink()
 	elseif drinkingSourcePosition then
 		ragdollTeleport(drinkingSourcePosition)
 	end
@@ -1097,6 +1240,19 @@ local function autoDrinkStep()
 	if not state.autoDrink or state.busy or criticalRecoveryActive then return end
 	local character, root = characterParts()
 	if not character or not root then return end
+
+	local currentAnimalName = getWorkspaceAnimalName(character)
+	if currentAnimalName and currentAnimalName ~= lastDrinkAnimalName then
+		if lastDrinkAnimalName ~= nil then
+			drinkingToFull = false
+			drinkingSourcePosition = nil
+			drinkingStuckSince = nil
+			lastDrinkWatchdogWater = nil
+			removeSwimBarrier()
+		end
+		lastDrinkAnimalName = currentAnimalName
+	end
+
 	local water = character:GetAttribute("Water") or 100
 	if water <= 75 then
 		drinkingToFull = true
@@ -1149,6 +1305,22 @@ local function autoDrinkStep()
 			setSubState("Drinking")
 			task.wait(0.2)
 		end
+		return
+	end
+
+	-- EXCLUSIVO do Crocodile: nada de teleportar em cima da agua.
+	-- Vai primeiro ao PrideRockSpawn1 e anda ate a agua, igual ao movimento da grama.
+	if isCrocodileCharacter(character) then
+		local waterPart = workspace:FindFirstChild("MainWaterPart")
+		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
+
+		if drinkingSourcePosition and (root.Position - drinkingSourcePosition).Magnitude <= 16 then
+			runtimeMessage = "Croco: bebendo ate encher"
+			setSubState("Drinking")
+			return
+		end
+
+		approachCrocodileDrink()
 		return
 	end
 
