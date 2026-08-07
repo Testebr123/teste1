@@ -429,7 +429,7 @@ local function findDistantGrass(origin)
 	end
 end
 
-local function moveToGrass(grassPosition)
+local function moveToGrass(grassPosition, speedOverride)
 	if state.busy then return false end
 	state.busy = true
 	local character, root, humanoid = characterParts()
@@ -442,7 +442,8 @@ local function moveToGrass(grassPosition)
 	local flatDirection = Vector3.new(direction.X, 0, direction.Z)
 	if flatDirection.Magnitude < 0.01 then flatDirection = root.CFrame.LookVector end
 	local goalCFrame = CFrame.lookAt(goalPosition, goalPosition + flatDirection)
-	local duration = math.clamp((goalPosition - root.Position).Magnitude / 55, 0.15, 8)
+	local moveSpeed = speedOverride or 55
+	local duration = math.clamp((goalPosition - root.Position).Magnitude / moveSpeed, 0.15, 16)
 	local startedAt = tick()
 	while state.alive and character.Parent and root.Parent do
 		local alpha = math.clamp((tick() - startedAt) / duration, 0, 1)
@@ -963,8 +964,8 @@ function CROC.approachDrink()
 	CROC.lastShorePosition = shorePosition
 	runtimeMessage = string.format("Croco: margem a %d studs; indo ate ela", math.floor(shoreDistance or 0))
 
-	-- Usa exatamente o mesmo movimento utilizado pelo farm de grama.
-	local moved = moveToGrass(shorePosition)
+	-- Croco anda com metade da velocidade normal para evitar o limitador do jogo.
+	local moved = moveToGrass(shorePosition, 27.5)
 	task.wait(0.25)
 	character, root = characterParts()
 	if character and root and CROC.isCharacter(character) then
