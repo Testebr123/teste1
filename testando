@@ -253,9 +253,10 @@ end
 -- frente pra CIMA durante a queda, então quando solta a física ele bate
 -- primeiro com a barriga/patas/parte traseira, em vez de mergulhar de
 -- cabeça (o que fazia atravessar a colisão e afundar).
-local function ragdollTeleportTiltedOntoWater(position, liftHeight, pitchDegrees)
+local function ragdollTeleportTiltedOntoWater(position, liftHeight, pitchDegrees, descendSeconds)
 	liftHeight = liftHeight or 12
-	pitchDegrees = pitchDegrees or -65
+	pitchDegrees = pitchDegrees or 65
+	descendSeconds = descendSeconds or 0.8
 	if state.busy then
 		if tick() - lastRagdollTeleportAt > 8 then state.busy = false else return false end
 	end
@@ -264,29 +265,44 @@ local function ragdollTeleportTiltedOntoWater(position, liftHeight, pitchDegrees
 	local character, root, humanoid = characterParts()
 	if not character or not root or not humanoid then state.busy = false return false end
 
-	local liftedPosition = position + Vector3.new(0, liftHeight, 0)
 	local horizontalLook = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
 	if horizontalLook.Magnitude < 0.01 then horizontalLook = Vector3.new(0, 0, -1) end
 	horizontalLook = horizontalLook.Unit
-	local tiltedCFrame = CFrame.lookAt(liftedPosition, liftedPosition + horizontalLook) * CFrame.Angles(math.rad(pitchDegrees), 0, 0)
+	local function tiltedCFrameAt(pos)
+		return CFrame.lookAt(pos, pos + horizontalLook) * CFrame.Angles(math.rad(pitchDegrees), 0, 0)
+	end
 
 	root.Anchored = false
-	humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-	for _ = 1, 45 do
+
+	-- NUNCA solta em ragdoll/Physics durante a queda — em alta velocidade
+	-- isso atravessa (tunneling) a colisão fina da água. Em vez disso,
+	-- controla a descida manualmente, frame a frame, via PivotTo — sem
+	-- física real caindo, então não tem como atravessar nada.
+	for _ = 1, 20 do
 		if not character.Parent or not root.Parent then break end
-		character:PivotTo(tiltedCFrame)
+		character:PivotTo(tiltedCFrameAt(position + Vector3.new(0, liftHeight, 0)))
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
 		task.wait()
 	end
-	lastRagdollTeleportAt = tick()
 
-	-- Solta a física já inclinado (nariz pra cima) e deixa cair naturalmente
-	-- até bater na água — assim toca primeiro com a parte de trás/patas.
-	for _ = 1, 20 do
-		if not root.Parent then break end
+	local steps = math.max(12, math.floor(descendSeconds * 30))
+	for i = 1, steps do
+		if not character.Parent or not root.Parent then break end
+		local alpha = i / steps
+		local currentHeight = liftHeight * (1 - alpha)
+		character:PivotTo(tiltedCFrameAt(position + Vector3.new(0, currentHeight, 0)))
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
 		task.wait()
 	end
+
+	-- Já pousado: endireita (tira a inclinação) e devolve o controle normal.
+	if root.Parent then
+		character:PivotTo(CFrame.lookAt(root.Position, root.Position + horizontalLook))
+		root.AssemblyLinearVelocity = Vector3.zero
+	end
+	lastRagdollTeleportAt = tick()
 
 	if humanoid.Parent then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
 	for _ = 1, 6 do
@@ -1042,7 +1058,7 @@ local function virtualDrinkKick()
 	runtimeMessage = "Beber travado; forcando com tecla E"
 
 	if isDinoLife then
-		ragdollTeleport(DINO_DRINK_POSITION)
+		ragdollTeleportTiltedOntoWater(DINO_DRINK_POSITION)
 	elseif drinkingSourcePosition then
 		ragdollTeleport(drinkingSourcePosition)
 	end
@@ -1113,7 +1129,7 @@ local function autoDrinkStep()
 			return
 		end
 		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
-		ragdollTeleport(DINO_DRINK_POSITION)
+		ragdollTeleportTiltedOntoWater(DINO_DRINK_POSITION)
 		drinkingSourcePosition = DINO_DRINK_POSITION
 		task.wait(0.25)
 		for _ = 1, 3 do
