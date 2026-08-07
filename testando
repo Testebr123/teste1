@@ -424,12 +424,14 @@ local function nearestCarcass(root)
 	local storage = workspace:FindFirstChild("CarcassesStorageModel")
 	if storage then scan(storage) end
 
-	-- Fallback: Dino Life (ou qualquer jogo) pode guardar as carcacas em outro lugar/nome
+	-- Fallback: Dino Life (ou qualquer jogo) pode guardar as carcacas em
+	-- outro lugar/nome. Só "carcass"/"carcaca" — "dead" sozinho pegava
+	-- cenário decorativo tipo "DeadTree"/"DeadLog" e teleportava em árvores.
 	if not best then
 		for _, object in ipairs(workspace:GetDescendants()) do
 			if object:IsA("Model")
 				and object.Parent ~= storage
-				and (object.Name:lower():find("carcass") or object.Name:lower():find("dead") or object.Name:lower():find("carcaca")) then
+				and (object.Name:lower():find("carcass") or object.Name:lower():find("carcaca")) then
 				local part = object:FindFirstChild("HumanoidRootPart") or object:FindFirstChildWhichIsA("BasePart", true)
 				if part then consider(object, part) end
 			end
@@ -437,6 +439,27 @@ local function nearestCarcass(root)
 	end
 
 	return best, bestRoot
+end
+
+-- Só pousa em cima do Terrain de VERDADE do Roblox (nunca em cima de
+-- árvores/rochas/qualquer objeto) e nunca na água — usado quando um
+-- carnívoro não acha carcaça por perto e precisa explorar outra área
+-- de um jeito seguro, sem risco de teleportar em cima de cenário.
+local terrainOnlyRayParams = RaycastParams.new()
+terrainOnlyRayParams.FilterType = Enum.RaycastFilterType.Include
+terrainOnlyRayParams.FilterDescendantsInstances = { workspace.Terrain }
+
+local function findSafeTerrainSpot(origin, minRadius, maxRadius)
+	for _ = 1, 12 do
+		local angle = math.random() * math.pi * 2
+		local radius = minRadius + math.random() * (maxRadius - minRadius)
+		local probeXZ = origin + Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+		local hit = workspace:Raycast(probeXZ + Vector3.new(0, 120, 0), Vector3.new(0, -400, 0), terrainOnlyRayParams)
+		if hit and hit.Material ~= Enum.Material.Water then
+			return hit.Position + Vector3.new(0, 3, 0)
+		end
+	end
+	return nil
 end
 
 local RAGDOLL_STATES = {
@@ -615,6 +638,7 @@ local ignoredGrassUntil = 0
 local lastObservedFood
 local lastFoodIncreaseAt = tick()
 local nextEmergencyGrassCheck = 0
+local nextCarnivoreExploreCheck = 0
 
 local function resetEatingSearch(food)
 	eatingSourcePosition = nil
@@ -741,6 +765,14 @@ local function autoEatStep()
 			task.spawn(eatCarcass, carcass, carcassRoot)
 		else
 			runtimeMessage = "Carnivoro sem carcaça por perto"
+			if tick() >= nextCarnivoreExploreCheck then
+				nextCarnivoreExploreCheck = tick() + 20
+				local spot = findSafeTerrainSpot(root.Position, 20, 60)
+				if spot then
+					runtimeMessage = "Procurando carcaça em outra area (terreno seguro)"
+					ragdollTeleport(spot)
+				end
+			end
 		end
 		return
 	end
@@ -1055,11 +1087,22 @@ local function autoDrinkStep()
 	end
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	if isAquatic and waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
-	local waterPosition = waterPart and waterPart:IsA("BasePart")
-		and Vector3.new(root.Position.X, waterPart.Position.Y, root.Position.Z)
+
+	local waterSurfaceY = waterPart and waterPart:IsA("BasePart")
+		and (waterPart.Position.Y + waterPart.Size.Y / 2)
+		or nil
+	local waterPosition = waterSurfaceY
+		and Vector3.new(root.Position.X, waterSurfaceY, root.Position.Z)
 		or findMaterial(root.Position, Enum.Material.Water, 384)
 	if waterPosition then
-		ragdollTeleport(waterPosition - Vector3.new(0, 3, 0))
+		-- Aquáticos (Hippo/Croco): pousa EM CIMA da água sólida de verdade,
+		-- não embaixo — antes pousava 3 studs ABAIXO da superfície, ou seja,
+		-- nascia dentro do bloco sólido e a física empurrava/atravessava ele.
+		-- Não-aquáticos: água continua sem colisão, ficam um pouco submersos.
+		local landingPosition = isAquatic
+			and (waterPosition + Vector3.new(0, 2, 0))
+			or (waterPosition - Vector3.new(0, 3, 0))
+		ragdollTeleport(landingPosition)
 		drinkingSourcePosition = waterPosition
 		task.wait(0.25)
 		local _, newRoot = characterParts()
