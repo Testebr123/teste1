@@ -34,10 +34,6 @@ local renders
 local runtimeMessage = "Anti-AFK ativo"
 local completionSpawnParts = {}
 local selectedCompletionSpawn
-local damageRecoveryActive = false
-local activeCarcass
-local preSwitchFoodTarget
-local preSwitchWaterTarget
 
 -- Inicia sozinho e simula uma entrada somente quando o Roblox detecta inatividade.
 table.insert(connections, player.Idled:Connect(function()
@@ -397,7 +393,7 @@ local function moveToGrass(grassPosition, speedOverride)
 	local moveSpeed = speedOverride or 55
 	local duration = math.clamp((goalPosition - root.Position).Magnitude / moveSpeed, 0.15, 16)
 	local startedAt = tick()
-	while state.alive and character.Parent and root.Parent and not damageRecoveryActive do
+	while state.alive and character.Parent and root.Parent do
 		local alpha = math.clamp((tick() - startedAt) / duration, 0, 1)
 		root.CFrame = startCFrame:Lerp(goalCFrame, alpha)
 		root.AssemblyLinearVelocity = Vector3.zero
@@ -672,29 +668,17 @@ local eatingToFull = false
 -- Quando definidos (por growthStep, antes de trocar de slot), sobrescrevem
 -- os tetos normais de "já tá bom" (92% comida / 98% água) para forçar
 -- encher de verdade até perto de 100%, dando uma margem de segurança.
-preSwitchFoodTarget = nil
-preSwitchWaterTarget = nil
+local preSwitchFoodTarget = nil
+local preSwitchWaterTarget = nil
 -- Fica true enquanto forcePostDrinkTeleport ou ensureOnSolidGround estão
 -- ativamente controlando o personagem (saindo da água/void). Enquanto isso,
 -- nenhuma outra rotina (comer, beber, trocar de slot) pode mexer no
 -- personagem — senão ficam brigando pra teleportar pra lugares diferentes
 -- ao mesmo tempo (foi isso que matou um Rex no Dino Life).
 local criticalRecoveryActive = false
-
--- Watchdog de dano: se perder 35%+ da vida em uma janela curta, pausa o
--- farm, foge para o spawn seguro mais próximo, recupera um pouco e retoma.
-damageRecoveryActive = false
-local damageHealthConnection
-local damageCooldownUntil = 0
-local DAMAGE_DROP_FRACTION = 0.35
-local DAMAGE_WINDOW_SECONDS = 4
-local DAMAGE_SAFE_FOOD_WATER = 70
-local DAMAGE_MAX_RECOVERY_WAIT = 10
-local DAMAGE_TARGET_HEAL_FRACTION = 0.15
-
 local eatingSourcePosition
 local eatingTargetReachedAt
-activeCarcass = nil
+local activeCarcass
 local drinkingSourcePosition
 local swimBarrier
 local swimAnchorPosition
@@ -1229,262 +1213,6 @@ local function escapeDinoToSafety(label)
 	end
 	return aquatic ~= nil
 end
-
-
-local function damageFarmModeName()
-	if state.growExisting then return "Grow Existing Slots" end
-	if state.growNew then return "Grow New Slots" end
-	if state.farmCoins then return "AFK Coin Farm" end
-	return "modo atual"
-end
-
-local function isDamageSafeSpawn(part)
-	if not part or not part:IsA("BasePart") or not part.Parent then return false end
-	local name = part.Name:lower()
-
-	-- Evita explicitamente os spawns aquáticos conhecidos.
-	if name:find("aquatic", 1, true)
-		or name:find("water", 1, true)
-		or name:find("ocean", 1, true)
-		or name:find("river", 1, true) then
-		return false
-	end
-
-	return true
-end
-
-local function nearestDamageSafeSpawns(root)
-	refreshCompletionSpawns()
-	local candidates = {}
-
-	for _, part in ipairs(completionSpawnParts) do
-		if isDamageSafeSpawn(part) then
-			table.insert(candidates, part)
-		end
-	end
-
-	table.sort(candidates, function(a, b)
-		return (a.Position - root.Position).Magnitude < (b.Position - root.Position).Magnitude
-	end)
-
-	return candidates
-end
-
-local function teleportToNearestDamageSafeSpawn()
-	local character, root = characterParts()
-	if not character or not root then return false, nil end
-
-	-- A água sólida do Croco não deve interferir no teleporte de emergência.
-	local waterPart = workspace:FindFirstChild("MainWaterPart")
-	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = false
-	end
-
-	local candidates = nearestDamageSafeSpawns(root)
-
-	for _, spawnPart in ipairs(candidates) do
-		runtimeMessage = "Watchdog: fugindo para " .. spawnPart.Name
-
-		local ok = ragdollTeleport(spawnPart.Position, 5)
-		task.wait(0.25)
-
-		local _, newRoot = characterParts()
-		if ok and newRoot and not isStandingInWater(newRoot) then
-			return true, spawnPart
-		end
-	end
-
-	-- Fallback caso workspace.Spawns esteja vazio ou todos sejam aquáticos.
-	local fallback = getSafeFarmPosition()
-	if fallback then
-		runtimeMessage = "Watchdog: usando ponto seguro alternativo"
-		local ok = ragdollTeleport(fallback, 5)
-		task.wait(0.25)
-		local _, newRoot = characterParts()
-		if ok and newRoot and not isStandingInWater(newRoot) then
-			return true, nil
-		end
-	end
-
-	return false, nil
-end
-
-local function runDamageRecovery(character, humanoid, healthBefore, healthAfter)
-	if damageRecoveryActive or tick() < damageCooldownUntil then return end
-	if character ~= player.Character or not humanoid.Parent or humanoid.Health <= 0 then return end
-
-	damageRecoveryActive = true
-
-	local previousCriticalRecovery = criticalRecoveryActive
-	criticalRecoveryActive = true
-
-	local previousAutoEat = state.autoEat
-	local previousAutoDrink = state.autoDrink
-	local previousMode = damageFarmModeName()
-
-	-- Para imediatamente as rotinas que poderiam puxar o personagem de volta.
-	state.autoEat = false
-	state.autoDrink = false
-	removeSwimBarrier()
-	drinkingToFull = false
-	eatingToFull = false
-	activeCarcass = nil
-	drinkingSourcePosition = nil
-
-	if renders then
-		if renders.autoEat then renders.autoEat() end
-		if renders.autoDrink then renders.autoDrink() end
-	end
-
-	local maxHealth = math.max(humanoid.MaxHealth, 1)
-	local lostPercent = math.floor(((healthBefore - healthAfter) / maxHealth) * 100 + 0.5)
-	runtimeMessage = string.format("Watchdog: dano alto (%d%%); procurando spawn seguro", lostPercent)
-
-	-- Dá um instante para movimentos/teleportes anteriores liberarem state.busy.
-	local busyDeadline = tick() + 2.2
-	while state.busy and tick() < busyDeadline and state.alive do
-		task.wait(0.05)
-	end
-
-	local escaped, safeSpawn = teleportToNearestDamageSafeSpawn()
-
-	character = player.Character
-	humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if escaped and character and humanoid and humanoid.Health > 0 then
-		local food = character:GetAttribute("Food") or 0
-		local water = character:GetAttribute("Water") or 0
-
-		if food >= DAMAGE_SAFE_FOOD_WATER and water >= DAMAGE_SAFE_FOOD_WATER then
-			local startHealth = humanoid.Health
-			local targetHealth = math.min(
-				humanoid.MaxHealth,
-				startHealth + humanoid.MaxHealth * DAMAGE_TARGET_HEAL_FRACTION
-			)
-			local deadline = tick() + DAMAGE_MAX_RECOVERY_WAIT
-
-			while state.alive
-				and character == player.Character
-				and humanoid.Parent
-				and humanoid.Health > 0
-				and tick() < deadline
-				and humanoid.Health < targetHealth do
-
-				food = character:GetAttribute("Food") or 0
-				water = character:GetAttribute("Water") or 0
-				if food < DAMAGE_SAFE_FOOD_WATER or water < DAMAGE_SAFE_FOOD_WATER then
-					break
-				end
-
-				local remaining = math.max(0, math.ceil(deadline - tick()))
-				runtimeMessage = string.format(
-					"Watchdog: recuperando vida em %s (%ds)",
-					safeSpawn and safeSpawn.Name or "local seguro",
-					remaining
-				)
-				task.wait(0.5)
-			end
-		else
-			runtimeMessage = string.format(
-				"Watchdog: Food %d%% Water %d%%; retomando para repor",
-				math.floor(food),
-				math.floor(water)
-			)
-			task.wait(1)
-		end
-	elseif not escaped then
-		runtimeMessage = "Watchdog: não consegui confirmar um spawn seguro"
-		task.wait(0.5)
-	end
-
-	-- Retoma exatamente o sistema que já estava ativo. Os modos de farm nunca
-	-- foram desligados; só Auto Eat/Drink ficaram pausados durante a fuga.
-	state.autoEat = previousAutoEat
-	state.autoDrink = previousAutoDrink
-
-	if state.farmCoins or state.growExisting or state.growNew then
-		state.autoEat = true
-		state.autoDrink = true
-	end
-
-	if renders then
-		if renders.autoEat then renders.autoEat() end
-		if renders.autoDrink then renders.autoDrink() end
-	end
-
-	criticalRecoveryActive = previousCriticalRecovery
-	damageRecoveryActive = false
-	damageCooldownUntil = tick() + 6
-
-	runtimeMessage = "Watchdog: seguro; retomando " .. previousMode
-end
-
-local function setupDamageWatchdog(character)
-	if damageHealthConnection then
-		damageHealthConnection:Disconnect()
-		damageHealthConnection = nil
-	end
-
-	if not character then return end
-
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-		or character:WaitForChild("Humanoid", 10)
-	if not humanoid then return end
-
-	local lastHealth = humanoid.Health
-	local damageWindowStartHealth = nil
-	local damageWindowStartedAt = nil
-
-	damageHealthConnection = humanoid.HealthChanged:Connect(function(newHealth)
-		if not state.alive or character ~= player.Character then return end
-		if newHealth <= 0 then
-			lastHealth = newHealth
-			return
-		end
-
-		local now = tick()
-
-		if damageRecoveryActive or now < damageCooldownUntil then
-			lastHealth = newHealth
-			damageWindowStartHealth = nil
-			damageWindowStartedAt = nil
-			return
-		end
-
-		if newHealth < lastHealth then
-			if not damageWindowStartedAt
-				or now - damageWindowStartedAt > DAMAGE_WINDOW_SECONDS then
-				damageWindowStartedAt = now
-				damageWindowStartHealth = lastHealth
-			end
-
-			local baseline = damageWindowStartHealth or lastHealth
-			local loss = baseline - newHealth
-			local threshold = math.max(humanoid.MaxHealth, 1) * DAMAGE_DROP_FRACTION
-
-			if loss >= threshold then
-				local before = baseline
-				damageWindowStartHealth = nil
-				damageWindowStartedAt = nil
-				lastHealth = newHealth
-				task.spawn(runDamageRecovery, character, humanoid, before, newHealth)
-				return
-			end
-		elseif newHealth > lastHealth then
-			-- Regenerou: começa uma nova janela de dano a partir daqui.
-			damageWindowStartHealth = nil
-			damageWindowStartedAt = nil
-		end
-
-		lastHealth = newHealth
-	end)
-end
-
-setupDamageWatchdog(player.Character)
-table.insert(connections, player.CharacterAdded:Connect(function(character)
-	damageCooldownUntil = tick() + 3
-	damageRecoveryActive = false
-	task.defer(setupDamageWatchdog, character)
-end))
 
 local function forcePostDrinkTeleport()
 	if forcingPostDrinkTeleport then return end
@@ -2921,7 +2649,7 @@ task.spawn(function()
 		if not drinkingToFull then pcall(autoEatStep) end
 		pcall(growthStep)
 		local character = player.Character
-		if state.farmCoins and not damageRecoveryActive then
+		if state.farmCoins then
 			state.autoEat, state.autoDrink = true, true
 		end
 		if not state.autoEat and not state.autoDrink
@@ -2936,7 +2664,6 @@ end)
 shared.__uiRootCleanup = function()
 	state.alive = false
 	removeSwimBarrier()
-	if damageHealthConnection then damageHealthConnection:Disconnect(); damageHealthConnection = nil end
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	gui:Destroy()
 	shared.__uiRootCleanup = nil
