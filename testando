@@ -2426,8 +2426,8 @@ INFO.overlay.ZIndex = 40
 INFO.overlay.Parent = window
 
 INFO.panel = Instance.new("Frame")
-INFO.panel.Size = UDim2.new(1, -34, 0, 300)
-INFO.panel.Position = UDim2.new(0, 17, 0.5, -150)
+INFO.panel.Size = UDim2.new(1, -34, 0, 366)
+INFO.panel.Position = UDim2.new(0, 17, 0.5, -183)
 INFO.panel.BackgroundColor3 = COLOR_HEADER
 INFO.panel.BorderSizePixel = 0
 INFO.panel.ZIndex = 41
@@ -2478,9 +2478,44 @@ INFO.divider.BorderSizePixel = 0
 INFO.divider.ZIndex = 42
 INFO.divider.Parent = INFO.panel
 
+INFO.update0 = Instance.new("Frame")
+INFO.update0.Size = UDim2.new(1, -36, 0, 58)
+INFO.update0.Position = UDim2.fromOffset(18, 66)
+INFO.update0.BackgroundColor3 = COLOR_CARD
+INFO.update0.BorderSizePixel = 0
+INFO.update0.ZIndex = 42
+INFO.update0.Parent = INFO.panel
+corner(INFO.update0, 9)
+
+INFO.update0Mark = Instance.new("TextLabel")
+INFO.update0Mark.Size = UDim2.fromOffset(28, 28)
+INFO.update0Mark.Position = UDim2.fromOffset(10, 15)
+INFO.update0Mark.BackgroundColor3 = COLOR_CARD_ON
+INFO.update0Mark.BorderSizePixel = 0
+INFO.update0Mark.Font = Enum.Font.GothamBlack
+INFO.update0Mark.Text = "•"
+INFO.update0Mark.TextColor3 = COLOR_ACCENT
+INFO.update0Mark.TextSize = 22
+INFO.update0Mark.ZIndex = 43
+INFO.update0Mark.Parent = INFO.update0
+corner(INFO.update0Mark, 7)
+
+INFO.update0Text = Instance.new("TextLabel")
+INFO.update0Text.Size = UDim2.new(1, -52, 1, 0)
+INFO.update0Text.Position = UDim2.fromOffset(46, 0)
+INFO.update0Text.BackgroundTransparency = 1
+INFO.update0Text.Font = FONT_BUTTON
+INFO.update0Text.Text = "Sorry for the key-related issues, the HWID was not being saved."
+INFO.update0Text.TextColor3 = COLOR_TEXT
+INFO.update0Text.TextSize = 12
+INFO.update0Text.TextXAlignment = Enum.TextXAlignment.Left
+INFO.update0Text.TextWrapped = true
+INFO.update0Text.ZIndex = 43
+INFO.update0Text.Parent = INFO.update0
+
 INFO.update1 = Instance.new("Frame")
 INFO.update1.Size = UDim2.new(1, -36, 0, 58)
-INFO.update1.Position = UDim2.fromOffset(18, 66)
+INFO.update1.Position = UDim2.fromOffset(18, 132)
 INFO.update1.BackgroundColor3 = COLOR_CARD
 INFO.update1.BorderSizePixel = 0
 INFO.update1.ZIndex = 42
@@ -2515,7 +2550,7 @@ INFO.update1Text.Parent = INFO.update1
 
 INFO.update2 = Instance.new("Frame")
 INFO.update2.Size = UDim2.new(1, -36, 0, 58)
-INFO.update2.Position = UDim2.fromOffset(18, 132)
+INFO.update2.Position = UDim2.fromOffset(18, 198)
 INFO.update2.BackgroundColor3 = COLOR_CARD
 INFO.update2.BorderSizePixel = 0
 INFO.update2.ZIndex = 42
@@ -2550,7 +2585,7 @@ INFO.update2Text.Parent = INFO.update2
 
 INFO.contact = Instance.new("TextLabel")
 INFO.contact.Size = UDim2.new(1, -36, 0, 68)
-INFO.contact.Position = UDim2.fromOffset(18, 208)
+INFO.contact.Position = UDim2.fromOffset(18, 274)
 INFO.contact.BackgroundColor3 = COLOR_CARD
 INFO.contact.BorderSizePixel = 0
 INFO.contact.Font = FONT_BODY
