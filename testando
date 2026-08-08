@@ -34,6 +34,10 @@ local renders
 local runtimeMessage = "Anti-AFK ativo"
 local completionSpawnParts = {}
 local selectedCompletionSpawn
+local damageRecoveryActive = false
+local activeCarcass
+local preSwitchFoodTarget
+local preSwitchWaterTarget
 
 -- Inicia sozinho e simula uma entrada somente quando o Roblox detecta inatividade.
 table.insert(connections, player.Idled:Connect(function()
@@ -668,8 +672,8 @@ local eatingToFull = false
 -- Quando definidos (por growthStep, antes de trocar de slot), sobrescrevem
 -- os tetos normais de "já tá bom" (92% comida / 98% água) para forçar
 -- encher de verdade até perto de 100%, dando uma margem de segurança.
-local preSwitchFoodTarget = nil
-local preSwitchWaterTarget = nil
+preSwitchFoodTarget = nil
+preSwitchWaterTarget = nil
 -- Fica true enquanto forcePostDrinkTeleport ou ensureOnSolidGround estão
 -- ativamente controlando o personagem (saindo da água/void). Enquanto isso,
 -- nenhuma outra rotina (comer, beber, trocar de slot) pode mexer no
@@ -679,7 +683,7 @@ local criticalRecoveryActive = false
 
 -- Watchdog de dano: se perder 35%+ da vida em uma janela curta, pausa o
 -- farm, foge para o spawn seguro mais próximo, recupera um pouco e retoma.
-local damageRecoveryActive = false
+damageRecoveryActive = false
 local damageHealthConnection
 local damageCooldownUntil = 0
 local DAMAGE_DROP_FRACTION = 0.35
@@ -690,7 +694,7 @@ local DAMAGE_TARGET_HEAL_FRACTION = 0.15
 
 local eatingSourcePosition
 local eatingTargetReachedAt
-local activeCarcass
+activeCarcass = nil
 local drinkingSourcePosition
 local swimBarrier
 local swimAnchorPosition
