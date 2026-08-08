@@ -1628,58 +1628,126 @@ local dinoDrinkHoldBusy = false
 local function holdDinoDrinkPosition(targetPosition)
 	if dinoDrinkHoldBusy then return end
 	dinoDrinkHoldBusy = true
+
+	local promptMissingSince = nil
+	local anchorXZ = nil
+
 	while drinkingToFull and state.autoDrink and not criticalRecoveryActive do
 		local character, root, humanoid = characterParts()
 		if not character or not root or not humanoid then break end
+
 		local water = character:GetAttribute("Water") or 100
 		if water >= (preSwitchWaterTarget or 98) then break end
-		if (root.Position - targetPosition).Magnitude > 24 then break end -- afastou demais, deixa o autoDrinkStep reagir de novo
 
-		local velocity = root.AssemblyLinearVelocity
-		root.AssemblyLinearVelocity = Vector3.new(0, math.clamp(velocity.Y, -1, 1), 0)
-		root.AssemblyAngularVelocity = Vector3.zero
-		if (root.Position - targetPosition).Magnitude > 8 then
-			root.CFrame = CFrame.new(targetPosition) * root.CFrame.Rotation
+		local detected = detectAvailableFood(character)
+
+		if detected == "Drink" then
+			-- Se o prompt de beber existe, ESTA posição já é válida.
+			-- Nunca teleporta/corrige a altura enquanto o prompt estiver disponível.
+			promptMissingSince = nil
+			if not anchorXZ then
+				anchorXZ = Vector3.new(root.Position.X, 0, root.Position.Z)
+			end
+			drinkingSourcePosition = root.Position
+			runtimeMessage = "Dino: prompt detectado; bebendo"
+
+			local velocity = root.AssemblyLinearVelocity
+			root.AssemblyLinearVelocity = Vector3.new(0, math.clamp(velocity.Y, -2, 2), 0)
+			root.AssemblyAngularVelocity = Vector3.zero
+
+			-- Só segura X/Z se escorregar bastante. O Y atual é SEMPRE preservado,
+			-- eliminando o efeito de ficar flickando para cima/baixo.
+			if anchorXZ then
+				local horizontalOffset = Vector3.new(
+					root.Position.X - anchorXZ.X,
+					0,
+					root.Position.Z - anchorXZ.Z
+				)
+				if horizontalOffset.Magnitude > 3.5 then
+					root.CFrame = CFrame.new(
+						anchorXZ.X,
+						root.Position.Y,
+						anchorXZ.Z
+					) * root.CFrame.Rotation
+				end
+			end
+
+			character:SetAttribute("MovementDisabled", false)
+			setSubState("Drinking")
+		else
+			-- O prompt pode piscar por alguns frames. Não teleporta imediatamente.
+			if not promptMissingSince then promptMissingSince = tick() end
+			if tick() - promptMissingSince >= 1.5 then
+				break
+			end
+
+			local velocity = root.AssemblyLinearVelocity
+			root.AssemblyLinearVelocity = Vector3.new(0, math.clamp(velocity.Y, -2, 2), 0)
+			root.AssemblyAngularVelocity = Vector3.zero
+			setSubState("Drinking")
 		end
-		setSubState("Drinking")
-		task.wait(0.25)
+
+		task.wait(0.15)
 	end
+
 	dinoDrinkHoldBusy = false
 end
+
 local lastDrinkWatchdogWater
 
 local function virtualDrinkKick()
 	local character, root = characterParts()
 	if not character or not root then return end
-	runtimeMessage = "Beber travado; forcando com tecla E"
 
-	if isDinoLife then
-		ragdollTeleport(DINO_DRINK_POSITION + Vector3.new(0, surfaceStandOffset(character), 0))
-	elseif CROC.isCharacter(character) then
-		drinkingSourcePosition = nil
-		removeSwimBarrier()
-		local _, waterPart = CROC.getWaterSurfaceY()
-		if waterPart then waterPart.CanCollide = true end
-		CROC.approachDrink()
-	elseif drinkingSourcePosition then
-		ragdollTeleport(drinkingSourcePosition)
+	local detected = detectAvailableFood(character)
+	local dinoPromptAlreadyVisible = isDinoLife and detected == "Drink"
+
+	if dinoPromptAlreadyVisible then
+		runtimeMessage = "Dino: beber travou, mas prompt esta ativo; reativando sem TP"
+		drinkingSourcePosition = root.Position
+	else
+		runtimeMessage = "Beber travado; forcando com tecla E"
+
+		if isDinoLife then
+			local landing = DINO_DRINK_POSITION + Vector3.new(0, surfaceStandOffset(character), 0)
+			ragdollTeleport(landing)
+			local _, newRoot = characterParts()
+			if newRoot then drinkingSourcePosition = newRoot.Position end
+			CROC.dinoLastTeleportAt = tick()
+		elseif CROC.isCharacter(character) then
+			drinkingSourcePosition = nil
+			removeSwimBarrier()
+			local _, waterPart = CROC.getWaterSurfaceY()
+			if waterPart then waterPart.CanCollide = true end
+			CROC.approachDrink()
+		elseif drinkingSourcePosition then
+			ragdollTeleport(drinkingSourcePosition)
+		end
+
+		task.wait(0.2)
 	end
-	task.wait(0.2)
 
 	pcall(function()
 		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
 		task.wait(0.05)
 		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
 	end)
-	task.wait(0.2)
+	task.wait(0.15)
 
-	state.autoDrink = false
-	if renders and renders.autoDrink then renders.autoDrink() end
-	task.wait(0.3)
-	state.autoDrink = true
-	if renders and renders.autoDrink then renders.autoDrink() end
+	-- No Dino, se o prompt já estava visível, não desliga/reLiga Auto Drink.
+	-- Esse toggle era outra fonte de interrupção e jitter.
+	if not dinoPromptAlreadyVisible then
+		state.autoDrink = false
+		if renders and renders.autoDrink then renders.autoDrink() end
+		task.wait(0.2)
+		state.autoDrink = true
+		if renders and renders.autoDrink then renders.autoDrink() end
+	end
 
 	setSubState("Drinking")
+	if isDinoLife then
+		task.spawn(holdDinoDrinkPosition, drinkingSourcePosition or root.Position)
+	end
 	drinkingStuckSince = nil
 end
 
@@ -1696,6 +1764,7 @@ local function autoDrinkStep()
 		lastDrinkWatchdogWater = nil
 		removeSwimBarrier()
 		CROC.lastDrinkAnimalName = currentAnimalName
+		CROC.dinoLastTeleportAt = nil
 	end
 
 	local water = character:GetAttribute("Water") or 100
@@ -1736,19 +1805,48 @@ local function autoDrinkStep()
 
 	if isDinoLife then
 		local waterPart = workspace:FindFirstChild("MainWaterPart")
-		if drinkingSourcePosition and (root.Position - drinkingSourcePosition).Magnitude <= 16 then
-			runtimeMessage = "Bebendo ate encher"
-			task.spawn(holdDinoDrinkPosition, drinkingSourcePosition)
+		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
+
+		-- REGRA PRINCIPAL: se o prompt já aparece, a posição atual é válida.
+		-- Não teleporta de novo e não tenta empurrar o personagem para outra altura.
+		local detected = detectAvailableFood(character)
+		if detected == "Drink" then
+			drinkingSourcePosition = root.Position
+			CROC.dinoLastTeleportAt = nil
+			runtimeMessage = "Dino: prompt de beber detectado; mantendo posicao"
+			setSubState("Drinking")
+			task.spawn(holdDinoDrinkPosition, root.Position)
 			return
 		end
-		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = true end
+
+		-- Depois de um TP, dá alguns segundos para o prompt aparecer/estabilizar.
+		-- Antes o autoDrinkStep rodava de novo 1s depois e teleportava no MESMO
+		-- ponto repetidamente, mesmo quando o animal ainda estava assentando.
+		if drinkingSourcePosition and (root.Position - drinkingSourcePosition).Magnitude <= 20 then
+			local elapsed = tick() - (CROC.dinoLastTeleportAt or tick())
+			if elapsed < 4 then
+				runtimeMessage = string.format(
+					"Dino: aguardando prompt estabilizar (%.1fs)",
+					math.max(0, 4 - elapsed)
+				)
+				setSubState("Drinking")
+				return
+			end
+		end
+
 		local dinoLandingPosition = DINO_DRINK_POSITION + Vector3.new(0, surfaceStandOffset(character), 0)
+		runtimeMessage = "Dino: posicionando na agua"
 		ragdollTeleport(dinoLandingPosition)
-		drinkingSourcePosition = dinoLandingPosition
+
+		-- Usa a posição REAL depois do pouso como referência, não o alvo teórico.
+		local _, landedRoot = characterParts()
+		drinkingSourcePosition = landedRoot and landedRoot.Position or dinoLandingPosition
+		CROC.dinoLastTeleportAt = tick()
+
 		task.wait(0.25)
 		for _ = 1, 3 do
 			setSubState("Drinking")
-			task.wait(0.2)
+			task.wait(0.15)
 		end
 		return
 	end
