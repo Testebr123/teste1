@@ -1220,6 +1220,15 @@ end
 local function escapeDinoToSafety(label)
 	label = label or "solo seguro"
 
+	-- REGRA ABSOLUTA: o AquaticNestRock é EXCLUSIVO do watchdog de void.
+	-- Se o personagem não estiver abaixo do dangerY, essa função não faz nada.
+	local _, root = characterParts()
+	if not root or root.Position.Y >= config.dangerY then
+		return false
+	end
+
+	runtimeMessage = "VOID detectado; usando rota AquaticNestRock"
+
 	local aquatic = findAquaticNestRock()
 	if aquatic then
 		ensureOnSolidGround(aquatic.Position, "AquaticNestRock (saindo do void)")
@@ -1230,9 +1239,8 @@ local function escapeDinoToSafety(label)
 		return ensureOnSolidGround(nestRock1.Position, "NestRock1")
 	end
 
-	-- Sem NestRock1 no mapa: pelo menos já confirmamos saída do void via Aquatic.
 	if not aquatic then
-		runtimeMessage = "Nem AquaticNestRock nem NestRock1 encontrados"
+		runtimeMessage = "Void: nem AquaticNestRock nem NestRock1 encontrados"
 	end
 	return aquatic ~= nil
 end
@@ -1582,7 +1590,35 @@ local function forcePostDrinkTeleport()
 	if isDinoLife then
 		local waterPart = workspace:FindFirstChild("MainWaterPart")
 		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
-		escapeDinoToSafety("saindo da água")
+
+		local _, root = characterParts()
+
+		-- Se por algum motivo realmente caiu no void enquanto bebia, aí SIM
+		-- libera a rota AquaticNestRock.
+		if root and root.Position.Y < config.dangerY then
+			escapeDinoToSafety("void depois de beber")
+		else
+			-- Saída normal da água: vai DIRETO para terra firme.
+			-- AquaticNestRock não participa desta rotina.
+			local landed = false
+			local nestRock1 = findNestRock1()
+
+			if nestRock1 then
+				landed = ensureOnSolidGround(nestRock1.Position, "NestRock1 (saindo da agua)")
+			elseif root then
+				-- Fallback apenas para spawns NÃO aquáticos.
+				for _, spawnPart in ipairs(DAMAGE.getNearestSafeSpawns(root)) do
+					if ensureOnSolidGround(spawnPart.Position, spawnPart.Name .. " (saindo da agua)") then
+						landed = true
+						break
+					end
+				end
+			end
+
+			if not landed then
+				runtimeMessage = "Dino: agua cheia, mas nenhum spawn terrestre seguro foi confirmado"
+			end
+		end
 	else
 		local waterPart = workspace:FindFirstChild("MainWaterPart")
 		if waterPart and waterPart:IsA("BasePart") then waterPart.CanCollide = false end
