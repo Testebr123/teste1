@@ -15,6 +15,7 @@ local CONFIGS = {
 	[9237322219] = { name = "JungleLife", farm = Vector3.new(1166.8350830078125, 24.75099754333496, -358.32073974609375), dangerY = -100 },
 }
 local config = CONFIGS[game.GameId] or CONFIGS[18214855317]
+local isSavannahLife = game.GameId == 6174994284 or game.GameId == 18214855317
 local isDinoLife = game.PlaceId == 75541741887441
 local DINO_DRINK_POSITION = Vector3.new(-552.27, 41.46, -520.35)
 local state = {
@@ -740,6 +741,9 @@ local lastObservedFood
 local lastFoodIncreaseAt = tick()
 local nextEmergencyGrassCheck = 0
 local nextCarnivoreExploreCheck = 0
+local savannahCarcassSpawnIndex = 0
+local savannahCarcassCurrentSpawn
+local SAVANNAH_CARCASS_SPAWN_WAIT = 15
 
 local function resetEatingSearch(food)
 	eatingSourcePosition = nil
@@ -748,6 +752,53 @@ local function resetEatingSearch(food)
 	ignoredGrassUntil = 0
 	lastObservedFood = food
 	lastFoodIncreaseAt = tick()
+end
+
+-- Savannah: quando um carnivoro nao encontra carcaca, percorre em ordem
+-- exatamente os mesmos spawns exibidos na aba Teleport. Fica 15s em cada
+-- ponto para dar tempo do mapa/carcacas carregarem antes de ir ao proximo.
+local function exploreSavannahCarcassSpawns()
+	if not isSavannahLife then return false end
+	if tick() < nextCarnivoreExploreCheck then
+		local remaining = math.max(0, math.ceil(nextCarnivoreExploreCheck - tick()))
+		local spawnName = savannahCarcassCurrentSpawn and savannahCarcassCurrentSpawn.Name or "spawn"
+		runtimeMessage = string.format("Procurando carcaca em %s (%ds)", spawnName, remaining)
+		return true
+	end
+
+	refreshCompletionSpawns()
+	if #completionSpawnParts == 0 then
+		runtimeMessage = "Nenhum spawn encontrado para procurar carcaca"
+		nextCarnivoreExploreCheck = tick() + SAVANNAH_CARCASS_SPAWN_WAIT
+		return true
+	end
+
+	-- Round-robin: nunca escolhe aleatorio e so repete depois de passar
+	-- por todos os spawns que aparecem na lista da aba Teleport.
+	savannahCarcassSpawnIndex = savannahCarcassSpawnIndex % #completionSpawnParts + 1
+	local destination = completionSpawnParts[savannahCarcassSpawnIndex]
+
+	-- Se a lista mudou e o destino deixou de existir, atualiza e tenta no
+	-- proximo ciclo, sem cair de volta na exploracao aleatoria antiga.
+	if not destination or not destination.Parent then
+		refreshCompletionSpawns()
+		nextCarnivoreExploreCheck = tick() + 1
+		return true
+	end
+
+	savannahCarcassCurrentSpawn = destination
+	runtimeMessage = "Procurando carcaca: teleportando para " .. destination.Name
+	local teleported = ragdollTeleport(destination.Position, 5)
+
+	if teleported then
+		runtimeMessage = "Procurando carcaca em " .. destination.Name .. " (15s)"
+		nextCarnivoreExploreCheck = tick() + SAVANNAH_CARCASS_SPAWN_WAIT
+	else
+		runtimeMessage = "Falha ao teleportar para " .. destination.Name .. "; tentando proximo"
+		nextCarnivoreExploreCheck = tick() + 2
+	end
+
+	return true
 end
 
 local function removeSwimBarrier()
@@ -1067,7 +1118,11 @@ local function autoEatStep()
 			task.spawn(eatCarcass, carcass, carcassRoot)
 		else
 			runtimeMessage = "Carnivoro sem carcaça por perto"
-			if tick() >= nextCarnivoreExploreCheck then
+
+			if isSavannahLife then
+				exploreSavannahCarcassSpawns()
+			elseif tick() >= nextCarnivoreExploreCheck then
+				-- Jungle/Dino continuam exatamente com a exploracao antiga.
 				nextCarnivoreExploreCheck = tick() + 20
 				local spot = findSafeTerrainSpot(root.Position, 20, 60)
 				if spot then
