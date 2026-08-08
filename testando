@@ -34,6 +34,7 @@ local renders
 local runtimeMessage = "Anti-AFK ativo"
 local completionSpawnParts = {}
 local selectedCompletionSpawn
+local INFO = {}
 local DAMAGE = {
 	active = false,
 	connection = nil,
@@ -2379,7 +2380,7 @@ titleLabel.Parent = header
 
 local statusDot = Instance.new("Frame")
 statusDot.Size = UDim2.fromOffset(7, 7)
-statusDot.Position = UDim2.new(1, -78, 0.5, -3)
+statusDot.Position = UDim2.new(1, -110, 0.5, -3)
 statusDot.BackgroundColor3 = Color3.fromRGB(90, 220, 130)
 statusDot.BorderSizePixel = 0
 statusDot.Parent = header
@@ -2397,6 +2398,191 @@ minimizeButton.TextSize = 18
 minimizeButton.AutoButtonColor = false
 minimizeButton.Parent = header
 corner(minimizeButton, 8)
+
+-- ============================================================
+-- Info / Update panel
+-- ============================================================
+INFO.button = Instance.new("TextButton")
+INFO.button.Size = UDim2.fromOffset(30, 30)
+INFO.button.Position = UDim2.new(1, -72, 0.5, -15)
+INFO.button.BackgroundColor3 = COLOR_CARD
+INFO.button.BorderSizePixel = 0
+INFO.button.Font = Enum.Font.GothamBlack
+INFO.button.Text = "!"
+INFO.button.TextColor3 = COLOR_ACCENT
+INFO.button.TextSize = 17
+INFO.button.AutoButtonColor = false
+INFO.button.Parent = header
+corner(INFO.button, 8)
+
+INFO.overlay = Instance.new("Frame")
+INFO.overlay.Size = UDim2.new(1, 0, 1, 0)
+INFO.overlay.Position = UDim2.fromOffset(0, 0)
+INFO.overlay.BackgroundColor3 = Color3.fromRGB(3, 2, 4)
+INFO.overlay.BackgroundTransparency = 0.18
+INFO.overlay.BorderSizePixel = 0
+INFO.overlay.Visible = false
+INFO.overlay.ZIndex = 40
+INFO.overlay.Parent = window
+
+INFO.panel = Instance.new("Frame")
+INFO.panel.Size = UDim2.new(1, -34, 0, 300)
+INFO.panel.Position = UDim2.new(0, 17, 0.5, -150)
+INFO.panel.BackgroundColor3 = COLOR_HEADER
+INFO.panel.BorderSizePixel = 0
+INFO.panel.ZIndex = 41
+INFO.panel.Parent = INFO.overlay
+corner(INFO.panel, 12)
+stroke(INFO.panel, COLOR_ACCENT, 1).Transparency = 0.35
+
+INFO.accent = Instance.new("Frame")
+INFO.accent.Size = UDim2.new(0, 3, 1, -28)
+INFO.accent.Position = UDim2.fromOffset(0, 14)
+INFO.accent.BackgroundColor3 = COLOR_ACCENT
+INFO.accent.BorderSizePixel = 0
+INFO.accent.ZIndex = 42
+INFO.accent.Parent = INFO.panel
+corner(INFO.accent, 2)
+
+INFO.title = Instance.new("TextLabel")
+INFO.title.Size = UDim2.new(1, -70, 0, 30)
+INFO.title.Position = UDim2.fromOffset(18, 12)
+INFO.title.BackgroundTransparency = 1
+INFO.title.Font = Enum.Font.GothamBlack
+INFO.title.Text = "WHAT'S NEW"
+INFO.title.TextColor3 = COLOR_TEXT
+INFO.title.TextSize = 17
+INFO.title.TextXAlignment = Enum.TextXAlignment.Left
+INFO.title.ZIndex = 42
+INFO.title.Parent = INFO.panel
+
+INFO.close = Instance.new("TextButton")
+INFO.close.Size = UDim2.fromOffset(28, 28)
+INFO.close.Position = UDim2.new(1, -40, 0, 10)
+INFO.close.BackgroundColor3 = COLOR_CARD
+INFO.close.BorderSizePixel = 0
+INFO.close.Font = FONT_BUTTON
+INFO.close.Text = "×"
+INFO.close.TextColor3 = COLOR_TEXT
+INFO.close.TextSize = 19
+INFO.close.AutoButtonColor = false
+INFO.close.ZIndex = 42
+INFO.close.Parent = INFO.panel
+corner(INFO.close, 8)
+
+INFO.divider = Instance.new("Frame")
+INFO.divider.Size = UDim2.new(1, -36, 0, 1)
+INFO.divider.Position = UDim2.fromOffset(18, 50)
+INFO.divider.BackgroundColor3 = Color3.fromRGB(70, 35, 61)
+INFO.divider.BorderSizePixel = 0
+INFO.divider.ZIndex = 42
+INFO.divider.Parent = INFO.panel
+
+INFO.update1 = Instance.new("Frame")
+INFO.update1.Size = UDim2.new(1, -36, 0, 58)
+INFO.update1.Position = UDim2.fromOffset(18, 66)
+INFO.update1.BackgroundColor3 = COLOR_CARD
+INFO.update1.BorderSizePixel = 0
+INFO.update1.ZIndex = 42
+INFO.update1.Parent = INFO.panel
+corner(INFO.update1, 9)
+
+INFO.update1Mark = Instance.new("TextLabel")
+INFO.update1Mark.Size = UDim2.fromOffset(28, 28)
+INFO.update1Mark.Position = UDim2.fromOffset(10, 15)
+INFO.update1Mark.BackgroundColor3 = COLOR_CARD_ON
+INFO.update1Mark.BorderSizePixel = 0
+INFO.update1Mark.Font = Enum.Font.GothamBlack
+INFO.update1Mark.Text = "•"
+INFO.update1Mark.TextColor3 = COLOR_ACCENT
+INFO.update1Mark.TextSize = 22
+INFO.update1Mark.ZIndex = 43
+INFO.update1Mark.Parent = INFO.update1
+corner(INFO.update1Mark, 7)
+
+INFO.update1Text = Instance.new("TextLabel")
+INFO.update1Text.Size = UDim2.new(1, -52, 1, 0)
+INFO.update1Text.Position = UDim2.fromOffset(46, 0)
+INFO.update1Text.BackgroundTransparency = 1
+INFO.update1Text.Font = FONT_BUTTON
+INFO.update1Text.Text = "Savannah Life aquatic support"
+INFO.update1Text.TextColor3 = COLOR_TEXT
+INFO.update1Text.TextSize = 12
+INFO.update1Text.TextXAlignment = Enum.TextXAlignment.Left
+INFO.update1Text.TextWrapped = true
+INFO.update1Text.ZIndex = 43
+INFO.update1Text.Parent = INFO.update1
+
+INFO.update2 = Instance.new("Frame")
+INFO.update2.Size = UDim2.new(1, -36, 0, 58)
+INFO.update2.Position = UDim2.fromOffset(18, 132)
+INFO.update2.BackgroundColor3 = COLOR_CARD
+INFO.update2.BorderSizePixel = 0
+INFO.update2.ZIndex = 42
+INFO.update2.Parent = INFO.panel
+corner(INFO.update2, 9)
+
+INFO.update2Mark = Instance.new("TextLabel")
+INFO.update2Mark.Size = UDim2.fromOffset(28, 28)
+INFO.update2Mark.Position = UDim2.fromOffset(10, 15)
+INFO.update2Mark.BackgroundColor3 = COLOR_CARD_ON
+INFO.update2Mark.BorderSizePixel = 0
+INFO.update2Mark.Font = Enum.Font.GothamBlack
+INFO.update2Mark.Text = "•"
+INFO.update2Mark.TextColor3 = COLOR_ACCENT
+INFO.update2Mark.TextSize = 22
+INFO.update2Mark.ZIndex = 43
+INFO.update2Mark.Parent = INFO.update2
+corner(INFO.update2Mark, 7)
+
+INFO.update2Text = Instance.new("TextLabel")
+INFO.update2Text.Size = UDim2.new(1, -52, 1, 0)
+INFO.update2Text.Position = UDim2.fromOffset(46, 0)
+INFO.update2Text.BackgroundTransparency = 1
+INFO.update2Text.Font = FONT_BUTTON
+INFO.update2Text.Text = "SL / DL bug fixes"
+INFO.update2Text.TextColor3 = COLOR_TEXT
+INFO.update2Text.TextSize = 12
+INFO.update2Text.TextXAlignment = Enum.TextXAlignment.Left
+INFO.update2Text.TextWrapped = true
+INFO.update2Text.ZIndex = 43
+INFO.update2Text.Parent = INFO.update2
+
+INFO.contact = Instance.new("TextLabel")
+INFO.contact.Size = UDim2.new(1, -36, 0, 68)
+INFO.contact.Position = UDim2.fromOffset(18, 208)
+INFO.contact.BackgroundColor3 = COLOR_CARD
+INFO.contact.BorderSizePixel = 0
+INFO.contact.Font = FONT_BODY
+INFO.contact.Text = "If you find any bugs or have a suggestion, contact me on Discord:\nmartusmmb"
+INFO.contact.TextColor3 = COLOR_SUBTEXT
+INFO.contact.TextSize = 11
+INFO.contact.TextWrapped = true
+INFO.contact.TextXAlignment = Enum.TextXAlignment.Left
+INFO.contact.TextYAlignment = Enum.TextYAlignment.Center
+INFO.contact.ZIndex = 42
+INFO.contact.Parent = INFO.panel
+corner(INFO.contact, 9)
+
+INFO.contactPadding = Instance.new("UIPadding")
+INFO.contactPadding.PaddingLeft = UDim.new(0, 12)
+INFO.contactPadding.PaddingRight = UDim.new(0, 12)
+INFO.contactPadding.Parent = INFO.contact
+
+INFO.button.MouseEnter:Connect(function()
+	INFO.button.BackgroundColor3 = COLOR_CARD_ON
+end)
+INFO.button.MouseLeave:Connect(function()
+	INFO.button.BackgroundColor3 = COLOR_CARD
+end)
+
+INFO.button.Activated:Connect(function()
+	INFO.overlay.Visible = not INFO.overlay.Visible
+end)
+
+INFO.close.Activated:Connect(function()
+	INFO.overlay.Visible = false
+end)
 
 -- Drag da janela pelo header
 do
@@ -3053,7 +3239,7 @@ local function showWelcomeToast()
 	msg.TextSize = 12
 	msg.TextWrapped = true
 	msg.TextXAlignment = Enum.TextXAlignment.Left
-	msg.Text = "MMB HUB loaded. Drag the header to move, tap - to minimize."
+	msg.Text = "MMB HUB loaded. Tap ! for updates, drag the header to move, tap - to minimize."
 	msg.Parent = toast
 
 	TweenService:Create(toast, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, 0, 0, 16) }):Play()
