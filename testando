@@ -38,8 +38,20 @@ local DAMAGE = {
 	active = false,
 	connection = nil,
 	cooldownUntil = 0,
+
+	-- Dano rápido: perda grande em poucos segundos.
 	dropFraction = 0.35,
 	windowSeconds = 4,
+
+	-- Dano lento/descontrolado: observa a maior vida recente e reage se ela
+	-- continuar caindo mesmo sem um hit grande de uma vez.
+	slowDropFraction = 0.20,
+	slowWindowSeconds = 18,
+
+	-- Alerta máximo: com 50% de vida ou menos, foge obrigatoriamente.
+	criticalHealthFraction = 0.50,
+	criticalMinWait = 6,
+
 	safeFoodWater = 70,
 	maxRecoveryWait = 10,
 	targetHealFraction = 0.15,
@@ -1301,7 +1313,7 @@ function DAMAGE.teleportToSafety()
 	return false, nil
 end
 
-function DAMAGE.recover(character, humanoid, healthBefore, healthAfter)
+function DAMAGE.recover(character, humanoid, healthBefore, healthAfter, reason, forceMinimumWait)
 	if DAMAGE.active or tick() < DAMAGE.cooldownUntil then return end
 	if character ~= player.Character or not humanoid.Parent or humanoid.Health <= 0 then return end
 
@@ -1327,8 +1339,21 @@ function DAMAGE.recover(character, humanoid, healthBefore, healthAfter)
 	end
 
 	local maxHealth = math.max(humanoid.MaxHealth, 1)
-	local lostPercent = math.floor(((healthBefore - healthAfter) / maxHealth) * 100 + 0.5)
-	runtimeMessage = string.format("Watchdog: dano alto (%d%%); fugindo", lostPercent)
+	local lostPercent = math.max(0, math.floor(((healthBefore - healthAfter) / maxHealth) * 100 + 0.5))
+
+	if reason == "critical" then
+		runtimeMessage = string.format(
+			"Watchdog CRITICO: vida em %d%%; fugindo agora",
+			math.floor((healthAfter / maxHealth) * 100)
+		)
+	elseif reason == "slow" then
+		runtimeMessage = string.format(
+			"Watchdog: vida caindo sem controle (-%d%%); fugindo",
+			lostPercent
+		)
+	else
+		runtimeMessage = string.format("Watchdog: dano alto (-%d%%); fugindo", lostPercent)
+	end
 
 	-- Espera brevemente uma ação anterior liberar state.busy.
 	local busyDeadline = tick() + 2
@@ -1336,7 +1361,7 @@ function DAMAGE.recover(character, humanoid, healthBefore, healthAfter)
 		task.wait(0.05)
 	end
 
-	-- Se ainda ficou ocupado, libera para a emergência assumir.
+	-- Emergência tem prioridade.
 	if state.busy then
 		state.busy = false
 	end
@@ -1349,6 +1374,27 @@ function DAMAGE.recover(character, humanoid, healthBefore, healthAfter)
 	if escaped and character and humanoid and humanoid.Health > 0 then
 		local food = character:GetAttribute("Food") or 0
 		local water = character:GetAttribute("Water") or 0
+		local waitStartedAt = tick()
+		local minimumWaitUntil = forceMinimumWait and (waitStartedAt + DAMAGE.criticalMinWait) or waitStartedAt
+
+		if forceMinimumWait then
+			while state.alive
+				and character == player.Character
+				and humanoid.Parent
+				and humanoid.Health > 0
+				and tick() < minimumWaitUntil do
+
+				runtimeMessage = string.format(
+					"Watchdog CRITICO: recuperando em %s (%ds)",
+					safeSpawn and safeSpawn.Name or "local seguro",
+					math.max(0, math.ceil(minimumWaitUntil - tick()))
+				)
+				task.wait(0.5)
+			end
+		end
+
+		food = character:GetAttribute("Food") or 0
+		water = character:GetAttribute("Water") or 0
 
 		if food >= DAMAGE.safeFoodWater and water >= DAMAGE.safeFoodWater then
 			local startHealth = humanoid.Health
@@ -1379,7 +1425,7 @@ function DAMAGE.recover(character, humanoid, healthBefore, healthAfter)
 				)
 				task.wait(0.5)
 			end
-		else
+		elseif not forceMinimumWait then
 			runtimeMessage = string.format(
 				"Watchdog: Food %d%% Water %d%%; retomando para repor",
 				math.floor(food),
@@ -1427,6 +1473,10 @@ function DAMAGE.bind(character)
 	local windowStartHealth = nil
 	local windowStartedAt = nil
 
+	-- Maior vida observada na janela lenta.
+	local slowPeakHealth = humanoid.Health
+	local slowPeakAt = tick()
+
 	DAMAGE.connection = humanoid.HealthChanged:Connect(function(newHealth)
 		if not state.alive or character ~= player.Character then return end
 
@@ -1436,14 +1486,41 @@ function DAMAGE.bind(character)
 		end
 
 		local now = tick()
+		local maxHealth = math.max(humanoid.MaxHealth, 1)
 
 		if DAMAGE.active or now < DAMAGE.cooldownUntil then
 			lastHealth = newHealth
 			windowStartHealth = nil
 			windowStartedAt = nil
+			slowPeakHealth = newHealth
+			slowPeakAt = now
 			return
 		end
 
+		-- ALERTA MÁXIMO: bateu 50% ou menos, sai imediatamente.
+		if newHealth <= maxHealth * DAMAGE.criticalHealthFraction then
+			local before = math.max(lastHealth, slowPeakHealth, newHealth)
+			lastHealth = newHealth
+			windowStartHealth = nil
+			windowStartedAt = nil
+			slowPeakHealth = newHealth
+			slowPeakAt = now
+			task.spawn(DAMAGE.recover, character, humanoid, before, newHealth, "critical", true)
+			return
+		end
+
+		-- Atualiza/reinicia a referência de vida alta da janela lenta.
+		if newHealth > slowPeakHealth then
+			slowPeakHealth = newHealth
+			slowPeakAt = now
+		elseif now - slowPeakAt > DAMAGE.slowWindowSeconds then
+			-- A cada janela, carrega a vida atual como nova referência.
+			-- Assim detecta uma queda prolongada em "degraus" sem depender de hit grande.
+			slowPeakHealth = math.max(newHealth, lastHealth)
+			slowPeakAt = now
+		end
+
+		-- Dano rápido: mantém a lógica anterior de 35% em até 4 segundos.
 		if newHealth < lastHealth then
 			if not windowStartedAt or now - windowStartedAt > DAMAGE.windowSeconds then
 				windowStartedAt = now
@@ -1452,19 +1529,38 @@ function DAMAGE.bind(character)
 
 			local baseline = windowStartHealth or lastHealth
 			local loss = baseline - newHealth
-			local threshold = math.max(humanoid.MaxHealth, 1) * DAMAGE.dropFraction
+			local fastThreshold = maxHealth * DAMAGE.dropFraction
 
-			if loss >= threshold then
-				local healthBefore = baseline
+			if loss >= fastThreshold then
 				windowStartHealth = nil
 				windowStartedAt = nil
 				lastHealth = newHealth
-				task.spawn(DAMAGE.recover, character, humanoid, healthBefore, newHealth)
+				task.spawn(DAMAGE.recover, character, humanoid, baseline, newHealth, "fast", false)
+				return
+			end
+
+			-- Dano lento/descontrolado: a vida pode ir caindo pouco a pouco.
+			local slowLoss = slowPeakHealth - newHealth
+			local slowThreshold = maxHealth * DAMAGE.slowDropFraction
+
+			if slowLoss >= slowThreshold then
+				local before = slowPeakHealth
+				windowStartHealth = nil
+				windowStartedAt = nil
+				lastHealth = newHealth
+				slowPeakHealth = newHealth
+				slowPeakAt = now
+				task.spawn(DAMAGE.recover, character, humanoid, before, newHealth, "slow", false)
 				return
 			end
 		elseif newHealth > lastHealth then
+			-- Regenerou: zera a janela rápida. A lenta conserva o novo pico.
 			windowStartHealth = nil
 			windowStartedAt = nil
+			if newHealth >= slowPeakHealth then
+				slowPeakHealth = newHealth
+				slowPeakAt = now
+			end
 		end
 
 		lastHealth = newHealth
