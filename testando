@@ -252,10 +252,27 @@ local function ragdollTeleport(position, maxAttempts, faceTowards)
 		end
 
 		if humanoid.Parent then humanoid:ChangeState(Enum.HumanoidStateType.GettingUp) end
-		for _ = 1, 6 do
+
+		-- Solta o ragdoll com uma queda curta e amortecida.
+		-- Não ancora nem inclina: só limita a velocidade vertical por ~0.45s,
+		-- evitando aquela queda seca logo depois do teleporte.
+		local softLandUntil = tick() + 0.45
+		while tick() < softLandUntil and character.Parent and root.Parent do
+			local velocity = root.AssemblyLinearVelocity
+			root.AssemblyLinearVelocity = Vector3.new(
+				velocity.X * 0.35,
+				math.clamp(velocity.Y, -7, 3),
+				velocity.Z * 0.35
+			)
+			root.AssemblyAngularVelocity = root.AssemblyAngularVelocity * 0.25
+			character:SetAttribute("MovementDisabled", false)
+			RunService.Heartbeat:Wait()
+		end
+
+		for _ = 1, 2 do
 			if not character.Parent then break end
 			character:SetAttribute("MovementDisabled", false)
-			task.wait(0.1)
+			task.wait(0.05)
 		end
 
 		local dist = root.Parent and (root.Position - position).Magnitude or math.huge
