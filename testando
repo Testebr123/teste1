@@ -46,6 +46,13 @@ local state = {
 	questPostGrowAll = false,
 	questSeenAny = false,
 	questEmptyScans = 0,
+	questForceFastRecheckUntil = 0,
+	questGrowthReset = {
+		busy = false,
+		active = nil,
+		lastAttemptAt = 0,
+		failedUntil = 0,
+	},
 	questSlots = {
 		maxSlots = 40,
 		busy = false,
@@ -3365,7 +3372,205 @@ function state.questSlots.createForQuest(quest, targetAnimal, records)
 	return true
 end
 
+
+function state.questGrowthResetFindTracked(records, tracked)
+	if type(tracked) ~= "table" then return nil end
+	for _, entry in ipairs(records or {}) do
+		if type(entry) == "table" then
+			local sameUnique = tracked.uniqueName
+				and entry.UniqueCharacterName == tracked.uniqueName
+			local sameName = tracked.characterName
+				and entry.CharacterName == tracked.characterName
+			if sameUnique or sameName then
+				return entry
+			end
+		end
+	end
+end
+
+function state.questGrowthResetIsZero(value)
+	value = tonumber(value)
+	if value == nil then return false end
+
+	-- SavedCharacters can expose growth as 0..1 or 0..100.
+	-- A real reset is expected very close to zero, never merely "not 100".
+	if value <= 1 then
+		return value <= 0.02
+	end
+	return value <= 1
+end
+
+function state.questGrowthResetMaintain(records)
+	local tracked = state.questGrowthReset.active
+	if not tracked then return false end
+
+	records = records or savedCharacters()
+	local entry = state.questGrowthResetFindTracked(records, tracked)
+	if not entry then
+		-- Replication can briefly disappear during reset/spawn. Do not clear
+		-- the lock immediately; the async reset routine owns that transition.
+		return state.questGrowthReset.busy
+	end
+
+	if isGrowthComplete(entry.GrowthPercentage) then
+		state.questGrowthReset.active = nil
+		state.questGrowthReset.busy = false
+		runtimeMessage = "Quest growth reset slot returned to 100%"
+		state.questForceFastRecheckUntil = tick() + 12
+		return false
+	end
+
+	-- IMPORTANT: while this slot is below 100%, do not abandon it for another
+	-- animal-specific/growth slot. Other compatible quests (Zone/Travel/Group)
+	-- are still allowed to run normally on this animal.
+	return true
+end
+
+function state.questGrowthResetCurrent(entry)
+	if state.questGrowthReset.busy
+		or state.questGrowthReset.active
+		or state.busy
+		or questSwitchingAnimal
+		or criticalRecoveryActive
+		or tick() < (state.questGrowthReset.failedUntil or 0) then
+		return true
+	end
+
+	if type(entry) ~= "table" then return false end
+
+	local uniqueName = entry.UniqueCharacterName or entry.CharacterName
+	local characterName = entry.CharacterName
+	if type(uniqueName) ~= "string" or uniqueName == ""
+		or type(characterName) ~= "string" or characterName == "" then
+		return false
+	end
+
+	local clearRemote = ReplicatedStorage:FindFirstChild("ClearCharacterGrowthRemoteFunction")
+		or ReplicatedStorage:WaitForChild("ClearCharacterGrowthRemoteFunction", 5)
+
+	if not clearRemote then
+		questStatusText = "Growth quest: ClearCharacterGrowthRemoteFunction not found"
+		state.questGrowthReset.failedUntil = tick() + 30
+		return false
+	end
+
+	state.questGrowthReset.busy = true
+	state.questGrowthReset.lastAttemptAt = tick()
+	questSwitchingAnimal = true
+	questTravelWanted = false
+	state.questTravelActive = false
+	state.questLandInputActive = false
+	state.questSetW(false)
+	state.questMotionMoving = false
+	state.questMotionMode = nil
+
+	task.spawn(function()
+		local tracked = {
+			uniqueName = uniqueName,
+			characterName = characterName,
+			animalName = entry.AnimalName,
+		}
+
+		runtimeMessage = "Growth quest: resetting 100% slot to 0%"
+		questStatusText = "Growth: resetting " .. tostring(entry.AnimalName or characterName)
+
+		-- Match the edit/restart flow observed from the game's UI.
+		local statsRemote = ReplicatedStorage:FindFirstChild("GuiOpenStatsCounterRemoteEvent")
+		if statsRemote then
+			pcall(statsRemote.FireServer, statsRemote, "EditCharacter")
+		end
+
+		-- Leave the active character cleanly before editing its saved growth.
+		if ResetRemote then
+			pcall(ResetRemote.InvokeServer, ResetRemote)
+			task.wait(1.25)
+		end
+
+		local clearOk = pcall(clearRemote.InvokeServer, clearRemote, uniqueName)
+		if not clearOk and uniqueName ~= characterName then
+			-- Some slots expose a separate UniqueCharacterName while the UI
+			-- remote may use CharacterName. Try the visible name only if the
+			-- unique-id call itself failed.
+			clearOk = pcall(clearRemote.InvokeServer, clearRemote, characterName)
+		end
+
+		if not clearOk then
+			state.questGrowthReset.failedUntil = tick() + 30
+			state.questGrowthReset.busy = false
+			questSwitchingAnimal = false
+			questStatusText = "Growth reset remote failed; retrying later"
+			runtimeMessage = "ClearCharacterGrowth failed"
+			return
+		end
+
+		task.wait(0.8)
+
+		-- The game's edit screen also finishes through EditExistingCharacter.
+		-- We preserve the exact existing identity/appearance; this is deliberately
+		-- no-change edit data. ClearCharacterGrowth remains the authoritative
+		-- growth mutation and SavedCharacters verification below decides success.
+		local editRemote = ReplicatedStorage:FindFirstChild("EditExistingCharacterRemoteFunction")
+			or ReplicatedStorage:WaitForChild("EditExistingCharacterRemoteFunction", 3)
+
+		if editRemote then
+			local gender = entry.Gender or "Male"
+			local skin = entry.Skin or "Default"
+			pcall(
+				editRemote.InvokeServer,
+				editRemote,
+				uniqueName,
+				characterName,
+				gender,
+				skin
+			)
+		end
+
+		local resetEntry
+		local deadline = tick() + 10
+		repeat
+			task.wait(0.4)
+			local refreshed = savedCharacters()
+			local candidate = state.questGrowthResetFindTracked(refreshed, tracked)
+			if candidate and state.questGrowthResetIsZero(candidate.GrowthPercentage) then
+				resetEntry = candidate
+			end
+		until resetEntry or tick() >= deadline
+
+		if not resetEntry then
+			-- Never assume a destructive/reset action succeeded.
+			state.questGrowthReset.failedUntil = tick() + 30
+			state.questGrowthReset.busy = false
+			questSwitchingAnimal = false
+			questStatusText = "Growth reset was not confirmed; no spawn attempted"
+			runtimeMessage = "Growth reset verification failed"
+			return
+		end
+
+		state.questGrowthReset.active = tracked
+		runtimeMessage = "Growth reset confirmed at 0%; spawning same animal"
+		questStatusText = "Growth reset confirmed -> spawning " .. tostring(resetEntry.AnimalName)
+
+		local spawned = spawnSlot(resetEntry)
+		if not spawned then
+			-- Keep active lock: next quest checks know this slot must be returned
+			-- to 100% and will not sacrifice another character instead.
+			questStatusText = "Growth reset confirmed; waiting to respawn slot"
+			runtimeMessage = "Reset slot confirmed but spawn failed"
+		else
+			state.questForceFastRecheckUntil = tick() + 20
+			questStatusText = "Growing reset slot + resuming compatible quests"
+			runtimeMessage = "Quest growth active; other quests resumed"
+		end
+
+		state.questGrowthReset.busy = false
+		questSwitchingAnimal = false
+	end)
+
+	return true
+end
+
 local function trySwitchToQuestAnimal(quest, records, resolvedTarget)
+	if state.questGrowthResetMaintain(records) then return false end
 	if tick() - questLastAnimalSwitch < 20 or questSwitchingAnimal or state.busy or criticalRecoveryActive then return false end
 	local targetAnimal = resolvedTarget or findSpecificAnimalTarget(quest, records)
 	if not targetAnimal then return false end
@@ -3396,51 +3601,139 @@ local function trySwitchToQuestAnimal(quest, records, resolvedTarget)
 			pcall(ResetRemote.InvokeServer, ResetRemote)
 			task.wait(1.5)
 		end
-		spawnSlot(targetSlot)
+		local spawned = spawnSlot(targetSlot)
 		questSwitchingAnimal = false
+		if spawned then
+			state.questForceFastRecheckUntil = tick() + 20
+			runtimeMessage = "Quest animal ready; resuming route checks"
+		end
 	end)
 	return true
 end
 
-local function trySwitchToGrowingSlot(quests, records)
+local function trySwitchToGrowingSlot(quests, records, specificAnimalFocus)
 	local hasGrowthQuest = false
 	for _, quest in ipairs(quests) do
-		if quest.props and quest.props.QuestType == "GrowTime" then
+		if quest.props
+			and quest.props.QuestType == "GrowTime"
+			and not state.questGroup.questComplete(quest) then
 			hasGrowthQuest = true
 			break
 		end
 	end
-	if not hasGrowthQuest or questSwitchingAnimal or state.busy or criticalRecoveryActive then return false end
+
+	if not hasGrowthQuest then
+		state.questGrowthResetMaintain(records)
+		return false
+	end
+
+	if questSwitchingAnimal or state.busy or criticalRecoveryActive then
+		return false
+	end
+
+	-- If we previously reset a mature slot, that same slot is now mandatory
+	-- until it reaches 100% again. Do not sacrifice its growth points.
+	if state.questGrowthResetMaintain(records) then
+		return false
+	end
 
 	local character = player.Character
-	local currentGrowth = character and character:GetAttribute("GrowthPercentage")
-	if currentGrowth ~= nil and not isGrowthComplete(currentGrowth) then return false end
-	if tick() - questLastAnimalSwitch < 20 then return false end
+	if not character then return false end
 
-	local currentName = character and character:GetAttribute("CharacterName")
+	local currentGrowth = character:GetAttribute("GrowthPercentage")
+	if currentGrowth ~= nil and not isGrowthComplete(currentGrowth) then
+		-- This is the desired state: Growth progresses passively while Zone,
+		-- Travel, Grouping, Survive, etc. continue below in Auto Quests.
+		return false
+	end
+
+	if tick() - questLastAnimalSwitch < 8 then return false end
+
+	local currentName = character:GetAttribute("CharacterName")
+	local currentAnimal = character:GetAttribute("AnimalName")
 	local targetSlot
-	for _, entry in ipairs(records) do
-		if entry.CharacterName ~= currentName and not isGrowthComplete(entry.GrowthPercentage) then
-			targetSlot = entry
-			break
+
+	-- If an animal-specific quest is active, never jump to another species
+	-- merely for Growth. Prefer an incomplete slot of THIS species so both
+	-- quests gain progress at once.
+	if specificAnimalFocus and type(currentAnimal) == "string" then
+		for _, entry in ipairs(records) do
+			if entry.CharacterName ~= currentName
+				and type(entry.AnimalName) == "string"
+				and entry.AnimalName:lower() == currentAnimal:lower()
+				and not isGrowthComplete(entry.GrowthPercentage) then
+				targetSlot = entry
+				break
+			end
+		end
+	elseif not specificAnimalFocus then
+		for _, entry in ipairs(records) do
+			if entry.CharacterName ~= currentName
+				and not isGrowthComplete(entry.GrowthPercentage) then
+				targetSlot = entry
+				break
+			end
 		end
 	end
-	if not targetSlot then return false end
 
-	questLastAnimalSwitch = tick()
-	questSwitchingAnimal = true
-	questTravelWanted = false
-	state.questTravelActive = false
-	runtimeMessage = "Quest: switching to a growing slot"
-	task.spawn(function()
-		if ResetRemote then
-			pcall(ResetRemote.InvokeServer, ResetRemote)
-			task.wait(1.5)
+	if targetSlot then
+		questLastAnimalSwitch = tick()
+		questSwitchingAnimal = true
+		questTravelWanted = false
+		state.questTravelActive = false
+		state.questLandInputActive = false
+		state.questSetW(false)
+		state.questMotionMoving = false
+		state.questMotionMode = nil
+
+		runtimeMessage = "Quest: switching to an incomplete growth slot"
+		task.spawn(function()
+			if ResetRemote then
+				pcall(ResetRemote.InvokeServer, ResetRemote)
+				task.wait(1.25)
+			end
+
+			local spawned = spawnSlot(targetSlot)
+			questSwitchingAnimal = false
+
+			if spawned then
+				state.questForceFastRecheckUntil = tick() + 20
+				questStatusText = "Growth slot active; resuming all compatible quests"
+				runtimeMessage = "Growth slot ready; quest routing resumed"
+			end
+		end)
+		return true
+	end
+
+	-- No incomplete slot exists. Only reset an existing mature slot when the
+	-- account is genuinely full (40 slots) AND every one is 100%.
+	if #records >= (state.questSlots.maxSlots or 40) then
+		local allComplete = true
+		for _, entry in ipairs(records) do
+			if not isGrowthComplete(entry.GrowthPercentage) then
+				allComplete = false
+				break
+			end
 		end
-		spawnSlot(targetSlot)
-		questSwitchingAnimal = false
-	end)
-	return true
+
+		if allComplete then
+			local currentEntry
+			for _, entry in ipairs(records) do
+				if entry.CharacterName == currentName then
+					currentEntry = entry
+					break
+				end
+			end
+
+			if currentEntry then
+				return state.questGrowthResetCurrent(currentEntry)
+			end
+
+			questStatusText = "Growth: 40/40 mature, but current saved slot was not found"
+		end
+	end
+
+	return false
 end
 
 local function claimQuestRewards(quests)
@@ -3728,6 +4021,11 @@ local function updateQuestAutomation()
 	if state.autoQuests and carnivore and food <= 70 and not preSwitchFoodTarget then
 		state.questCarnivoreFeeding = true
 		eatingToFull = true
+		state.questForceFastRecheckUntil = tick() + 10
+		runtimeMessage = string.format(
+			"Carnivore quest slot: feeding to 100%% before route resume (%d%%)",
+			math.floor(food)
+		)
 	end
 
 	if state.questCarnivoreFeeding or drinkingToFull or eatingToFull or carcassEatBusy or CROC.approachBusy
@@ -3743,6 +4041,8 @@ local function updateQuestAutomation()
 	end
 
 	local records = savedCharacters()
+	state.questGrowthResetMaintain(records)
+
 	local specificAnimalFocus = false
 	local focusQuest
 	local focusAnimal
@@ -3759,7 +4059,7 @@ local function updateQuestAutomation()
 		end
 	end
 
-	if focusQuest and focusAnimal then
+	if focusQuest and focusAnimal and not state.questGrowthReset.active then
 		local character = player.Character
 		local currentAnimal = character and character:GetAttribute("AnimalName")
 		local targetSlot = state.questSlots.findAnimalSlot(records, focusAnimal)
@@ -3798,8 +4098,10 @@ local function updateQuestAutomation()
 		end
 	end
 
-	if not specificAnimalFocus and trySwitchToGrowingSlot(quests, records) then
-		questStatusText = "Changing to a growing slot"
+	if trySwitchToGrowingSlot(quests, records, specificAnimalFocus) then
+		questStatusText = state.questGrowthReset.busy
+			and "Resetting mature slot for Growth quest"
+			or "Changing to a growing slot"
 		return
 	end
 
@@ -5767,7 +6069,9 @@ task.spawn(function()
 			local cardHeight = math.max(52, 24 + (displayLines * 18))
 			questStatusCard.Size = UDim2.new(1, 0, 0, cardHeight)
 		end
-		task.wait(state.questSwimActive and 1 or 5)
+		local fastQuestCheck = state.questSwimActive
+			or tick() < (state.questForceFastRecheckUntil or 0)
+		task.wait(fastQuestCheck and 1 or 5)
 	end
 end)
 
