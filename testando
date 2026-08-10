@@ -25,6 +25,43 @@ local state = {
 	growExisting = false,
 	growNew = false,
 	farmCoins = false,
+	autoQuests = false,
+	autoClaimQuests = false,
+	questMoveSubState = "Running",
+	questLastSubStateAt = 0,
+	questLastEatTapAt = 0,
+	questTravelActive = false,
+	questMotionMoving = false,
+	questMotionMode = nil,
+	questLandInputActive = false,
+	questLandKeyDown = false,
+	questLandLastPulseAt = 0,
+	questLandLastRefreshAt = 0,
+	questSwimActive = false,
+	questSwimReady = false,
+	questSwimLastDrinkAt = 0,
+	questSwimLastWaterCheck = 0,
+	questSwimPosition = Vector3.new(-3800.06, -15.06, 4247.34),
+	questCarnivoreFeeding = false,
+	questPostGrowAll = false,
+	questSeenAny = false,
+	questEmptyScans = 0,
+	questSlots = {
+		maxSlots = 40,
+		busy = false,
+		temp = nil,
+		failedUntil = {},
+	},
+	questGroup = {
+		handler = nil,
+		lastActionAt = 0,
+		lastAnimal = nil,
+		lastInviteAt = {},
+		statusText = "",
+		difficultySince = nil,
+		lastServerAnalysisAt = 0,
+		pendingPackAnimal = nil,
+	},
 	newSlotGender = "Female",
 	busy = false,
 	alive = true,
@@ -188,6 +225,13 @@ local AskSubState = ReplicatedStorage:FindFirstChild("AskServerToSetSubStateRemo
 local SpawnRemote = ReplicatedStorage:WaitForChild("SpawnAsCharacterRemoteFunction", 15)
 local ResetRemote = ReplicatedStorage:WaitForChild("CustomCharacterResetRemoteFunction", 15)
 local CreateRemote = ReplicatedStorage:WaitForChild("CreateNewCharacterRemoteFunction", 15)
+local ClaimQuestRemote = ReplicatedStorage:WaitForChild("ClaimQuestRemoteFunction", 15)
+local QuestsStorage
+pcall(function()
+	local sharedFolder = ReplicatedStorage:WaitForChild("Shared", 10)
+	local questsModule = sharedFolder and sharedFolder:WaitForChild("QuestsStorage", 10)
+	if questsModule then QuestsStorage = require(questsModule) end
+end)
 local CarcassRemote = ReplicatedStorage:FindFirstChild("StartEatingCarcassesRemotEvent")
 if not CarcassRemote then
 	for _, object in ipairs(ReplicatedStorage:GetDescendants()) do
@@ -654,7 +698,10 @@ local function eatCarcass(carcass, carcassRoot)
 			foodEverRose = true
 			deadline = tick() + 4 -- ainda subindo, estende o prazo
 		end
-		if curFood >= (preSwitchFoodTarget or 92) then break end
+		local targetFood = (state.autoQuests and state.questCarnivoreFeeding and not preSwitchFoodTarget)
+			and 100
+			or (preSwitchFoodTarget or 92)
+		if curFood >= targetFood then break end
 
 		root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
 		if (root.Position - holdPosition).Magnitude > 6 then
@@ -1052,12 +1099,45 @@ local function virtualEatKick()
 end
 
 local function autoEatStep()
+	if state.questSwimActive then return end
 	if not state.autoEat or state.busy or drinkingToFull or criticalRecoveryActive then return end
 	local character, root = characterParts()
 	if not character or not root then return end
 	if carcassEatBusy then return end
+
 	local food = character:GetAttribute("Food") or 100
-	local foodCap = preSwitchFoodTarget or 92
+	local carnivore = isCarnivoreCharacter(character)
+	local questCarnivore = state.autoQuests and carnivore and not preSwitchFoodTarget
+
+	-- Carnívoro durante Auto Quests:
+	-- só interrompe as quests quando Food chegar a 70% ou menos.
+	-- Depois que começa, continua procurando/comendo carcaça até 100%.
+	if questCarnivore then
+		if not state.questCarnivoreFeeding and food <= 70 then
+			state.questCarnivoreFeeding = true
+			eatingToFull = true
+			runtimeMessage = "Carnivore: Food <= 70%; pausing quests to eat"
+		end
+
+		if state.questCarnivoreFeeding then
+			if food >= 100 then
+				state.questCarnivoreFeeding = false
+				eatingToFull = false
+				resetEatingSearch(food)
+				activeCarcass = nil
+				eatingStuckSince = nil
+				runtimeMessage = "Carnivore full; returning to quests"
+				return
+			end
+		else
+			-- Acima de 70% o carnívoro não abandona Auto Run/Zone para caçar.
+			return
+		end
+	elseif state.questCarnivoreFeeding then
+		state.questCarnivoreFeeding = false
+	end
+
+	local foodCap = questCarnivore and 100 or (preSwitchFoodTarget or 92)
 	if food >= foodCap then
 		eatingToFull = false
 		resetEatingSearch(food)
@@ -1065,6 +1145,39 @@ local function autoEatStep()
 		eatingStuckSince = nil
 		return
 	end
+
+	local availableFood = detectAvailableFood(character)
+
+	-- Herbívoro durante Auto Quests:
+	-- o modo especial "Eat enquanto corre" só existe se ainda houver uma
+	-- Travel/Land Distance incompleta. Sem missão de corrida, volta ao Auto Eat
+	-- padrão: procura a grama e vai até ela normalmente.
+	if state.autoQuests and state.questTravelActive
+		and not preSwitchFoodTarget and not carnivore then
+		if availableFood == "Eat" then
+			eatingToFull = false
+			eatingSourcePosition = nil
+			eatingTargetReachedAt = nil
+			eatingStuckSince = nil
+			runtimeMessage = "Eating while running"
+
+			if tick() - (state.questLastEatTapAt or 0) >= 0.8 then
+				state.questLastEatTapAt = tick()
+				pcall(function()
+					VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+					task.wait(0.04)
+					VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+				end)
+				setSubState("Eating")
+			end
+			return
+		end
+
+		if not eatingToFull and food > 68 then
+			return
+		end
+	end
+
 	eatingToFull = true
 
 	if lastEatWatchdogFood == nil or food > lastEatWatchdogFood then
@@ -1079,21 +1192,33 @@ local function autoEatStep()
 		virtualEatKick()
 		return
 	end
-	local animal = character:GetAttribute("AnimalName") or ""
-	if isCarnivoreCharacter(character) then
+
+	if carnivore then
 		if carcassEatBusy then return end
+
 		local carcass = activeCarcass
-		local carcassRoot = carcass and (carcass:FindFirstChild("HumanoidRootPart") or carcass:FindFirstChildWhichIsA("BasePart", true))
-		if not carcassRoot then carcass, carcassRoot = nearestCarcass(root) end
+		local carcassRoot = carcass and (
+			carcass:FindFirstChild("HumanoidRootPart")
+			or carcass:FindFirstChildWhichIsA("BasePart", true)
+		)
+
+		if not carcassRoot then
+			carcass, carcassRoot = nearestCarcass(root)
+		end
+
 		if carcass and carcassRoot then
+			runtimeMessage = questCarnivore
+				and string.format("Carnivore feeding to 100%% (Food %d%%)", math.floor(food))
+				or "Indo comer carcaça"
 			task.spawn(eatCarcass, carcass, carcassRoot)
 		else
-			runtimeMessage = "Carnivoro sem carcaça por perto"
+			runtimeMessage = questCarnivore
+				and string.format("Carnivore feeding: searching carcass (Food %d%%)", math.floor(food))
+				or "Carnivoro sem carcaça por perto"
 
 			if isSavannahLife then
 				exploreSavannahCarcassSpawns()
 			elseif tick() >= nextCarnivoreExploreCheck then
-				-- Jungle/Dino continuam exatamente com a exploracao antiga.
 				nextCarnivoreExploreCheck = tick() + 20
 				local spot = findSafeTerrainSpot(root.Position, 20, 60)
 				if spot then
@@ -1119,7 +1244,7 @@ local function autoEatStep()
 		end
 	end
 
-	if detectAvailableFood(character) == "Eat" then
+	if availableFood == "Eat" then
 		eatingSourcePosition = root.Position
 		eatingTargetReachedAt = tick()
 		runtimeMessage = "Comendo a grama proxima"
@@ -1140,36 +1265,119 @@ local function autoEatStep()
 		runtimeMessage = "Nenhuma grama detectada por perto"
 		return
 	end
+
 	runtimeMessage = "Indo para uma grama proxima"
 	moveToGrass(grass)
 	task.wait(0.2)
 	eatingSourcePosition = grass
 	eatingTargetReachedAt = tick()
+
 	local detectedAfterMove = detectAvailableFood(character)
-	if detectedAfterMove == "Eat" or not GameUtils or not AnimalConfig then setSubState("Eating") end
+	if detectedAfterMove == "Eat" or not GameUtils or not AnimalConfig then
+		setSubState("Eating")
+	end
 end
 
-local function isPositionInWaterTerrain(position)
-	-- Lê o material do terreno exatamente na posição (voxel), em vez de
-	-- confiar só num raycast fino que pode "passar batido" se o personagem
-	-- estiver afundado ou o terreno abaixo não for o mesmo voxel da água.
-	local ok, materials = pcall(function()
-		local region = Region3.new(position - Vector3.new(2, 2, 2), position + Vector3.new(2, 2, 2)):ExpandToGrid(4)
-		local m = workspace.Terrain:ReadVoxels(region, 4)
-		return m
+local function isPositionInWaterTerrain(position, radiusXZ, radiusY)
+	radiusXZ = radiusXZ or 5
+	radiusY = radiusY or 7
+
+	local ok, materials, occupancies = pcall(function()
+		local half = Vector3.new(radiusXZ, radiusY, radiusXZ)
+		local region = Region3.new(position - half, position + half):ExpandToGrid(4)
+		return workspace.Terrain:ReadVoxels(region, 4)
 	end)
-	if not ok or not materials then return false end
-	local material = materials[1] and materials[1][1] and materials[1][1][1]
-	return material == Enum.Material.Water
+	if not ok or type(materials) ~= "table" then return false end
+
+	-- ReadVoxels returns a 3D matrix. The old check only inspected [1][1][1],
+	-- so it could report false even with the animal visibly inside water.
+	for x = 1, #materials do
+		local ys = materials[x]
+		if type(ys) == "table" then
+			for y = 1, #ys do
+				local zs = ys[y]
+				if type(zs) == "table" then
+					for z = 1, #zs do
+						if zs[z] == Enum.Material.Water then
+							local occupancy = occupancies
+								and occupancies[x]
+								and occupancies[x][y]
+								and occupancies[x][y][z]
+							if occupancy == nil or occupancy > 0.05 then
+								return true
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return false
 end
 
 local function isStandingInWater(root)
 	if not root then return false end
-	if isPositionInWaterTerrain(root.Position) then return true end
-	local hit = workspace:Raycast(root.Position + Vector3.new(0, 1, 0), Vector3.new(0, -3, 0), terrainParams)
-	if hit and hit.Material == Enum.Material.Water then return true end
+
 	local _, _, humanoid = characterParts()
-	return humanoid ~= nil and humanoid:GetState() == Enum.HumanoidStateType.Swimming
+	if humanoid and humanoid:GetState() == Enum.HumanoidStateType.Swimming then
+		return true
+	end
+
+	if isPositionInWaterTerrain(root.Position, 6, 9) then
+		return true
+	end
+
+	-- Probe several points around the body instead of one tiny 3-stud ray.
+	local offsets = {
+		Vector3.new(0, 5, 0),
+		Vector3.new(0, 2, 0),
+		Vector3.new(3, 3, 0),
+		Vector3.new(-3, 3, 0),
+		Vector3.new(0, 3, 3),
+		Vector3.new(0, 3, -3),
+	}
+	for _, offset in ipairs(offsets) do
+		local hit = workspace:Raycast(
+			root.Position + offset,
+			Vector3.new(0, -14, 0),
+			terrainParams
+		)
+		if hit and hit.Material == Enum.Material.Water then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function isValidSwimQuestWater(root)
+	if not root then return false end
+
+	if isStandingInWater(root) then
+		return true
+	end
+
+	-- Wider scan used only for the known Swim farm location. Large animals can
+	-- have their HRP above/below the water voxel even while the body is swimming.
+	if isPositionInWaterTerrain(root.Position, 12, 16) then
+		return true
+	end
+
+	-- The supplied farm point is known to be inside the swim area. If we are
+	-- very close to it, force Swimming once and accept the area after physics
+	-- has had a moment to update instead of teleporting forever.
+	local target = state.questSwimPosition
+	if target and (root.Position - target).Magnitude <= 28 then
+		local _, _, humanoid = characterParts()
+		if humanoid then
+			pcall(humanoid.ChangeState, humanoid, Enum.HumanoidStateType.Swimming)
+		end
+		setSubState("Swimming")
+		return true
+	end
+
+	return false
 end
 
 local forcingPostDrinkTeleport = false
@@ -1805,6 +2013,37 @@ local function autoDrinkStep()
 	end
 
 	local water = character:GetAttribute("Water") or 100
+
+	-- Swim quest: pode beber, mas nunca pode parar o nado.
+	-- Faz pulsos curtos de Drink somente quando o prompt já está disponível,
+	-- preserva a velocidade atual e imediatamente volta ao estado Swimming.
+	if state.questSwimActive then
+		drinkingToFull = false
+		drinkingSourcePosition = nil
+		drinkingStuckSince = nil
+		lastDrinkWatchdogWater = water
+		removeSwimBarrier()
+
+		if water <= 75
+			and tick() - (state.questSwimLastDrinkAt or 0) >= 0.8
+			and detectAvailableFood(character) == "Drink" then
+
+			state.questSwimLastDrinkAt = tick()
+			runtimeMessage = string.format("Swim quest: drinking while moving (%d%%)", math.floor(water))
+
+			pcall(function()
+				VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+				task.wait(0.04)
+				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+			end)
+
+			setSubState("Drinking")
+			task.wait(0.08)
+			setSubState("Swimming")
+		end
+		return
+	end
+
 	if water <= 75 then
 		drinkingToFull = true
 		eatingToFull = false
@@ -1833,10 +2072,25 @@ local function autoDrinkStep()
 	elseif not drinkingStuckSince then
 		drinkingStuckSince = tick()
 	end
-	if drinkingStuckSince and tick() - drinkingStuckSince >= 15 then
+	if drinkingStuckSince and tick() - drinkingStuckSince >= 8 then
 		lastDrinkWatchdogWater = water
 		drinkingStuckSince = tick()
 		virtualDrinkKick()
+		return
+	end
+
+	-- Se o prompt já está disponível, não reposiciona nem deixa outra rotina
+	-- assumir o personagem: simplesmente mantém a posição e bebe.
+	local drinkDetectedNow = detectAvailableFood(character)
+	if drinkDetectedNow == "Drink" then
+		drinkingSourcePosition = root.Position
+		root.AssemblyLinearVelocity = Vector3.new(0, root.AssemblyLinearVelocity.Y, 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+		runtimeMessage = "Prompt de agua detectado; bebendo"
+		setSubState("Drinking")
+		if isDinoLife then
+			task.spawn(holdDinoDrinkPosition, root.Position)
+		end
 		return
 	end
 
@@ -1934,11 +2188,19 @@ local function autoDrinkStep()
 		else
 			ragdollTeleport(waterPosition - Vector3.new(0, 3, 0))
 		end
-		drinkingSourcePosition = waterPosition
 		task.wait(0.25)
+
 		local _, newRoot = characterParts()
-		if newRoot then updateSwimBarrier(newRoot, true) end
-		for _ = 1, 3 do
+		if newRoot then
+			drinkingSourcePosition = newRoot.Position
+			newRoot.AssemblyLinearVelocity = Vector3.zero
+			newRoot.AssemblyAngularVelocity = Vector3.zero
+			updateSwimBarrier(newRoot, true)
+		else
+			drinkingSourcePosition = waterPosition
+		end
+
+		for _ = 1, 5 do
 			setSubState("Drinking")
 			task.wait(0.2)
 		end
@@ -2067,6 +2329,1920 @@ local function nextExistingSlot(animalName, records)
 			return entry
 		end
 	end
+end
+
+
+-- ============================================================
+-- Quest automation
+-- ============================================================
+local QUEST_ZONES = {
+	["Savannah Mirage"] = Vector3.new(-8088.98, 4.76, 1515.19),
+	["Savannah Heights"] = Vector3.new(-9773.28, 4.30, 2197.76),
+	["Hippo Swamp"] = Vector3.new(-8762.41, 7.27, 3803.63),
+	["Pride Rock"] = Vector3.new(-6124.87, -4.29, 4454.70),
+	["Mbali River Bend"] = Vector3.new(-4107.91, -0.05, 4673.10),
+	["Sablerock"] = Vector3.new(-2551.84, 0.03, 5621.46),
+	["Simba Falls"] = Vector3.new(-3989.49, -3.79, 761.26),
+	["Nyala Forest"] = Vector3.new(-3484.64, 0.50, 903.23),
+	["Tshukudu Canyon"] = Vector3.new(-2877.89, 117.16, 11345.21),
+	["Savannah Plains"] = Vector3.new(-6085.59, -1.04, 9310.34),
+	["Sabie Delta"] = Vector3.new(-7963.85, 4.01, 7975.86),
+}
+
+local questSessionClaimed = {}
+local questTargetZoneName
+local questTravelWanted = false
+local questStatusText = "Ready"
+local questLastAnimalSwitch = 0
+local questSwitchingAnimal = false
+
+local function normalizeQuestBucket(bucket)
+	local result = {}
+	if type(bucket) ~= "table" then return result end
+	for index, entry in pairs(bucket) do
+		if type(entry) == "table" and type(entry.QuestUniqueKey) == "string" then
+			table.insert(result, {
+				index = index,
+				data = entry,
+			})
+		end
+	end
+	table.sort(result, function(a, b)
+		local an, bn = tonumber(a.index), tonumber(b.index)
+		if an and bn then return an < bn end
+		return tostring(a.index) < tostring(b.index)
+	end)
+	return result
+end
+
+local function getQuestBucket(key)
+	local replication = resolveReplication()
+	if not replication then return {} end
+	local ok, bucket = pcall(replication.GetKeyData, key)
+	if not ok or type(bucket) ~= "table" then
+		if type(replication.GetData) == "function" then
+			local dataOk, allData = pcall(replication.GetData)
+			if dataOk and type(allData) == "table" then bucket = allData[key] end
+		end
+	end
+	return normalizeQuestBucket(bucket)
+end
+
+local function getAllQuests()
+	local result = {}
+	for _, spec in ipairs({
+		{ category = "Daily", dataKey = "DailyQuests" },
+		{ category = "Weekly", dataKey = "WeeklyQuests" },
+	}) do
+		for _, wrapped in ipairs(getQuestBucket(spec.dataKey)) do
+			local entry = wrapped.data
+			local storageBucket = QuestsStorage and QuestsStorage[spec.dataKey]
+			local props = storageBucket and storageBucket[entry.QuestUniqueKey]
+			if props then
+				local id = spec.category .. "|" .. entry.QuestUniqueKey
+				if not questSessionClaimed[id] then
+					table.insert(result, {
+						id = id,
+						category = spec.category,
+						dataKey = spec.dataKey,
+						entry = entry,
+						props = props,
+					})
+				end
+			end
+		end
+	end
+	return result
+end
+
+
+-- ============================================================
+-- Quest: Grouping / Pack automation
+-- ============================================================
+function state.questGroup.resolveHandler()
+	if state.questGroup.handler and type(state.questGroup.handler.GetData) == "function" then
+		return state.questGroup.handler
+	end
+
+	local scripts = player:FindFirstChild("PlayerScripts")
+	local framework = scripts and scripts:FindFirstChild("AnimalGameFramework")
+	local external = framework and framework:FindFirstChild("ExternalAccessModules")
+	local module = external and external:FindFirstChild("PackHandlerClient")
+	if not module then
+		module = scripts and scripts:FindFirstChild("PackHandlerClient", true)
+	end
+	if not module or not module:IsA("ModuleScript") then return nil end
+
+	local ok, result = pcall(require, module)
+	if ok and type(result) == "table" then
+		state.questGroup.handler = result
+		return result
+	end
+end
+
+function state.questGroup.samePlayer(a, b)
+	if a == b then return true end
+	if not a or not b then return false end
+	local okA, idA = pcall(function() return a.UserId end)
+	local okB, idB = pcall(function() return b.UserId end)
+	return okA and okB and idA ~= nil and idA == idB
+end
+
+function state.questGroup.getPlayerAnimal(targetPlayer)
+	if not targetPlayer then return nil end
+	local character = targetPlayer.Character or workspace:FindFirstChild(targetPlayer.Name)
+	if not character then return nil end
+	local animal = character:GetAttribute("AnimalName")
+	if type(animal) == "string" and animal ~= "" then return animal end
+	local value = character:FindFirstChild("AnimalName")
+	if value and value:IsA("StringValue") and value.Value ~= "" then return value.Value end
+end
+
+function state.questGroup.sameAnimal(a, b)
+	return type(a) == "string" and type(b) == "string" and a:lower() == b:lower()
+end
+
+function state.questGroup.getCurrentPack(handler)
+	if not handler or type(handler.GetPlayerPackData) ~= "function" then return nil end
+	local ok, pack = pcall(handler.GetPlayerPackData, player)
+	return ok and type(pack) == "table" and pack or nil
+end
+
+function state.questGroup.hasOtherMember(pack)
+	if type(pack) ~= "table" then return false end
+	if pack.Owner and not state.questGroup.samePlayer(pack.Owner, player) then
+		return true
+	end
+	if type(pack.NormalMembers) == "table" then
+		for _, member in pairs(pack.NormalMembers) do
+			if member and not state.questGroup.samePlayer(member, player) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+function state.questGroup.questComplete(quest)
+	if type(quest) ~= "table" or type(quest.props) ~= "table" then return false end
+	local maxProgress
+	if type(quest.props.GetMaxProgress) == "function" then
+		local ok, value = pcall(quest.props.GetMaxProgress, quest.props)
+		if ok and type(value) == "number" and value > 0 then maxProgress = value end
+	end
+	if not maxProgress then return false end
+
+	local function scan(value, seen)
+		if type(value) ~= "table" then return nil end
+		seen = seen or {}
+		if seen[value] then return nil end
+		seen[value] = true
+		local best
+		for key, child in pairs(value) do
+			if type(child) == "number" and type(key) == "string"
+				and key:lower():find("progress", 1, true) then
+				best = math.max(best or 0, child)
+			elseif type(child) == "table" then
+				local nested = scan(child, seen)
+				if nested then best = math.max(best or 0, nested) end
+			end
+		end
+		return best
+	end
+
+	local current = scan(quest.entry)
+	if type(current) == "number" then
+		return current >= maxProgress * 0.999
+	end
+
+	-- Fallback pela HUD para Grouping concluída mas ainda não removida dos dados.
+	local gui = player:FindFirstChild("PlayerGui")
+	local questsGui = gui and gui:FindFirstChild("QuestsScreenGui")
+	local scrolling = questsGui and questsGui:FindFirstChild("RefScrollingFrame", true)
+	local wantedTitle = type(quest.props.Title) == "string" and quest.props.Title:lower() or nil
+	if scrolling and wantedTitle then
+		for _, frame in ipairs(scrolling:GetChildren()) do
+			if frame:IsA("GuiObject") and frame.Name:match("^QuestFrame%d+$") then
+				local pieces = {}
+				for _, object in ipairs(frame:GetDescendants()) do
+					if object:IsA("TextLabel") or object:IsA("TextButton") then
+						table.insert(pieces, tostring(object.Text))
+					end
+				end
+				local combined = table.concat(pieces, " ")
+				if combined:lower():find(wantedTitle, 1, true) then
+					local shownCurrent, shownMax = combined:match("([%d,%.]+)%s*/%s*([%d,%.]+)")
+					if shownCurrent and shownMax then
+						shownCurrent = tonumber((shownCurrent:gsub("[,%.]", "")))
+						shownMax = tonumber((shownMax:gsub("[,%.]", "")))
+						if shownCurrent and shownMax and shownMax > 0 then
+							return shownCurrent >= shownMax
+						end
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
+function state.questGroup.inviteMatchingPlayers(handler, animalName)
+	if not handler or type(handler.RequestInvite) ~= "function" then return 0 end
+	local invited = 0
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player and state.questGroup.sameAnimal(state.questGroup.getPlayerAnimal(other), animalName) then
+			local last = state.questGroup.lastInviteAt[other.UserId] or 0
+			if tick() - last >= 30 then
+				state.questGroup.lastInviteAt[other.UserId] = tick()
+				pcall(handler.RequestInvite, other)
+				invited += 1
+				if invited >= 3 then break end
+			end
+		end
+	end
+	return invited
+end
+
+function state.questGroup.memberCount(pack)
+	if type(pack) ~= "table" then return 0 end
+	local count = pack.Owner and 1 or 0
+	if type(pack.NormalMembers) == "table" then
+		for _, member in pairs(pack.NormalMembers) do
+			if member then count += 1 end
+		end
+	end
+	return count
+end
+
+function state.questGroup.findOwnedSlot(records, animalName)
+	if type(records) ~= "table" or type(animalName) ~= "string" then return nil end
+	local bestComplete
+	local bestIncomplete
+	local bestIncompleteGrowth = -1
+
+	for _, entry in ipairs(records) do
+		if type(entry) == "table"
+			and type(entry.AnimalName) == "string"
+			and entry.AnimalName:lower() == animalName:lower() then
+
+			if isGrowthComplete(entry.GrowthPercentage) then
+				if not bestComplete then bestComplete = entry end
+			else
+				local growth = tonumber(entry.GrowthPercentage) or 0
+				if growth <= 1 then growth *= 100 end
+				if growth > bestIncompleteGrowth then
+					bestIncompleteGrowth = growth
+					bestIncomplete = entry
+				end
+			end
+		end
+	end
+
+	-- Para trocar só por causa de Grouping, prefere um slot adulto/100%.
+	-- Se não houver, usa o slot incompleto mais avançado que o jogador possui.
+	return bestComplete or bestIncomplete
+end
+
+function state.questGroup.findBestServerPack(handler, records, currentAnimal, allowAnimalSwitch)
+	if not handler or type(handler.GetData) ~= "function" then return nil end
+	local ok, packs = pcall(handler.GetData)
+	if not ok or type(packs) ~= "table" then return nil end
+
+	local best
+	for packId, candidate in pairs(packs) do
+		if type(candidate) == "table"
+			and type(candidate.AnimalName) == "string"
+			and candidate.AnimalName ~= ""
+			and candidate.Owner
+			and not state.questGroup.samePlayer(candidate.Owner, player)
+			and candidate.JoinRequirements == "AutoAccept" then
+
+			local sameSpecies = state.questGroup.sameAnimal(candidate.AnimalName, currentAnimal)
+			local ownedSlot = sameSpecies and true
+				or (allowAnimalSwitch and state.questGroup.findOwnedSlot(records, candidate.AnimalName))
+
+			if ownedSlot then
+				local count = state.questGroup.memberCount(candidate)
+				if not best
+					or count > best.count
+					or (count == best.count and sameSpecies and not best.sameSpecies) then
+
+					best = {
+						packId = packId,
+						pack = candidate,
+						count = count,
+						animalName = candidate.AnimalName,
+						sameSpecies = sameSpecies,
+						slot = sameSpecies and nil or ownedSlot,
+					}
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
+	local handler = state.questGroup.resolveHandler()
+	if not handler then
+		state.questGroup.statusText = "Grouping: PackHandlerClient not found"
+		return false
+	end
+
+	records = records or savedCharacters()
+	local animalName = state.questGroup.getPlayerAnimal(player)
+	if not animalName then
+		state.questGroup.statusText = "Grouping: waiting for animal"
+		return false
+	end
+
+	if state.questGroup.lastAnimal ~= animalName then
+		state.questGroup.lastAnimal = animalName
+		state.questGroup.lastActionAt = 0
+		state.questGroup.difficultySince = tick()
+	end
+
+	local pack = state.questGroup.getCurrentPack(handler)
+	if pack then
+		-- O servidor só aceita grupos da mesma espécie. Um pack diferente logo
+		-- após trocar de animal é tratado como cache antigo do cliente.
+		if not state.questGroup.sameAnimal(pack.AnimalName, animalName) then
+			state.questGroup.statusText = "Grouping: waiting for species pack update"
+			return false
+		end
+
+		if state.questGroup.hasOtherMember(pack) then
+			state.questGroup.difficultySince = nil
+			state.questGroup.pendingPackAnimal = nil
+			state.questGroup.statusText = string.format(
+				"Grouping active: %s (%d animals)",
+				animalName,
+				state.questGroup.memberCount(pack)
+			)
+			return true
+		end
+
+		if not state.questGroup.difficultySince then
+			state.questGroup.difficultySince = tick()
+		end
+
+		if state.questGroup.samePlayer(pack.Owner, player) then
+			if pack.JoinRequirements ~= "AutoAccept"
+				and type(handler.SetJoinRequirements) == "function"
+				and tick() - state.questGroup.lastActionAt >= 3 then
+
+				state.questGroup.lastActionAt = tick()
+				pcall(handler.SetJoinRequirements, "AutoAccept")
+			end
+
+			local invited = state.questGroup.inviteMatchingPlayers(handler, animalName)
+			state.questGroup.statusText = invited > 0
+				and ("Grouping: invited " .. animalName .. " players")
+				or ("Grouping: waiting for another " .. animalName)
+		end
+	else
+		if not state.questGroup.difficultySince then
+			state.questGroup.difficultySince = tick()
+		end
+	end
+
+	-- Primeiro dá uma chance para o grupo/espécie atual funcionar normalmente.
+	local difficultFor = tick() - (state.questGroup.difficultySince or tick())
+	local shouldAnalyze = difficultFor >= 20
+
+	if shouldAnalyze and tick() - (state.questGroup.lastServerAnalysisAt or 0) >= 5 then
+		state.questGroup.lastServerAnalysisAt = tick()
+
+		local best = state.questGroup.findBestServerPack(
+			handler,
+			records,
+			animalName,
+			allowAnimalSwitch == true
+		)
+
+		if best then
+			state.questGroup.statusText = string.format(
+				"Grouping: best server pack %s (%d animals)",
+				best.animalName,
+				best.count
+			)
+
+			-- Já existe um grupo melhor da espécie atual.
+			if best.sameSpecies then
+				if pack and state.questGroup.samePlayer(pack.Owner, player) then
+					if type(handler.Disband) == "function"
+						and tick() - state.questGroup.lastActionAt >= 4 then
+						state.questGroup.lastActionAt = tick()
+						pcall(handler.Disband)
+						state.questGroup.statusText = "Grouping: moving to bigger " .. animalName .. " pack"
+					end
+					return false
+				elseif not pack and type(handler.RequestJoin) == "function"
+					and tick() - state.questGroup.lastActionAt >= 4 then
+					state.questGroup.lastActionAt = tick()
+					pcall(handler.RequestJoin, best.packId)
+					state.questGroup.statusText = string.format(
+						"Grouping: joining %s pack (%d animals)",
+						animalName,
+						best.count
+					)
+					return false
+				end
+			end
+
+			-- Se nenhuma quest exige uma espécie específica, podemos trocar para
+			-- a espécie do maior grupo, mas SOMENTE se há um slot salvo dela.
+			if not best.sameSpecies and allowAnimalSwitch and best.slot then
+				if pack then
+					if tick() - state.questGroup.lastActionAt >= 4 then
+						state.questGroup.lastActionAt = tick()
+						if state.questGroup.samePlayer(pack.Owner, player)
+							and type(handler.Disband) == "function" then
+							pcall(handler.Disband)
+						elseif type(handler.Leave) == "function" then
+							pcall(handler.Leave)
+						end
+						state.questGroup.pendingPackAnimal = best.animalName
+						state.questGroup.statusText = "Grouping: leaving pack before species switch"
+					end
+					return false
+				end
+
+				if not questSwitchingAnimal
+					and not state.busy
+					and not criticalRecoveryActive
+					and tick() - questLastAnimalSwitch >= 20 then
+
+					questLastAnimalSwitch = tick()
+					questSwitchingAnimal = true
+					questTravelWanted = false
+					state.questTravelActive = false
+					state.questGroup.pendingPackAnimal = best.animalName
+					runtimeMessage = string.format(
+						"Grouping: switching to %s for bigger pack (%d)",
+						best.animalName,
+						best.count
+					)
+
+					task.spawn(function()
+						if ResetRemote then
+							pcall(ResetRemote.InvokeServer, ResetRemote)
+							task.wait(1.5)
+						end
+						spawnSlot(best.slot)
+						questSwitchingAnimal = false
+					end)
+
+					return false
+				end
+			end
+		end
+	end
+
+	-- Sem pack atual: primeiro tenta AutoAccept da espécie atual.
+	if not pack then
+		local ok, packs = pcall(handler.GetData)
+		if ok and type(packs) == "table" then
+			local preferredId
+			local preferredCount = -1
+
+			for packId, candidate in pairs(packs) do
+				if type(candidate) == "table"
+					and state.questGroup.sameAnimal(candidate.AnimalName, animalName)
+					and candidate.Owner
+					and not state.questGroup.samePlayer(candidate.Owner, player)
+					and candidate.JoinRequirements == "AutoAccept" then
+
+					local count = state.questGroup.memberCount(candidate)
+					if count > preferredCount then
+						preferredCount = count
+						preferredId = packId
+					end
+				end
+			end
+
+			if preferredId ~= nil and type(handler.RequestJoin) == "function" then
+				if tick() - state.questGroup.lastActionAt >= 5 then
+					state.questGroup.lastActionAt = tick()
+					pcall(handler.RequestJoin, preferredId)
+				end
+				state.questGroup.statusText = string.format(
+					"Grouping: joining biggest %s pack (%d animals)",
+					animalName,
+					math.max(preferredCount, 1)
+				)
+				return false
+			end
+		end
+
+		-- Nenhum grupo compatível: cria um AutoAccept da espécie atual.
+		if type(handler.CreateGroup) == "function"
+			and tick() - state.questGroup.lastActionAt >= 8 then
+
+			state.questGroup.lastActionAt = tick()
+			local groupName = "MMB" .. tostring(player.UserId % 100000) .. tostring(math.random(10, 99))
+			pcall(handler.CreateGroup, groupName)
+			state.questGroup.statusText = "Grouping: creating " .. animalName .. " pack"
+		else
+			state.questGroup.statusText = "Grouping: waiting for " .. animalName .. " pack"
+		end
+	end
+
+	return false
+end
+
+local function recursiveStringMatch(value, lookup, seen)
+	local valueType = type(value)
+	if valueType == "string" then
+		return lookup[value:lower()]
+	end
+	if valueType ~= "table" then return nil end
+	seen = seen or {}
+	if seen[value] then return nil end
+	seen[value] = true
+	for key, child in pairs(value) do
+		local result = recursiveStringMatch(child, lookup, seen)
+		if result then return result end
+		if type(key) == "string" then
+			result = lookup[key:lower()]
+			if result then return result end
+		end
+	end
+end
+
+local zoneLookup = {}
+local function refreshZoneLookup()
+	for zoneName in pairs(QUEST_ZONES) do
+		zoneLookup[zoneName:lower()] = zoneName
+	end
+	zoneLookup["pride rock"] = "Pride Rock"
+	local mapZones = workspace:FindFirstChild("MapZones")
+	if mapZones then
+		for _, zoneObject in ipairs(mapZones:GetChildren()) do
+			zoneLookup[zoneObject.Name:lower()] = zoneObject.Name
+		end
+	end
+end
+refreshZoneLookup()
+
+local function findZoneInQuest(quest)
+	refreshZoneLookup()
+
+	local entry = quest and quest.entry or quest
+	local zone = recursiveStringMatch(entry, zoneLookup)
+	if zone then return zone end
+
+	-- Fallback da HUD: só aceita uma zona encontrada no frame que também
+	-- contém o título da própria missão. Isso evita pegar a zona de outra quest.
+	local gui = player:FindFirstChild("PlayerGui")
+	local questsGui = gui and gui:FindFirstChild("QuestsScreenGui")
+	local title = quest and quest.props and quest.props.Title
+	local wantedTitle = type(title) == "string" and title:lower() or nil
+	if questsGui and wantedTitle then
+		local scrolling = questsGui:FindFirstChild("RefScrollingFrame", true)
+		if scrolling then
+			for _, frame in ipairs(scrolling:GetChildren()) do
+				if frame:IsA("GuiObject") and frame.Name:match("^QuestFrame%d+$") then
+					local pieces = {}
+					for _, object in ipairs(frame:GetDescendants()) do
+						if object:IsA("TextLabel") or object:IsA("TextButton") then
+							table.insert(pieces, tostring(object.Text))
+						end
+					end
+					local combined = table.concat(pieces, " "):lower()
+					if combined:find(wantedTitle, 1, true) then
+						for key, canonical in pairs(zoneLookup) do
+							if combined:find(key, 1, true) then
+								return canonical
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function getPlayerZoneName()
+	local zone = player:GetAttribute("ZoneName")
+	if type(zone) == "string" and zone ~= "" then return zone end
+	local value = player:FindFirstChild("ZoneName")
+	if value and value:IsA("StringValue") and value.Value ~= "" then return value.Value end
+
+	local character = workspace:FindFirstChild(player.Name)
+	if character then
+		zone = character:GetAttribute("ZoneName")
+		if type(zone) == "string" and zone ~= "" then return zone end
+		value = character:FindFirstChild("ZoneName")
+		if value and value:IsA("StringValue") and value.Value ~= "" then return value.Value end
+	end
+end
+
+local function getZonePosition(zoneName)
+	if QUEST_ZONES[zoneName] then return QUEST_ZONES[zoneName] end
+
+	if zoneName == "Pride Rock" then
+		local spawns = workspace:FindFirstChild("Spawns")
+		local pride = spawns and spawns:FindFirstChild("PrideRockSpawn1", true)
+		if pride and pride:IsA("BasePart") then return pride.Position end
+	end
+
+	local mapZones = workspace:FindFirstChild("MapZones")
+	local zoneModel = mapZones and mapZones:FindFirstChild(zoneName)
+	if not zoneModel then return nil end
+
+	local bestPart, bestVolume
+	for _, object in ipairs(zoneModel:GetDescendants()) do
+		if object:IsA("BasePart") then
+			local volume = object.Size.X * object.Size.Y * object.Size.Z
+			if not bestVolume or volume > bestVolume then
+				bestPart, bestVolume = object, volume
+			end
+		end
+	end
+	return bestPart and bestPart.Position or nil
+end
+
+local function isSwimQuest(props)
+	if not props or props.QuestType ~= "TravelDistance" then return false end
+	local allowed = props.QuestData and props.QuestData.AllowedMovementStates
+	if type(allowed) ~= "table" or #allowed == 0 then return false end
+
+	local hasSwimming = false
+	for _, movementState in ipairs(allowed) do
+		if movementState == "Swimming" then
+			hasSwimming = true
+		else
+			return false
+		end
+	end
+	return hasSwimming
+end
+
+local function isLandDistanceQuest(props)
+	if not props or props.QuestType ~= "TravelDistance" then return false end
+	local allowed = props.QuestData and props.QuestData.AllowedMovementStates
+	if type(allowed) ~= "table" or #allowed == 0 then return false end
+
+	local hasLandState = false
+	for _, movementState in ipairs(allowed) do
+		if movementState == "Swimming" then
+			return false
+		end
+		if movementState == "Walking"
+			or movementState == "Trotting"
+			or movementState == "Running"
+			or movementState == "Sprinting" then
+			hasLandState = true
+		end
+	end
+	return hasLandState
+end
+
+function state.questSetW(active, forceReassert)
+	if not active then
+		if state.questLandKeyDown then
+			pcall(function()
+				local env = (getgenv and getgenv()) or _G
+				local release = env and env.keyrelease
+				if type(release) == "function" then
+					release(0x57) -- W
+				end
+			end)
+
+			pcall(function()
+				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.W, false, game)
+			end)
+		end
+
+		state.questLandKeyDown = false
+		state.questLandLastPulseAt = 0
+		state.questLandLastRefreshAt = 0
+		return
+	end
+
+	-- Normal path: W was already held by us, so do nothing.
+	-- forceReassert is used only after real player input. A physical KeyUp can
+	-- cancel an executor-generated KeyDown even though our boolean is still true.
+	if state.questLandKeyDown and not forceReassert then
+		return
+	end
+
+	local pressed = false
+
+	-- Prefer the executor keyboard API: this is a genuine KeyDown that remains
+	-- held until keyrelease(). Calling it again after user input simply restores
+	-- the held state; it does not spam while the player is idle.
+	pcall(function()
+		local env = (getgenv and getgenv()) or _G
+		local press = env and env.keypress
+		if type(press) == "function" then
+			press(0x57) -- W
+			pressed = true
+		end
+	end)
+
+	if not pressed then
+		pcall(function()
+			VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.W, false, game)
+			pressed = true
+		end)
+	end
+
+	state.questLandKeyDown = pressed or state.questLandKeyDown
+end
+
+local function isTravelQuestForAutoRun(props)
+	if not props or props.QuestType ~= "TravelDistance" then return false end
+	local allowed = props.QuestData and props.QuestData.AllowedMovementStates
+	if type(allowed) ~= "table" or #allowed == 0 then return true end
+	for _, movementState in ipairs(allowed) do
+		if movementState ~= "Swimming" then return true end
+	end
+	return false
+end
+
+local function findSpecificAnimalTarget(quest, records)
+	local data = quest.props and quest.props.QuestData
+	if not data or not data.ShouldBeSpawnedAsSpecificAnimalName then return nil end
+
+	local lookup = {}
+
+	-- Existing slots are the most reliable spelling/casing source.
+	for _, entry in ipairs(records or {}) do
+		if type(entry.AnimalName) == "string" and entry.AnimalName ~= "" then
+			lookup[entry.AnimalName:lower()] = entry.AnimalName
+		end
+	end
+
+	-- AnimalConfig[AnimalType][AnimalName] lets us recognize a quest target
+	-- even if this account currently has no SavedCharacter for that species.
+	if type(AnimalConfig) == "table" then
+		for _, animalTypeBucket in pairs(AnimalConfig) do
+			if type(animalTypeBucket) == "table" then
+				for animalName, configData in pairs(animalTypeBucket) do
+					if type(animalName) == "string"
+						and animalName ~= ""
+						and type(configData) == "table" then
+						lookup[animalName:lower()] = animalName
+					end
+				end
+			end
+		end
+	end
+
+	local target = recursiveStringMatch(quest.entry, lookup)
+	if target then return target end
+
+	-- Fallback da HUD para quests cujo animal escolhido só aparece no texto.
+	local gui = player:FindFirstChild("PlayerGui")
+	local questsGui = gui and gui:FindFirstChild("QuestsScreenGui")
+	local scrolling = questsGui and questsGui:FindFirstChild("RefScrollingFrame", true)
+	local title = quest.props and quest.props.Title
+	local wantedTitle = type(title) == "string" and title:lower() or nil
+
+	if scrolling and wantedTitle then
+		for _, frame in ipairs(scrolling:GetChildren()) do
+			if frame:IsA("GuiObject") and frame.Name:match("^QuestFrame%d+$") then
+				local pieces = {}
+				for _, object in ipairs(frame:GetDescendants()) do
+					if object:IsA("TextLabel") or object:IsA("TextButton") then
+						table.insert(pieces, tostring(object.Text))
+					end
+				end
+
+				local combined = table.concat(pieces, " "):lower()
+				if combined:find(wantedTitle, 1, true) then
+					for lowerName, canonical in pairs(lookup) do
+						if combined:find(lowerName, 1, true) then
+							return canonical
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+
+function state.questSlots.findAnimalSlot(records, animalName)
+	if type(animalName) ~= "string" then return nil end
+	for _, entry in ipairs(records or {}) do
+		if type(entry) == "table"
+			and type(entry.AnimalName) == "string"
+			and entry.AnimalName:lower() == animalName:lower() then
+			return entry
+		end
+	end
+end
+
+function state.questSlots.findExactSlot(records, characterName, animalName)
+	if type(characterName) ~= "string" then return nil end
+	for _, entry in ipairs(records or {}) do
+		if type(entry) == "table"
+			and entry.CharacterName == characterName
+			and (not animalName
+				or (type(entry.AnimalName) == "string"
+					and entry.AnimalName:lower() == animalName:lower())) then
+			return entry
+		end
+	end
+end
+
+function state.questSlots.generateQuestName(records)
+	local used = {}
+	for _, entry in ipairs(records or {}) do
+		if type(entry.CharacterName) == "string" then
+			used[entry.CharacterName:lower()] = true
+		end
+	end
+
+	-- Apenas letras para evitar qualquer validação de nome que rejeite números.
+	local alphabet = "abcdefghijklmnopqrstuvwxyz"
+	for attempt = 1, 40 do
+		local seed = player.UserId + math.floor(tick() * 10) + attempt * 7919
+		local chars = { "Q" }
+		for index = 1, 7 do
+			local position = ((seed + index * 3571) % #alphabet) + 1
+			chars[#chars + 1] = alphabet:sub(position, position)
+			seed = math.floor(seed / 3) + position * 97
+		end
+		local candidate = table.concat(chars)
+		if not used[candidate:lower()] then return candidate end
+	end
+end
+
+function state.questSlots.deleteTempForNext(nextAnimal)
+	local temp = state.questSlots.temp
+	if not temp or state.questSlots.busy then return false end
+	if type(nextAnimal) == "string"
+		and type(temp.animalName) == "string"
+		and temp.animalName:lower() == nextAnimal:lower() then
+		return false
+	end
+
+	local records = savedCharacters()
+	local exact = state.questSlots.findExactSlot(records, temp.characterName, temp.animalName)
+	if not exact then
+		-- Só apagamos slots que ESTA execução criou e confirmou. Se ele já não
+		-- existe, limpamos o marcador sem tocar em nenhum outro slot do usuário.
+		state.questSlots.temp = nil
+		return false
+	end
+
+	local deleteRemote = ReplicatedStorage:FindFirstChild("DeleteCharacterRemoteFunction")
+		or ReplicatedStorage:WaitForChild("DeleteCharacterRemoteFunction", 5)
+	if not deleteRemote then
+		state.questSlots.statusText = "Quest slot: DeleteCharacterRemoteFunction not found"
+		questStatusText = "Cannot replace temporary quest slot"
+		return true
+	end
+
+	state.questSlots.busy = true
+	questSwitchingAnimal = true
+	questTravelWanted = false
+	state.questTravelActive = false
+
+	task.spawn(function()
+		runtimeMessage = "Quest slot: removing temporary " .. tostring(temp.animalName)
+
+		local current = player.Character
+		local currentName = current and current:GetAttribute("CharacterName")
+		if currentName == temp.characterName and ResetRemote then
+			pcall(ResetRemote.InvokeServer, ResetRemote)
+			task.wait(1.5)
+		end
+
+		local ok = pcall(deleteRemote.InvokeServer, deleteRemote, temp.characterName)
+		if ok then
+			local deadline = tick() + 7
+			local removed = false
+			repeat
+				task.wait(0.35)
+				local refreshed = savedCharacters()
+				removed = state.questSlots.findExactSlot(
+					refreshed,
+					temp.characterName,
+					temp.animalName
+				) == nil
+			until removed or tick() >= deadline
+
+			if removed then
+				state.questSlots.temp = nil
+				runtimeMessage = "Quest slot removed; preparing " .. tostring(nextAnimal)
+			else
+				runtimeMessage = "Quest slot deletion was not confirmed; keeping it"
+				questStatusText = "Temporary slot deletion not confirmed"
+			end
+		else
+			runtimeMessage = "Quest slot delete remote failed; keeping slot"
+			questStatusText = "Temporary slot deletion failed"
+		end
+
+		state.questSlots.busy = false
+		questSwitchingAnimal = false
+	end)
+
+	return true
+end
+
+function state.questSlots.createForQuest(quest, targetAnimal, records)
+	if state.questSlots.busy or questSwitchingAnimal or state.busy or criticalRecoveryActive then
+		return true
+	end
+	if not CreateRemote or type(targetAnimal) ~= "string" or targetAnimal == "" then
+		return false
+	end
+
+	records = records or savedCharacters()
+
+	-- Never create a duplicate if replication changed since the previous scan.
+	local existing = state.questSlots.findAnimalSlot(records, targetAnimal)
+	if existing then return false end
+
+	if #records >= (state.questSlots.maxSlots or 40) then
+		questStatusText = "Specific animal needed, but all 40 slots are occupied: " .. targetAnimal
+		runtimeMessage = "Quest slot: no free slot for " .. targetAnimal
+		return false
+	end
+
+	local failedUntil = state.questSlots.failedUntil[targetAnimal:lower()] or 0
+	if tick() < failedUntil then
+		questStatusText = "Waiting before retrying quest slot: " .. targetAnimal
+		return true
+	end
+
+	local characterName = state.questSlots.generateQuestName(records)
+	if not characterName then
+		questStatusText = "Could not generate a safe quest slot name"
+		return false
+	end
+
+	state.questSlots.busy = true
+	questSwitchingAnimal = true
+	questTravelWanted = false
+	state.questTravelActive = false
+
+	task.spawn(function()
+		-- Move away from water/void first, then reset. The Create remote itself
+		-- is the server-authoritative ownership validation: after invoking it,
+		-- we ONLY trust success if SavedCharacters actually contains exactly
+		-- the new CharacterName + requested AnimalName.
+		runtimeMessage = "Quest slot: validating/creating " .. targetAnimal
+		pcall(function()
+			ragdollTeleport(getSafeFarmPosition(), 5)
+		end)
+		task.wait(0.5)
+
+		if ResetRemote then
+			pcall(ResetRemote.InvokeServer, ResetRemote)
+			task.wait(1.5)
+		end
+
+		local refreshedBefore = savedCharacters()
+		local appearedExisting = state.questSlots.findAnimalSlot(refreshedBefore, targetAnimal)
+		if appearedExisting then
+			spawnSlot(appearedExisting)
+			state.questSlots.busy = false
+			questSwitchingAnimal = false
+			return
+		end
+
+		if #refreshedBefore >= (state.questSlots.maxSlots or 40) then
+			questStatusText = "No free slot after final verification: " .. targetAnimal
+			runtimeMessage = "Quest slot creation cancelled: 40/40"
+			state.questSlots.busy = false
+			questSwitchingAnimal = false
+			return
+		end
+
+		local gender = state.newSlotGender or "Male"
+		local invokeOk = pcall(
+			CreateRemote.InvokeServer,
+			CreateRemote,
+			characterName,
+			targetAnimal,
+			gender,
+			"Default"
+		)
+
+		local created
+		if invokeOk then
+			local deadline = tick() + 8
+			repeat
+				task.wait(0.4)
+				local refreshed = savedCharacters()
+				created = state.questSlots.findExactSlot(
+					refreshed,
+					characterName,
+					targetAnimal
+				)
+			until created or tick() >= deadline
+		end
+
+		if created then
+			state.questSlots.temp = {
+				characterName = characterName,
+				animalName = targetAnimal,
+				questId = quest and quest.id or nil,
+			}
+			runtimeMessage = "Quest-only slot confirmed: " .. targetAnimal
+			questStatusText = "Created quest slot: " .. targetAnimal
+			spawnSlot(created)
+		else
+			-- If the account does not own the animal, the server should reject
+			-- the Create call. We never mark a temp slot without replication proof.
+			state.questSlots.failedUntil[targetAnimal:lower()] = tick() + 60
+			runtimeMessage = "Quest slot not created/owned or server rejected: " .. targetAnimal
+			questStatusText = "Could not verify/create owned animal slot: " .. targetAnimal
+		end
+
+		state.questSlots.busy = false
+		questSwitchingAnimal = false
+	end)
+
+	return true
+end
+
+local function trySwitchToQuestAnimal(quest, records, resolvedTarget)
+	if tick() - questLastAnimalSwitch < 20 or questSwitchingAnimal or state.busy or criticalRecoveryActive then return false end
+	local targetAnimal = resolvedTarget or findSpecificAnimalTarget(quest, records)
+	if not targetAnimal then return false end
+
+	local character = player.Character
+	local currentAnimal = character and character:GetAttribute("AnimalName")
+	if type(currentAnimal) == "string" and currentAnimal:lower() == targetAnimal:lower() then return false end
+
+	local targetSlot
+	for _, entry in ipairs(records) do
+		if type(entry.AnimalName) == "string" and entry.AnimalName:lower() == targetAnimal:lower() then
+			targetSlot = entry
+			break
+		end
+	end
+	if not targetSlot then
+		questStatusText = "Specific animal needed: " .. targetAnimal
+		return false
+	end
+
+	questLastAnimalSwitch = tick()
+	questSwitchingAnimal = true
+	questTravelWanted = false
+	state.questTravelActive = false
+	runtimeMessage = "Quest: switching to " .. targetAnimal
+	task.spawn(function()
+		if ResetRemote then
+			pcall(ResetRemote.InvokeServer, ResetRemote)
+			task.wait(1.5)
+		end
+		spawnSlot(targetSlot)
+		questSwitchingAnimal = false
+	end)
+	return true
+end
+
+local function trySwitchToGrowingSlot(quests, records)
+	local hasGrowthQuest = false
+	for _, quest in ipairs(quests) do
+		if quest.props and quest.props.QuestType == "GrowTime" then
+			hasGrowthQuest = true
+			break
+		end
+	end
+	if not hasGrowthQuest or questSwitchingAnimal or state.busy or criticalRecoveryActive then return false end
+
+	local character = player.Character
+	local currentGrowth = character and character:GetAttribute("GrowthPercentage")
+	if currentGrowth ~= nil and not isGrowthComplete(currentGrowth) then return false end
+	if tick() - questLastAnimalSwitch < 20 then return false end
+
+	local currentName = character and character:GetAttribute("CharacterName")
+	local targetSlot
+	for _, entry in ipairs(records) do
+		if entry.CharacterName ~= currentName and not isGrowthComplete(entry.GrowthPercentage) then
+			targetSlot = entry
+			break
+		end
+	end
+	if not targetSlot then return false end
+
+	questLastAnimalSwitch = tick()
+	questSwitchingAnimal = true
+	questTravelWanted = false
+	state.questTravelActive = false
+	runtimeMessage = "Quest: switching to a growing slot"
+	task.spawn(function()
+		if ResetRemote then
+			pcall(ResetRemote.InvokeServer, ResetRemote)
+			task.wait(1.5)
+		end
+		spawnSlot(targetSlot)
+		questSwitchingAnimal = false
+	end)
+	return true
+end
+
+local function claimQuestRewards(quests)
+	if not ClaimQuestRemote then return end
+	for _, quest in ipairs(quests) do
+		local ok, claimed = pcall(
+			ClaimQuestRemote.InvokeServer,
+			ClaimQuestRemote,
+			quest.category,
+			quest.entry.QuestUniqueKey
+		)
+		if ok and claimed then
+			questSessionClaimed[quest.id] = true
+			questStatusText = "Claimed: " .. tostring(quest.props.Title or quest.entry.QuestUniqueKey)
+			runtimeMessage = "Quest reward claimed"
+			task.wait(0.2)
+		end
+	end
+end
+
+local function updateQuestAutomation()
+	if not state.autoQuests then
+		questTargetZoneName = nil
+		questTravelWanted = false
+		state.questTravelActive = false
+		state.questLandInputActive = false
+		state.questSetW(false)
+		state.questSwimActive = false
+		state.questSwimReady = false
+		state.questCarnivoreFeeding = false
+		state.questGroup.statusText = ""
+		state.questMoveSubState = "Running"
+		if not state.autoClaimQuests then questStatusText = "Ready" end
+		return
+	end
+
+	if not criticalRecoveryActive and not questSwitchingAnimal then
+		state.autoEat, state.autoDrink = true, true
+		if renders then
+			if renders.autoEat then renders.autoEat() end
+			if renders.autoDrink then renders.autoDrink() end
+		end
+	end
+
+	local quests = getAllQuests()
+
+	-- Evita interpretar um atraso de replicação como "acabaram as quests".
+	-- Com lista vazia, exige 3 leituras consecutivas (15s). Se alguma quest
+	-- apareceu nesta sessão, zeramos o contador sempre que os dados voltam.
+	if #quests > 0 then
+		state.questSeenAny = true
+		state.questEmptyScans = 0
+	else
+		state.questEmptyScans = (state.questEmptyScans or 0) + 1
+		if state.questEmptyScans < 3 then
+			questTargetZoneName = nil
+			questTravelWanted = false
+			state.questTravelActive = false
+			state.questLandInputActive = false
+			state.questSetW(false)
+			state.questSwimActive = false
+			state.questSwimReady = false
+			questStatusText = string.format(
+				"Waiting for quest data (%d/3)",
+				state.questEmptyScans
+			)
+			return
+		end
+	end
+
+	-- Quando todas as Daily/Weekly atuais estiverem concluídas, encerra o
+	-- controlador de quests e passa automaticamente para:
+	-- 1) crescer TODOS os slots existentes abaixo de 100%;
+	-- 2) quando não restar nenhum, AFK Coin Farm.
+	local incompleteQuestCount = 0
+	state.questTravelActive = false
+	for _, quest in ipairs(quests) do
+		if not state.questGroup.questComplete(quest) then
+			incompleteQuestCount += 1
+			if isTravelQuestForAutoRun(quest.props) then
+				state.questTravelActive = true
+			end
+		end
+	end
+
+	if #quests == 0 or incompleteQuestCount == 0 then
+		questTargetZoneName = nil
+		questTravelWanted = false
+		state.questTravelActive = false
+		state.questLandInputActive = false
+		state.questSetW(false)
+		state.questSwimActive = false
+		state.questSwimReady = false
+		state.questCarnivoreFeeding = false
+		state.questGroup.statusText = ""
+
+		local records = savedCharacters()
+		local hasIncompleteSlot = false
+		for _, entry in ipairs(records) do
+			if type(entry) == "table" and not isGrowthComplete(entry.GrowthPercentage) then
+				hasIncompleteSlot = true
+				break
+			end
+		end
+
+		state.autoQuests = false
+		state.growNew = false
+
+		if hasIncompleteSlot then
+			state.questPostGrowAll = true
+			state.growExisting = true
+			state.farmCoins = false
+			questStatusText = "All quests done -> growing incomplete slots"
+			runtimeMessage = "Quests complete: growing all existing slots"
+		else
+			state.questPostGrowAll = false
+			state.growExisting = false
+			state.farmCoins = true
+			questStatusText = "All quests + slots complete -> AFK Coin Farm"
+			runtimeMessage = "All quests/slots complete: AFK coin farming"
+		end
+
+		state.autoEat, state.autoDrink = true, true
+		if renders then
+			for _, key in ipairs({
+				"autoQuests", "growExisting", "growNew",
+				"farmCoins", "autoEat", "autoDrink"
+			}) do
+				if renders[key] then renders[key]() end
+			end
+		end
+		return
+	end
+
+
+	-- ========================================================
+	-- Swim quests
+	-- ========================================================
+	-- Pure Swimming TravelDistance quests are intentionally handled before
+	-- Zone/Grouping/Growth because they complete quickly and require a very
+	-- specific movement state. Generic Survive/PlayTime quests continue to
+	-- progress naturally while this happens.
+	local incompleteSwimCount = 0
+	local firstSwimTitle
+
+	for _, quest in ipairs(quests) do
+		if isSwimQuest(quest.props) and not state.questGroup.questComplete(quest) then
+			incompleteSwimCount += 1
+			firstSwimTitle = firstSwimTitle or quest.props.Title
+		end
+	end
+
+	if incompleteSwimCount > 0 then
+		state.questSwimActive = true
+		state.questTravelActive = false
+		state.questLandInputActive = false
+		state.questSetW(false)
+		questTravelWanted = false
+		questTargetZoneName = nil
+		state.questMoveSubState = "Swimming"
+
+		-- Never eat during Swim. Clear any food routine that may have started
+		-- before the quest scanner noticed the new Swim quest.
+		state.autoEat = false
+		state.autoDrink = true
+		eatingToFull = false
+		eatingSourcePosition = nil
+		eatingTargetReachedAt = nil
+		activeCarcass = nil
+		eatingStuckSince = nil
+		resetEatingSearch(nil)
+
+		-- Standard Auto Drink cannot run during Swim because it zeroes velocity
+		-- and teleports to land after filling. autoDrinkStep has a dedicated
+		-- non-blocking Swim branch instead.
+		drinkingToFull = false
+		drinkingSourcePosition = nil
+		drinkingStuckSince = nil
+		removeSwimBarrier()
+
+		if renders then
+			if renders.autoEat then renders.autoEat() end
+			if renders.autoDrink then renders.autoDrink() end
+		end
+
+		-- Never fight an already-running recovery/slot/teleport routine.
+		if questSwitchingAnimal or state.busy or criticalRecoveryActive
+			or DAMAGE.active or forcingPostDrinkTeleport then
+			state.questSwimReady = false
+			questStatusText = "Swim: waiting for current recovery/teleport"
+			return
+		end
+
+		local swimCharacter, swimRoot = characterParts()
+		if not swimCharacter or not swimRoot then
+			state.questSwimReady = false
+			questStatusText = "Swim: waiting for character"
+			return
+		end
+
+		local target = state.questSwimPosition
+		local inWater = isValidSwimQuestWater(swimRoot)
+		local tooFar = (swimRoot.Position - target).Magnitude > 85
+
+		if not inWater or tooFar then
+			state.questSwimReady = false
+			questStatusText = "Swim: teleporting to water"
+			runtimeMessage = "Swim quest: moving to swim area"
+
+			local teleported = ragdollTeleport(target, 6)
+			task.wait(0.45)
+
+			local _, landedRoot, landedHumanoid = characterParts()
+			if landedHumanoid then
+				pcall(landedHumanoid.ChangeState, landedHumanoid, Enum.HumanoidStateType.Swimming)
+			end
+			setSubState("Swimming")
+			task.wait(0.25)
+
+			if teleported and landedRoot and isValidSwimQuestWater(landedRoot) then
+				state.questSwimReady = true
+				state.questSwimLastWaterCheck = tick()
+				setSubState("Swimming")
+				questStatusText = string.format(
+					"%s: swimming (%d active)",
+					tostring(firstSwimTitle or "Swim"),
+					incompleteSwimCount
+				)
+			else
+				state.questSwimReady = false
+				questStatusText = "Swim: water verification failed; retrying"
+				runtimeMessage = "Swim quest: target did not verify as water"
+			end
+			return
+		end
+
+		state.questSwimReady = true
+		state.questSwimLastWaterCheck = tick()
+		setSubState("Swimming")
+		questStatusText = string.format(
+			"%s: swimming (%d active)",
+			tostring(firstSwimTitle or "Swim"),
+			incompleteSwimCount
+		)
+		return
+	elseif state.questSwimActive then
+		-- A scan confirmed every Swim quest at 100%. Stop the movement mode
+		-- immediately and restore normal survival automation. We do NOT
+		-- teleport back to the swim position again.
+		state.questSwimActive = false
+		state.questSwimReady = false
+		state.questMoveSubState = "Running"
+		questTravelWanted = false
+		state.questTravelActive = false
+
+		local _, swimRoot = characterParts()
+		if swimRoot then
+			local velocity = swimRoot.AssemblyLinearVelocity
+			swimRoot.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+		end
+
+		drinkingToFull = false
+		drinkingSourcePosition = nil
+		drinkingStuckSince = nil
+		lastDrinkWatchdogWater = nil
+		removeSwimBarrier()
+		blockClientSubState = false
+
+		state.autoEat, state.autoDrink = true, true
+		if renders then
+			if renders.autoEat then renders.autoEat() end
+			if renders.autoDrink then renders.autoDrink() end
+		end
+
+		runtimeMessage = "Swim quests complete; resuming normal quests"
+	end
+
+	-- Comer/beber tem prioridade absoluta. Sem isso o scanner de zona podia
+	-- teleportar o jogador no meio da água ou enquanto ele tentava comer.
+	local character = player.Character
+	local food = character and (character:GetAttribute("Food") or 100) or 100
+	local water = character and (character:GetAttribute("Water") or 100) or 100
+	local carnivore = character and isCarnivoreCharacter(character)
+
+	if state.autoQuests and carnivore and food <= 70 and not preSwitchFoodTarget then
+		state.questCarnivoreFeeding = true
+		eatingToFull = true
+	end
+
+	if state.questCarnivoreFeeding or drinkingToFull or eatingToFull or carcassEatBusy or CROC.approachBusy
+		or forcingPostDrinkTeleport or water <= 75 or (not carnivore and food <= 68) then
+		questStatusText = state.questCarnivoreFeeding
+			and string.format("Paused: carnivore eating to 100%% (%d%%)", math.floor(food))
+			or drinkingToFull and "Paused: drinking"
+			or eatingToFull and "Paused: eating"
+			or water <= 75 and "Paused: water low"
+			or (not carnivore and food <= 68) and "Paused: food low"
+			or "Paused: survival routine"
+		return
+	end
+
+	local records = savedCharacters()
+	local specificAnimalFocus = false
+	local focusQuest
+	local focusAnimal
+
+	for _, quest in ipairs(quests) do
+		if not state.questGroup.questComplete(quest) then
+			local targetAnimal = findSpecificAnimalTarget(quest, records)
+			if targetAnimal then
+				specificAnimalFocus = true
+				focusQuest = quest
+				focusAnimal = targetAnimal
+				break
+			end
+		end
+	end
+
+	if focusQuest and focusAnimal then
+		local character = player.Character
+		local currentAnimal = character and character:GetAttribute("AnimalName")
+		local targetSlot = state.questSlots.findAnimalSlot(records, focusAnimal)
+
+		if targetSlot then
+			if trySwitchToQuestAnimal(focusQuest, records, focusAnimal) then
+				questStatusText = "Changing animal for " .. tostring(focusQuest.props.Title)
+				return
+			end
+		elseif type(currentAnimal) == "string"
+			and currentAnimal:lower() == focusAnimal:lower() then
+			-- Already spawned as the requested species; no reason to create a slot.
+		else
+			-- If a previous quest-only slot exists for another species, remove ONLY
+			-- that confirmed temp slot before creating the next one, even if there
+			-- are still spare slots. This prevents accumulating quest-only slots.
+			if state.questSlots.temp
+				and type(state.questSlots.temp.animalName) == "string"
+				and state.questSlots.temp.animalName:lower() ~= focusAnimal:lower() then
+
+				if state.questSlots.deleteTempForNext(focusAnimal) then
+					questStatusText = "Replacing previous quest-only slot -> " .. focusAnimal
+					return
+				end
+			end
+
+			-- Re-read after any possible cleanup before the final create validation.
+			records = savedCharacters()
+			targetSlot = state.questSlots.findAnimalSlot(records, focusAnimal)
+			if not targetSlot then
+				if state.questSlots.createForQuest(focusQuest, focusAnimal, records) then
+					questStatusText = "Preparing quest-only slot: " .. focusAnimal
+					return
+				end
+			end
+		end
+	end
+
+	if not specificAnimalFocus and trySwitchToGrowingSlot(quests, records) then
+		questStatusText = "Changing to a growing slot"
+		return
+	end
+
+	-- Grouping roda em paralelo com Zone/Travel. A cada verificação confirma
+	-- que o pack pertence ao animal atual; se o jogador trocar de animal,
+	-- sai/desfaz o pack incompatível e procura/cria outro correto.
+	local groupingQuestActive = false
+	for _, quest in ipairs(quests) do
+		if quest.props.QuestType == "GroupTime" and not state.questGroup.questComplete(quest) then
+			groupingQuestActive = true
+			state.questGroup.ensureForCurrentAnimal(records, not specificAnimalFocus)
+			break
+		end
+	end
+
+	-- Running conta para Travel e também para Land Distance.
+	-- Mantém um substate válido para que as Weekly com AllowedMovementStates
+	-- não fiquem paradas enquanto a Daily genérica progride.
+	questTravelWanted = false
+	state.questLandInputActive = false
+	state.questMoveSubState = "Running"
+	local incompleteTravelCount = 0
+
+	for _, quest in ipairs(quests) do
+		if isTravelQuestForAutoRun(quest.props)
+			and not state.questGroup.questComplete(quest) then
+
+			incompleteTravelCount += 1
+			questTravelWanted = true
+
+			if isLandDistanceQuest(quest.props) then
+				state.questLandInputActive = true
+			end
+
+			local allowed = quest.props.QuestData and quest.props.QuestData.AllowedMovementStates
+			if type(allowed) == "table" then
+				local hasRunning = false
+				local hasSprinting = false
+
+				for _, movementState in ipairs(allowed) do
+					if movementState == "Running" then hasRunning = true end
+					if movementState == "Sprinting" then hasSprinting = true end
+				end
+
+				if hasRunning then
+					state.questMoveSubState = "Running"
+				elseif hasSprinting then
+					state.questMoveSubState = "Sprinting"
+				end
+			end
+		end
+	end
+	state.questTravelActive = questTravelWanted
+	if not state.questLandInputActive then
+		state.questSetW(false)
+	end
+
+	-- Escolhe a missão de zona com maior progresso detectável.
+	-- Se o runtime não expuser um campo de progresso, mantém a ordem normal.
+	local function progressRatio(quest)
+		local maxProgress
+		if quest.props and type(quest.props.GetMaxProgress) == "function" then
+			local ok, value = pcall(quest.props.GetMaxProgress, quest.props)
+			if ok and type(value) == "number" and value > 0 then maxProgress = value end
+		end
+		if not maxProgress then return 0 end
+
+		local function scan(value, seen)
+			if type(value) ~= "table" then return nil end
+			seen = seen or {}
+			if seen[value] then return nil end
+			seen[value] = true
+
+			local best
+			for key, child in pairs(value) do
+				if type(child) == "number" and type(key) == "string"
+					and key:lower():find("progress", 1, true) then
+					best = math.max(best or 0, child)
+				elseif type(child) == "table" then
+					local nested = scan(child, seen)
+					if nested then best = math.max(best or 0, nested) end
+				end
+			end
+			return best
+		end
+
+		local current = scan(quest.entry)
+		if type(current) == "number" then
+			return math.clamp(current / maxProgress, 0, 1)
+		end
+
+		local gui = player:FindFirstChild("PlayerGui")
+		local questsGui = gui and gui:FindFirstChild("QuestsScreenGui")
+		local scrolling = questsGui and questsGui:FindFirstChild("RefScrollingFrame", true)
+		local title = quest.props and quest.props.Title
+		local wantedTitle = type(title) == "string" and title:lower() or nil
+		if scrolling and wantedTitle then
+			for _, frame in ipairs(scrolling:GetChildren()) do
+				if frame:IsA("GuiObject") and frame.Name:match("^QuestFrame%d+$") then
+					local pieces = {}
+					for _, object in ipairs(frame:GetDescendants()) do
+						if object:IsA("TextLabel") or object:IsA("TextButton") then
+							table.insert(pieces, tostring(object.Text))
+						end
+					end
+					local combined = table.concat(pieces, " ")
+					if combined:lower():find(wantedTitle, 1, true) then
+						local shownCurrent, shownMax = combined:match("([%d,%.]+)%s*/%s*([%d,%.]+)")
+						if shownCurrent and shownMax then
+							shownCurrent = tonumber((shownCurrent:gsub("[,%.]", "")))
+							shownMax = tonumber((shownMax:gsub("[,%.]", "")))
+							if shownCurrent and shownMax and shownMax > 0 then
+								return math.clamp(shownCurrent / shownMax, 0, 1)
+							end
+						end
+					end
+				end
+			end
+		end
+
+		return 0
+	end
+
+	questTargetZoneName = nil
+	local zoneQuestTitle
+	local bestZoneRatio = -1
+	for _, quest in ipairs(quests) do
+		if quest.props.QuestType == "ZoneTime" then
+			local targetZone = findZoneInQuest(quest)
+			if targetZone then
+				local ratio = progressRatio(quest)
+
+				-- Quest de zona concluída continua aparecendo nos dados/HUD até ser
+				-- resgatada. Nunca usa uma de 100% como destino; entre as incompletas,
+				-- continua priorizando a que está mais perto de terminar.
+				if ratio < 0.999 and ratio > bestZoneRatio then
+					bestZoneRatio = ratio
+					questTargetZoneName = targetZone
+					zoneQuestTitle = quest.props.Title
+				end
+			end
+		end
+	end
+
+	local passiveSurviveTitle
+	for _, quest in ipairs(quests) do
+		local data = quest.props and quest.props.QuestData
+		if quest.props
+			and quest.props.QuestType == "PlayTime"
+			and data
+			and data.ShouldBeSpawnedAsAnimal == true
+			and not data.ShouldBeSpawnedAsSpecificAnimalName
+			and not state.questGroup.questComplete(quest) then
+			passiveSurviveTitle = passiveSurviveTitle or quest.props.Title
+		end
+	end
+
+	if questTargetZoneName then
+		local currentZone = getPlayerZoneName()
+		if type(currentZone) ~= "string" or currentZone:lower() ~= questTargetZoneName:lower() then
+			local position = getZonePosition(questTargetZoneName)
+			if position and not state.busy and not criticalRecoveryActive and not DAMAGE.active
+				and not drinkingToFull and not eatingToFull then
+				questStatusText = "Going to " .. questTargetZoneName
+				runtimeMessage = "Quest zone: " .. questTargetZoneName
+				ragdollTeleport(position, 6)
+			else
+				questStatusText = "Waiting to enter " .. questTargetZoneName
+			end
+		else
+			local progressText = bestZoneRatio > 0
+				and string.format(" (%.0f%%)", bestZoneRatio * 100)
+				or ""
+			questStatusText = string.format("%s: %s%s", tostring(zoneQuestTitle or "Zone quest"), questTargetZoneName, progressText)
+		end
+	elseif questTravelWanted then
+		questStatusText = string.format("Auto Run: Travel/Land Distance (%d active)", incompleteTravelCount)
+	elseif groupingQuestActive then
+		questStatusText = state.questGroup.statusText ~= "" and state.questGroup.statusText or "Grouping: checking pack"
+	elseif passiveSurviveTitle then
+		questStatusText = "Passive: " .. tostring(passiveSurviveTitle) .. " (stay alive as any animal)"
+	else
+		local first = quests[1]
+		questStatusText = "Progressing: " .. tostring(first and first.props and first.props.Title or "quests")
+	end
+end
+
+function state.questProgressValues(quest)
+	if type(quest) ~= "table" or type(quest.props) ~= "table" then
+		return nil, nil, nil
+	end
+
+	local maxProgress
+	if type(quest.props.GetMaxProgress) == "function" then
+		local ok, value = pcall(quest.props.GetMaxProgress, quest.props)
+		if ok and type(value) == "number" and value > 0 then
+			maxProgress = value
+		end
+	end
+
+	local function scan(value, seen)
+		if type(value) ~= "table" then return nil end
+		seen = seen or {}
+		if seen[value] then return nil end
+		seen[value] = true
+
+		local best
+		for key, child in pairs(value) do
+			if type(child) == "number" and type(key) == "string"
+				and key:lower():find("progress", 1, true) then
+				best = math.max(best or 0, child)
+			elseif type(child) == "table" then
+				local nested = scan(child, seen)
+				if nested then best = math.max(best or 0, nested) end
+			end
+		end
+		return best
+	end
+
+	local current = scan(quest.entry)
+	if type(current) == "number" and type(maxProgress) == "number" then
+		return current, maxProgress, math.clamp(current / maxProgress, 0, 1)
+	end
+
+	-- HUD fallback. This is also useful because some replicated quest entries
+	-- do not expose a numeric Progress field directly.
+	local gui = player:FindFirstChild("PlayerGui")
+	local questsGui = gui and gui:FindFirstChild("QuestsScreenGui")
+	local scrolling = questsGui and questsGui:FindFirstChild("RefScrollingFrame", true)
+	local wantedTitle = type(quest.props.Title) == "string"
+		and quest.props.Title:lower()
+		or nil
+
+	if scrolling and wantedTitle then
+		for _, frame in ipairs(scrolling:GetChildren()) do
+			if frame:IsA("GuiObject") and frame.Name:match("^QuestFrame%d+$") then
+				local pieces = {}
+				for _, object in ipairs(frame:GetDescendants()) do
+					if object:IsA("TextLabel") or object:IsA("TextButton") then
+						table.insert(pieces, tostring(object.Text))
+					end
+				end
+
+				local combined = table.concat(pieces, " ")
+				if combined:lower():find(wantedTitle, 1, true) then
+					local shownCurrent, shownMax =
+						combined:match("([%d,%.]+)%s*/%s*([%d,%.]+)")
+
+					if shownCurrent and shownMax then
+						shownCurrent = tonumber((shownCurrent:gsub("[,%.]", "")))
+						shownMax = tonumber((shownMax:gsub("[,%.]", "")))
+
+						if shownCurrent and shownMax and shownMax > 0 then
+							return shownCurrent, shownMax,
+								math.clamp(shownCurrent / shownMax, 0, 1)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	return nil, maxProgress, nil
+end
+
+function state.questFormatProgress(quest)
+	local current, maximum, ratio = state.questProgressValues(quest)
+
+	if current and maximum then
+		local function compact(value)
+			if math.abs(value - math.floor(value)) < 0.001 then
+				return tostring(math.floor(value))
+			end
+			return string.format("%.1f", value)
+		end
+
+		return string.format(
+			"%s/%s (%d%%)",
+			compact(current),
+			compact(maximum),
+			math.floor((ratio or 0) * 100 + 0.5)
+		)
+	end
+
+	if ratio then
+		return string.format("%d%%", math.floor(ratio * 100 + 0.5))
+	end
+
+	return nil
+end
+
+function state.questIsProgressingNow(quest, records, character, currentAnimal, currentZone, currentPack)
+	if not state.autoQuests
+		or type(quest) ~= "table"
+		or type(quest.props) ~= "table"
+		or state.questGroup.questComplete(quest) then
+		return false
+	end
+
+	local props = quest.props
+	local data = props.QuestData or {}
+	local questType = props.QuestType
+
+	if questType == "PlayTime" then
+		-- Normal Playtime always progresses while connected.
+		if not data.ShouldBeSpawnedAsAnimal then
+			return true
+		end
+
+		-- Survive as a specific animal only progresses while that exact
+		-- requested species is currently spawned.
+		if data.ShouldBeSpawnedAsSpecificAnimalName then
+			local targetAnimal = findSpecificAnimalTarget(quest, records)
+			return type(targetAnimal) == "string"
+				and type(currentAnimal) == "string"
+				and targetAnimal:lower() == currentAnimal:lower()
+		end
+
+		-- Generic Survive only requires being spawned as any animal.
+		return character ~= nil
+			and type(currentAnimal) == "string"
+			and currentAnimal ~= ""
+	end
+
+	if questType == "GrowTime" then
+		if not character then return false end
+		local growth = character:GetAttribute("GrowthPercentage")
+		return type(growth) == "number" and not isGrowthComplete(growth)
+	end
+
+	if questType == "ZoneTime" then
+		if type(currentZone) ~= "string" or currentZone == "" then return false end
+		local targetZone = findZoneInQuest(quest)
+		return type(targetZone) == "string"
+			and targetZone:lower() == currentZone:lower()
+	end
+
+	if questType == "GroupTime" then
+		return currentPack ~= nil
+			and state.questGroup.hasOtherMember(currentPack)
+	end
+
+	if questType == "TravelDistance" then
+		-- Use the ACTUAL motion loop state, not merely the existence of a quest.
+		-- This prevents Land/Travel appearing while food, water, damage or a
+		-- teleport has temporarily stopped movement.
+		if not state.questMotionMoving then return false end
+
+		if isSwimQuest(props) then
+			return state.questMotionMode == "Swimming"
+		end
+
+		if isLandDistanceQuest(props) then
+			return state.questMotionMode == "Land"
+		end
+
+		-- Generic Travel counts any real travel performed by our motion loop,
+		-- including swimming.
+		return state.questMotionMode == "Land"
+			or state.questMotionMode == "Swimming"
+	end
+
+	return false
+end
+
+function state.questBuildActiveStatus(quests)
+	if not state.autoQuests then
+		return "Status: " .. tostring(questStatusText), 1
+	end
+
+	quests = type(quests) == "table" and quests or getAllQuests()
+
+	local records = savedCharacters()
+	local character = player.Character
+	local currentAnimal = character and character:GetAttribute("AnimalName")
+	if (type(currentAnimal) ~= "string" or currentAnimal == "") and character then
+		currentAnimal = CROC.getAnimalName(character)
+	end
+	local currentZone = getPlayerZoneName()
+
+	local handler = state.questGroup.resolveHandler()
+	local currentPack = handler and state.questGroup.getCurrentPack(handler) or nil
+
+	local lines = {}
+	for _, quest in ipairs(quests) do
+		if state.questIsProgressingNow(
+			quest,
+			records,
+			character,
+			currentAnimal,
+			currentZone,
+			currentPack
+		) then
+			local title = tostring(
+				quest.props.Title
+				or quest.entry.QuestUniqueKey
+				or "Quest"
+			)
+			local progress = state.questFormatProgress(quest)
+			local suffix = ""
+
+			if quest.props.QuestType == "ZoneTime" then
+				local zone = findZoneInQuest(quest)
+				if zone then suffix = " · " .. zone end
+			elseif quest.props.QuestType == "GroupTime" and currentPack then
+				suffix = string.format(
+					" · %d animals",
+					state.questGroup.memberCount(currentPack)
+				)
+			elseif isSwimQuest(quest.props) then
+				suffix = " · swimming"
+			elseif isLandDistanceQuest(quest.props) then
+				suffix = " · running"
+			elseif quest.props.QuestType == "GrowTime" then
+				suffix = " · growing"
+			end
+
+			table.insert(
+				lines,
+				"• " .. title .. suffix
+					.. (progress and (" · " .. progress) or "")
+			)
+		end
+	end
+
+	if #lines == 0 then
+		-- No quest is gaining progress THIS instant. Keep the operational
+		-- message (going to zone, eating, switching animal, etc.) instead of
+		-- falsely listing an idle quest.
+		return "Status: " .. tostring(questStatusText), 1
+	end
+
+	table.insert(lines, 1, string.format("Active quests (%d):", #lines))
+	return table.concat(lines, "\n"), #lines
+end
+
+local function getQuestMoveSpeed(character)
+	local model = workspace:FindFirstChild(player.Name)
+	local acceleration = model and model:GetAttribute("Acceleration")
+	if acceleration == nil and character then acceleration = character:GetAttribute("Acceleration") end
+	acceleration = tonumber(acceleration)
+	if not acceleration or acceleration <= 0 then return 50 end
+	return acceleration
 end
 
 local NAMES = { "Jack","John","Evian","Aiman","Adam","Alex","Ben","Sam","Max","Leo","Noah","Liam","Omar","Zain","Ali","Ryan","Ethan","Mason","Dylan","Lucas","Harry","Jacob","Henry","Isaac","Yusuf","Amir","Daniel","David","Aaron","Oscar","Toby","Kian","Kai","Jay","Sean","Chris","Kevin","Mark" }
@@ -2226,7 +4402,7 @@ local function growthStep()
 		if ResetRemote then pcall(ResetRemote.InvokeServer, ResetRemote) end
 		task.wait(2.5)
 		local refreshed = savedCharacters()
-		entry = nextExistingSlot(completedAnimal, refreshed)
+		entry = nextExistingSlot(state.questPostGrowAll and nil or completedAnimal, refreshed)
 		if not previousEntry then
 			for _, candidate in ipairs(refreshed) do
 				if candidate.CharacterName == completedName then
@@ -2250,7 +4426,12 @@ local function growthStep()
 			createNextSlot()
 		end
 	elseif state.growExisting then
-		runtimeMessage = "Sem " .. tostring(completedAnimal or "animal") .. " incompleto; ativando Farm Coins"
+		if state.questPostGrowAll then
+			runtimeMessage = "Todos os slots existentes estão 100%; ativando Farm Coins"
+			state.questPostGrowAll = false
+		else
+			runtimeMessage = "Sem " .. tostring(completedAnimal or "animal") .. " incompleto; ativando Farm Coins"
+		end
 		if previousEntry then
 			spawnSlot(previousEntry)
 		end
@@ -2269,6 +4450,9 @@ end
 -- ============================================================
 -- HUD
 -- ============================================================
+-- HUD + loops ficam em um chunk separado para não compartilhar os registradores
+-- locais do núcleo principal. Luau limita cada função/chunk a 200 registradores.
+;(function()
 local TweenService = game:GetService("TweenService")
 
 local COLOR_BG        = Color3.fromRGB(10, 6, 12)
@@ -2663,7 +4847,7 @@ local tabLayout = Instance.new("UIListLayout", tabBar)
 tabLayout.FillDirection = Enum.FillDirection.Horizontal
 tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
 
-local TAB_NAMES = { "Survival", "Growth", "Teleport" }
+local TAB_NAMES = { "Survival", "Growth", "Quests", "Teleport" }
 local tabButtons, tabContents = {}, {}
 
 local contentContainer = Instance.new("ScrollingFrame")
@@ -2945,13 +5129,35 @@ local function toggle(parent, label, key, order)
 	row.Activated:Connect(function()
 		state[key] = not state[key]
 		if key == "farmCoins" and state[key] then
-			state.growExisting, state.growNew = false, false
+			state.questPostGrowAll = false
+			state.growExisting, state.growNew, state.autoQuests = false, false, false
 			state.autoEat, state.autoDrink = true, true
 			runtimeMessage = "AFK coin farming active"
 		elseif (key == "growExisting" or key == "growNew") and state[key] then
-			state.farmCoins = false
+			state.questPostGrowAll = false
+			state.farmCoins, state.autoQuests = false, false
+		elseif key == "autoQuests" and state[key] then
+			state.questPostGrowAll = false
+			state.questSeenAny = false
+			state.questEmptyScans = 0
+			state.questGroup.difficultySince = nil
+			state.farmCoins, state.growExisting, state.growNew = false, false, false
+			state.autoEat, state.autoDrink = true, true
+			questStatusText = "Scanning Daily + Weekly quests"
+			runtimeMessage = "Auto Quests active"
+		elseif key == "autoQuests" and not state[key] then
+			questTravelWanted = false
+			state.questTravelActive = false
+			state.questLandInputActive = false
+			state.questSetW(false)
+			state.questSwimActive = false
+			state.questSwimReady = false
+			questTargetZoneName = nil
+			questStatusText = "Ready"
+		elseif key == "autoClaimQuests" then
+			questStatusText = state[key] and "Auto Claim active" or "Ready"
 		end
-		for _, changedKey in ipairs({ key, "farmCoins", "growExisting", "growNew", "autoEat", "autoDrink" }) do
+		for _, changedKey in ipairs({ key, "farmCoins", "growExisting", "growNew", "autoQuests", "autoClaimQuests", "autoEat", "autoDrink" }) do
 			if renders[changedKey] then renders[changedKey]() end
 		end
 	end)
@@ -3052,6 +5258,48 @@ genderNote.TextSize = 10
 genderNote.TextWrapped = true
 genderNote.TextXAlignment = Enum.TextXAlignment.Left
 genderNote.Parent = tabContents.Growth
+
+-- ============================================================
+-- Aba: Quests
+-- ============================================================
+sectionLabel(tabContents.Quests, "QUEST AUTOMATION", 0)
+toggle(tabContents.Quests, "Auto Complete Quests", "autoQuests", 1)
+toggle(tabContents.Quests, "Auto Claim Rewards", "autoClaimQuests", 2)
+
+local questNote = Instance.new("TextLabel")
+questNote.Size = UDim2.new(1, 0, 0, 42)
+questNote.LayoutOrder = 3
+questNote.BackgroundTransparency = 1
+questNote.Font = FONT_BODY
+questNote.Text = "Zone/Pack check: 5s | Auto Run uses the character's Acceleration limit.\nAuto Complete handles Grouping and keeps Food/Water active."
+questNote.TextColor3 = COLOR_SUBTEXT
+questNote.TextSize = 10
+questNote.TextWrapped = true
+questNote.TextXAlignment = Enum.TextXAlignment.Left
+questNote.Parent = tabContents.Quests
+
+local questStatusCard = Instance.new("Frame")
+questStatusCard.Size = UDim2.new(1, 0, 0, 52)
+questStatusCard.AutomaticSize = Enum.AutomaticSize.None
+questStatusCard.LayoutOrder = 4
+questStatusCard.BackgroundColor3 = COLOR_CARD
+questStatusCard.BorderSizePixel = 0
+questStatusCard.Parent = tabContents.Quests
+corner(questStatusCard, 8)
+stroke(questStatusCard, Color3.fromRGB(48, 24, 42), 1)
+
+local questStatusLabel = Instance.new("TextLabel")
+questStatusLabel.Size = UDim2.new(1, -20, 1, -10)
+questStatusLabel.Position = UDim2.fromOffset(10, 5)
+questStatusLabel.BackgroundTransparency = 1
+questStatusLabel.Font = FONT_BUTTON
+questStatusLabel.Text = "Status: Ready"
+questStatusLabel.TextColor3 = COLOR_TEXT
+questStatusLabel.TextSize = 11
+questStatusLabel.TextWrapped = true
+questStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+questStatusLabel.TextYAlignment = Enum.TextYAlignment.Top
+questStatusLabel.Parent = questStatusCard
 
 -- ============================================================
 -- Aba: Teleport
@@ -3320,7 +5568,9 @@ task.spawn(function()
 		cornerBarFill.Size = UDim2.new(growthPct, 0, 1, 0)
 
 		local mode, color
-		if state.growExisting then
+		if state.autoQuests then
+			mode, color = "Auto Quests", Color3.fromRGB(90, 210, 255)
+		elseif state.growExisting then
 			mode, color = "Growing existing slots", Color3.fromRGB(80, 200, 120)
 		elseif state.growNew then
 			mode, color = "Growing new slots", Color3.fromRGB(255, 150, 80)
@@ -3376,8 +5626,297 @@ task.spawn(function()
 	end
 end)
 
+
+-- Physical movement input can emit a real KeyUp/Move command that overrides the
+-- virtual held W. Reassert ONLY when the player actually interacts with movement
+-- controls; there is no continuous W spam.
+local function questLandInputShouldStayHeld()
+	return state.alive
+		and state.autoQuests
+		and state.questLandInputActive
+		and not state.questSwimActive
+		and not questSwitchingAnimal
+		and not state.busy
+		and not criticalRecoveryActive
+		and not DAMAGE.active
+		and not drinkingToFull
+		and not eatingToFull
+end
+
+local function reassertQuestWAfterPlayerInput()
+	if not questLandInputShouldStayHeld() then return end
+	task.defer(function()
+		task.wait(0.025)
+		if questLandInputShouldStayHeld() then
+			state.questSetW(true, true)
+		end
+	end)
+end
+
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if not state.questLandInputActive then return end
+
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		local key = input.KeyCode
+		if key == Enum.KeyCode.W
+			or key == Enum.KeyCode.A
+			or key == Enum.KeyCode.S
+			or key == Enum.KeyCode.D
+			or key == Enum.KeyCode.Up
+			or key == Enum.KeyCode.Left
+			or key == Enum.KeyCode.Down
+			or key == Enum.KeyCode.Right then
+			reassertQuestWAfterPlayerInput()
+		end
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		reassertQuestWAfterPlayerInput()
+	end
+end))
+
+table.insert(connections, UserInputService.InputEnded:Connect(function(input, gameProcessed)
+	if not state.questLandInputActive then return end
+
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		local key = input.KeyCode
+		if key == Enum.KeyCode.W
+			or key == Enum.KeyCode.A
+			or key == Enum.KeyCode.S
+			or key == Enum.KeyCode.D
+			or key == Enum.KeyCode.Up
+			or key == Enum.KeyCode.Left
+			or key == Enum.KeyCode.Down
+			or key == Enum.KeyCode.Right then
+			reassertQuestWAfterPlayerInput()
+		end
+	elseif input.UserInputType == Enum.UserInputType.Touch then
+		reassertQuestWAfterPlayerInput()
+	end
+end))
+
+-- If the Roblox window loses focus, Windows can discard held-key state.
+-- Restore W once focus returns, but only while Land Distance is still active.
+pcall(function()
+	table.insert(connections, UserInputService.WindowFocused:Connect(function()
+		reassertQuestWAfterPlayerInput()
+	end))
+end)
+
+task.spawn(function()
+	local lastClaimCheck = 0
+	while state.alive do
+		-- AFK Coin is also the idle watcher. If a fresh Daily/Weekly appears
+		-- while we are coin farming, switch back to Auto Quests automatically.
+		if state.farmCoins and not state.autoQuests then
+			local coinQuests = getAllQuests()
+			local hasPending = false
+
+			for _, quest in ipairs(coinQuests) do
+				if not state.questGroup.questComplete(quest) then
+					hasPending = true
+					break
+				end
+			end
+
+			if hasPending then
+				state.farmCoins = false
+				state.growExisting = false
+				state.growNew = false
+				state.questPostGrowAll = false
+				state.questSeenAny = true
+				state.questEmptyScans = 0
+				state.autoQuests = true
+				state.autoEat, state.autoDrink = true, true
+				questStatusText = "Pending quests found -> Auto Quests"
+				runtimeMessage = "AFK Coins: new quests detected; Auto Quests active"
+
+				if renders then
+					for _, key in ipairs({
+						"farmCoins", "growExisting", "growNew",
+						"autoQuests", "autoEat", "autoDrink"
+					}) do
+						if renders[key] then renders[key]() end
+					end
+				end
+			end
+		end
+
+		if state.autoQuests or state.autoClaimQuests then
+			local quests = getAllQuests()
+			if tick() - lastClaimCheck >= 10 then
+				lastClaimCheck = tick()
+				claimQuestRewards(quests)
+			end
+			if state.autoQuests then
+				updateQuestAutomation()
+			elseif state.autoClaimQuests then
+				questStatusText = "Auto Claim: checking Daily + Weekly"
+			end
+		else
+			questTravelWanted = false
+			state.questTravelActive = false
+		end
+
+		if questStatusLabel and questStatusLabel.Parent then
+			local displayText, displayLines =
+				state.questBuildActiveStatus(getAllQuests())
+
+			questStatusLabel.Text = displayText
+
+			-- 52px for a single operational status; expand for one line per
+			-- simultaneously progressing quest. The Quests tab is scrollable.
+			local cardHeight = math.max(52, 24 + (displayLines * 18))
+			questStatusCard.Size = UDim2.new(1, 0, 0, cardHeight)
+		end
+		task.wait(state.questSwimActive and 1 or 5)
+	end
+end)
+
+task.spawn(function()
+	local radius = 30
+	local center
+	local angle = 0
+	local trackedCharacter
+	local wasMoving = false
+	local wasSwimming = false
+
+	while state.alive do
+		local character, root = characterParts()
+		local food = character and (character:GetAttribute("Food") or 100) or 100
+		local water = character and (character:GetAttribute("Water") or 100) or 100
+
+		local swimMove = state.autoQuests
+			and state.questSwimActive
+			and state.questSwimReady
+
+		local landMove = state.autoQuests
+			and questTravelWanted
+			and not state.questSwimActive
+
+		local commonSafe = not questSwitchingAnimal
+			and not state.busy
+			and not criticalRecoveryActive
+			and not DAMAGE.active
+			and not carcassEatBusy
+			and not CROC.approachBusy
+			and not forcingPostDrinkTeleport
+			and not state.questCarnivoreFeeding
+			and character and root
+
+		local canMove = commonSafe and (
+			swimMove
+			or (
+				landMove
+				and not drinkingToFull
+				and not eatingToFull
+				and food > 68
+				and water > 75
+			)
+		)
+
+		if canMove then
+			-- Water verification during the fast Swim mission. If physics pushes
+			-- us out, stop propulsion and let the 1s quest scanner re-teleport.
+			if swimMove and tick() - (state.questSwimLastWaterCheck or 0) >= 1 then
+				state.questSwimLastWaterCheck = tick()
+				if not isValidSwimQuestWater(root) then
+					state.questSwimReady = false
+					canMove = false
+					questStatusText = "Swim: left water; repositioning"
+				end
+			end
+		end
+
+		if canMove then
+			state.questMotionMoving = true
+			state.questMotionMode = swimMove and "Swimming" or "Land"
+
+			local wantsLandW = landMove and state.questLandInputActive
+			state.questSetW(wantsLandW)
+
+			if trackedCharacter ~= character
+				or not center
+				or wasSwimming ~= swimMove
+				or (not swimMove and (root.Position - center).Magnitude > 80) then
+
+				trackedCharacter = character
+				wasSwimming = swimMove
+				center = swimMove and state.questSwimPosition or root.Position
+				angle = 0
+			end
+
+			if tick() - (state.questLastSubStateAt or 0) >= (swimMove and 0.35 or 0.75) then
+				state.questLastSubStateAt = tick()
+				blockClientSubState = false
+				setSubState(swimMove and "Swimming" or (state.questMoveSubState or "Running"))
+				blockClientSubState = false
+			end
+
+			local speed = getQuestMoveSpeed(character)
+			local moveRadius = swimMove and 22 or radius
+			angle += (speed / moveRadius) * 0.05
+
+			local target = Vector3.new(
+				center.X + math.cos(angle) * moveRadius,
+				root.Position.Y,
+				center.Z + math.sin(angle) * moveRadius
+			)
+
+			local flat = Vector3.new(
+				target.X - root.Position.X,
+				0,
+				target.Z - root.Position.Z
+			)
+
+			if flat.Magnitude > 0.1 then
+				local direction = flat.Unit
+				local velocity = root.AssemblyLinearVelocity
+
+				-- Land Distance needs genuine movement input, not only HRP velocity.
+				-- Face the direction of travel so the virtual W input agrees with the
+				-- circular path instead of fighting it.
+				if landMove and state.questLandInputActive then
+					pcall(function()
+						root.CFrame = CFrame.lookAt(
+							root.Position,
+							root.Position + direction,
+							Vector3.yAxis
+						)
+					end)
+				end
+
+				-- Preserve Y so swimming physics can keep the animal at the
+				-- proper depth. Drinking pulses never zero this velocity.
+				root.AssemblyLinearVelocity = Vector3.new(
+					direction.X * speed,
+					velocity.Y,
+					direction.Z * speed
+				)
+				wasMoving = true
+			end
+		else
+			state.questMotionMoving = false
+			state.questMotionMode = nil
+			state.questSetW(false)
+
+			if wasMoving and root then
+			local velocity = root.AssemblyLinearVelocity
+			root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+			wasMoving = false
+			wasSwimming = false
+			center = nil
+			blockClientSubState = false
+			end
+		end
+
+		task.wait(0.05)
+	end
+end)
+
 shared.__uiRootCleanup = function()
 	state.alive = false
+	state.questMotionMoving = false
+	state.questMotionMode = nil
+	state.questSetW(false)
 	removeSwimBarrier()
 	if DAMAGE.connection then DAMAGE.connection:Disconnect(); DAMAGE.connection = nil end
 	for _, connection in ipairs(connections) do connection:Disconnect() end
@@ -3400,3 +5939,4 @@ task.spawn(function()
 		task.wait(0.5)
 	end
 end)
+end)()
