@@ -24,8 +24,14 @@ local state = {
 	escapeTerrain = false,
 	growExisting = false,
 	growExistingAutomaticAll = false,
+	growAllSlots = false,
 	growNew = false,
 	farmCoins = false,
+	coinFarmPreferredAnimal = nil,
+	coinFarmSwitchPending = false,
+	coinFarmSwitching = false,
+	coinFarmSwitchReason = nil,
+	coinFarmRetryAt = 0,
 	autoQuests = false,
 	autoClaimQuests = false,
 	questMoveSubState = "Running",
@@ -3958,7 +3964,10 @@ function DAMAGE.recover(character, humanoid, healthBefore, healthAfter, reason, 
 	state.autoEat = previousAutoEat
 	state.autoDrink = previousAutoDrink
 
-	if state.farmCoins or state.growExisting or state.growNew then
+	if state.farmCoins
+		or state.growExisting
+		or state.growAllSlots
+		or state.growNew then
 		state.autoEat = true
 		state.autoDrink = true
 	end
@@ -8343,6 +8352,7 @@ local function updateQuestAutomation()
 			state.questPostGrowAll = true
 			state.growExisting = true
 			state.growExistingAutomaticAll = true
+			state.growAllSlots = false
 			state.farmCoins = false
 
 			if incompleteQuestCount > 0 then
@@ -8359,6 +8369,7 @@ local function updateQuestAutomation()
 			state.questPostGrowAll = false
 			state.growExisting = false
 			state.growExistingAutomaticAll = false
+			state.growAllSlots = false
 			state.farmCoins = true
 
 			if incompleteQuestCount > 0 then
@@ -8375,7 +8386,7 @@ local function updateQuestAutomation()
 		state.autoEat, state.autoDrink = true, true
 		if renders then
 			for _, key in ipairs({
-				"autoQuests", "growExisting", "growNew",
+				"autoQuests", "growExisting", "growAllSlots", "growNew",
 				"farmCoins", "autoEat", "autoDrink"
 			}) do
 				if renders[key] then renders[key]() end
@@ -9873,6 +9884,274 @@ local function createNextSlot()
 end
 
 local growthBusy = false
+function state.coinFarmUniqueAnimals(records)
+	records = records or savedCharacters()
+
+	local byKey = {}
+	for _, entry in ipairs(records) do
+		if type(entry) == "table"
+			and type(entry.AnimalName) == "string"
+			and entry.AnimalName ~= "" then
+
+			local key = state.questAnimalKey(entry.AnimalName)
+			if key ~= "" and not byKey[key] then
+				byKey[key] = entry.AnimalName
+			end
+		end
+	end
+
+	local animals = {}
+	for _, animalName in pairs(byKey) do
+		animals[#animals + 1] = animalName
+	end
+
+	table.sort(animals, function(a, b)
+		return a:lower() < b:lower()
+	end)
+
+	return animals
+end
+
+function state.coinFarmFindPreferredSlot(records, animalName)
+	if type(animalName) ~= "string" or animalName == "" then
+		return nil
+	end
+
+	records = records or savedCharacters()
+	local wanted = state.questAnimalKey(animalName)
+	local best
+	local bestGrowth = -math.huge
+
+	for _, entry in ipairs(records) do
+		if type(entry) == "table"
+			and type(entry.AnimalName) == "string"
+			and state.questAnimalKey(entry.AnimalName) == wanted then
+
+			local growth = tonumber(entry.GrowthPercentage) or 0
+			if growth <= 1 then
+				growth *= 100
+			end
+
+			-- If the user owns many slots of the same animal, use ONE slot only:
+			-- prefer the most-grown one because AFK Coin does not need to rotate
+			-- through duplicate species.
+			if not best
+				or growth > bestGrowth
+				or (
+					growth == bestGrowth
+					and tostring(entry.CharacterName or "")
+						< tostring(best.CharacterName or "")
+				) then
+
+				best = entry
+				bestGrowth = growth
+			end
+		end
+	end
+
+	return best
+end
+
+function state.coinFarmRenderPreferred()
+	if renders and renders.coinFarmAnimal then
+		pcall(renders.coinFarmAnimal)
+	end
+end
+
+function state.coinFarmRequestPreferredSwitch(reason)
+	if not state.farmCoins then
+		state.coinFarmSwitchPending = false
+		state.coinFarmSwitchReason = nil
+		return
+	end
+
+	local preferred = state.coinFarmPreferredAnimal
+
+	if type(preferred) ~= "string" or preferred == "" then
+		state.coinFarmSwitchPending = false
+		state.coinFarmSwitchReason = nil
+
+		local character = player.Character
+		local currentAnimal = character
+			and character:GetAttribute("AnimalName")
+			or "current animal"
+
+		questStatusText =
+			"AFK Coin Farm: keeping current animal -> "
+			.. tostring(currentAnimal)
+
+		runtimeMessage =
+			"No AFK Coin animal selected; keeping the animal active when Coin Farm started"
+		return
+	end
+
+	state.coinFarmSwitchPending = true
+	state.coinFarmSwitchReason = reason or "AFK Coin Farm started"
+	state.coinFarmRetryAt = 0
+
+	questStatusText =
+		"AFK Coin Farm: preferred animal -> "
+		.. preferred
+end
+
+function state.coinFarmTryPreferredSwitch()
+	if not state.farmCoins
+		or not state.coinFarmSwitchPending
+		or state.coinFarmSwitching
+		or tick() < (state.coinFarmRetryAt or 0) then
+		return
+	end
+
+	local preferred = state.coinFarmPreferredAnimal
+	if type(preferred) ~= "string" or preferred == "" then
+		state.coinFarmSwitchPending = false
+		return
+	end
+
+	local character = player.Character
+	local currentAnimal = character
+		and character:GetAttribute("AnimalName")
+
+	if type(currentAnimal) == "string"
+		and state.questAnimalKey(currentAnimal)
+			== state.questAnimalKey(preferred) then
+
+		state.coinFarmSwitchPending = false
+		state.coinFarmSwitchReason = nil
+
+		questStatusText =
+			"AFK Coin Farm: "
+			.. preferred
+			.. " selected"
+
+		runtimeMessage =
+			"AFK Coin preferred animal already active: "
+			.. preferred
+		return
+	end
+
+	-- Never fight Eat/Drink, damage recovery, Growth reset, a quest switch,
+	-- or another ragdoll teleport. The preferred species remains pending.
+	if growthBusy
+		or state.busy
+		or questSwitchingAnimal
+		or criticalRecoveryActive
+		or DAMAGE.active
+		or state.questGrowthReset.exclusive
+		or state.questGrowthReset.busy
+		or drinkingToFull
+		or eatingToFull
+		or carcassEatBusy
+		or BABOON.busy
+		or GIRAFFE.busy
+		or CROC.approachBusy
+		or forcingPostDrinkTeleport then
+		return
+	end
+
+	local target = state.coinFarmFindPreferredSlot(
+		savedCharacters(),
+		preferred
+	)
+
+	-- The selector only lists existing species, but a slot can be removed after
+	-- selection. Fail safely: clear the stale preference and keep current animal.
+	if not target then
+		state.coinFarmPreferredAnimal = nil
+		state.coinFarmSwitchPending = false
+		state.coinFarmSwitchReason = nil
+
+		runtimeMessage =
+			"Selected AFK Coin animal no longer has a saved slot; keeping current animal"
+		questStatusText =
+			"AFK Coin Farm: Current animal (saved selection unavailable)"
+
+		state.coinFarmRenderPreferred()
+		return
+	end
+
+	state.coinFarmSwitching = true
+	state.coinFarmSwitchPending = false
+
+	local requestedAnimal = preferred
+	local previousAutoEat = state.autoEat
+	local previousAutoDrink = state.autoDrink
+
+	-- Prevent survival loops from trying to operate on the disappearing
+	-- character during the short Reset -> Spawn transition.
+	state.autoEat = false
+	state.autoDrink = false
+	blockClientSubState = false
+	state.questSetW(false)
+	DAMAGE.cooldownUntil = math.max(
+		DAMAGE.cooldownUntil or 0,
+		tick() + 20
+	)
+
+	runtimeMessage =
+		"AFK Coin Farm: switching to preferred animal "
+		.. requestedAnimal
+
+	questStatusText =
+		"AFK Coin Farm: switching -> "
+		.. requestedAnimal
+
+	task.spawn(function()
+		if ResetRemote then
+			pcall(ResetRemote.InvokeServer, ResetRemote)
+			task.wait(1.35)
+		end
+
+		-- Even if Coin Farm/selection changed while the menu was open, always
+		-- finish spawning something so the player is never left slotless.
+		local spawned = spawnSlot(target)
+
+		state.coinFarmSwitching = false
+
+		if state.farmCoins then
+			state.autoEat = true
+			state.autoDrink = true
+		else
+			state.autoEat = previousAutoEat
+			state.autoDrink = previousAutoDrink
+		end
+
+		if renders then
+			if renders.autoEat then renders.autoEat() end
+			if renders.autoDrink then renders.autoDrink() end
+		end
+
+		if spawned then
+			if state.farmCoins
+				and type(state.coinFarmPreferredAnimal) == "string"
+				and state.questAnimalKey(state.coinFarmPreferredAnimal)
+					~= state.questAnimalKey(requestedAnimal) then
+
+				-- User changed the dropdown during the switch. Complete this
+				-- spawn first, then honor the NEW choice on the next pass.
+				state.coinFarmSwitchPending = true
+				state.coinFarmRetryAt = tick() + 1
+				runtimeMessage =
+					"AFK Coin animal selection changed; applying new preference"
+			else
+				state.coinFarmSwitchPending = false
+				questStatusText =
+					"AFK Coin Farm: "
+					.. requestedAnimal
+				runtimeMessage =
+					"AFK Coin preferred animal active: "
+					.. requestedAnimal
+			end
+		elseif state.farmCoins then
+			state.coinFarmSwitchPending = true
+			state.coinFarmRetryAt = tick() + 10
+			runtimeMessage =
+				"AFK Coin preferred animal spawn was not confirmed; retrying later"
+		end
+	end)
+end
+
+
 local preSwitchTopUpActive = false -- true enquanto estamos no meio de encher comida/água antes de trocar
 local preSwitchTopUpStartedAt = nil
 local PRE_SWITCH_TOP_UP_TIMEOUT = 90 -- segundos: desiste de esperar 100% (ex: sem carcaça por perto) e troca mesmo assim
@@ -9900,7 +10179,16 @@ end
 
 local function growthStep()
 	if state.questGrowthReset.exclusive then return end
-	if state.farmCoins or growthBusy or state.busy or not (state.growExisting or state.growNew) then return end
+	if state.farmCoins
+		or growthBusy
+		or state.busy
+		or not (
+			state.growExisting
+			or state.growAllSlots
+			or state.growNew
+		) then
+		return
+	end
 	-- Se uma rotina crítica (saída de água/void) estiver no controle do
 	-- personagem, o growthStep NÃO pode religar autoEat/autoDrink nem fazer
 	-- nada — senão as duas rotinas brigam pra teleportar o personagem pra
@@ -9998,19 +10286,28 @@ local function growthStep()
 	task.wait(0.5)
 
 	local entry
-	if state.growExisting then
+	if state.growExisting or state.growAllSlots then
 		local automaticAll = state.growExistingAutomaticAll == true
+		local manualAll = state.growAllSlots == true
+		local allAnimals = automaticAll or manualAll
 
-		runtimeMessage = automaticAll
-			and "AUTO Grow Existing: scanning ALL animal species for slots below 100%"
-			or "Abrindo lista de " .. tostring(completedAnimal or "animais")
+		if automaticAll then
+			runtimeMessage =
+				"AUTO Grow Existing: scanning ALL animal species for slots below 100%"
+		elseif manualAll then
+			runtimeMessage =
+				"Grow All Slots: scanning ALL animal species for slots below 100%"
+		else
+			runtimeMessage =
+				"Abrindo lista de " .. tostring(completedAnimal or "animais")
+		end
 
 		if ResetRemote then pcall(ResetRemote.InvokeServer, ResetRemote) end
 		task.wait(2.5)
 
 		local refreshed = savedCharacters()
 
-		entry = automaticAll
+		entry = allAnimals
 			and nextExistingSlot(nil, refreshed, true)
 			or nextExistingSlot(completedAnimal, refreshed, false)
 		if not previousEntry then
@@ -10031,6 +10328,15 @@ local function growthStep()
 			)
 			runtimeMessage =
 				"Automatic Grow Existing switched species to continue every saved slot below 100%"
+
+		elseif state.growAllSlots then
+			questStatusText = string.format(
+				"Grow All Slots: %s · %s%%",
+				tostring(entry.AnimalName or "Animal"),
+				tostring(entry.GrowthPercentage or "?")
+			)
+			runtimeMessage =
+				"Grow All Slots switched species to continue every saved slot below 100%"
 		end
 
 		spawnSlot(entry)
@@ -10041,13 +10347,14 @@ local function growthStep()
 			runtimeMessage = "Limite de " .. MAX_SLOTS .. " slots atingido; ativando Farm Coins"
 			state.growExisting, state.growNew = false, false
 			state.growExistingAutomaticAll = false
+			state.growAllSlots = false
 			state.farmCoins = true
 			if previousEntry then spawnSlot(previousEntry) end
 		else
 			runtimeMessage = "Criando novo slot"
 			createNextSlot()
 		end
-	elseif state.growExisting then
+	elseif state.growExisting or state.growAllSlots then
 		if state.growExistingAutomaticAll then
 			runtimeMessage =
 				"AUTO Grow Existing complete: ALL animal slots are 100%; activating AFK Coin Farm"
@@ -10055,22 +10362,40 @@ local function growthStep()
 				"AUTO Grow All complete -> AFK Coin Farm"
 			state.growExistingAutomaticAll = false
 			state.questPostGrowAll = false
+
+		elseif state.growAllSlots then
+			runtimeMessage =
+				"Grow All Slots complete: ALL animal slots are 100%; activating AFK Coin Farm"
+			questStatusText =
+				"Grow All Slots complete -> AFK Coin Farm"
+
 		elseif state.questPostGrowAll then
-			runtimeMessage = "Todos os slots existentes estão 100%; ativando Farm Coins"
+			runtimeMessage =
+				"Todos os slots existentes estão 100%; ativando Farm Coins"
 			state.questPostGrowAll = false
+
 		else
-			runtimeMessage = "Sem " .. tostring(completedAnimal or "animal") .. " incompleto; ativando Farm Coins"
+			runtimeMessage =
+				"Sem " .. tostring(completedAnimal or "animal")
+				.. " incompleto; ativando Farm Coins"
 		end
+
 		if previousEntry then
 			spawnSlot(previousEntry)
 		end
-		state.growExisting, state.growNew = false, false
+
+		state.growExisting = false
+		state.growAllSlots = false
+		state.growNew = false
 		state.growExistingAutomaticAll = false
 		state.farmCoins = true
 	end
 	state.autoEat, state.autoDrink = true, true
 	if renders then
-		for _, key in ipairs({ "growExisting", "growNew", "farmCoins", "autoEat", "autoDrink" }) do
+		for _, key in ipairs({
+			"growExisting", "growAllSlots", "growNew",
+			"farmCoins", "autoEat", "autoDrink"
+		}) do
 			if renders[key] then renders[key]() end
 		end
 	end
@@ -10803,25 +11128,49 @@ local function toggle(parent, label, key, order)
 	row.Activated:Connect(function()
 		state[key] = not state[key]
 
-		-- User interaction always means MANUAL Grow Existing.
-		-- Manual mode intentionally stays limited to the current animal species.
+		-- User interaction always means a MANUAL Growth mode.
 		if key == "growExisting" then
 			state.growExistingAutomaticAll = false
+			if state[key] then
+				state.growAllSlots = false
+			end
+
+		elseif key == "growAllSlots" and state[key] then
+			state.growExistingAutomaticAll = false
+			state.growExisting = false
+			state.growNew = false
+			questStatusText = "Grow All Slots: ALL animal species"
+			runtimeMessage =
+				"Grow All Slots active: growing every existing slot below 100% across all animals"
+
+		elseif key == "growNew" and state[key] then
+			state.growAllSlots = false
 		end
 
 		if key == "farmCoins" and state[key] then
 			state.questPostGrowAll = false
 			state.growExistingAutomaticAll = false
+			state.growAllSlots = false
 			state.growExisting, state.growNew, state.autoQuests = false, false, false
 			state.autoEat, state.autoDrink = true, true
-			runtimeMessage = "AFK coin farming active"
-		elseif (key == "growExisting" or key == "growNew") and state[key] then
+			runtimeMessage = state.coinFarmPreferredAnimal
+				and (
+					"AFK Coin Farm active; preferred animal queued: "
+					.. state.coinFarmPreferredAnimal
+				)
+				or "AFK Coin Farm active; current animal will be kept"
+		elseif (
+			key == "growExisting"
+			or key == "growAllSlots"
+			or key == "growNew"
+		) and state[key] then
 			state.questPostGrowAll = false
 			state.growExistingAutomaticAll = false
 			state.farmCoins, state.autoQuests = false, false
 		elseif key == "autoQuests" and state[key] then
 			state.questPostGrowAll = false
 			state.growExistingAutomaticAll = false
+			state.growAllSlots = false
 			state.questSeenAny = false
 			state.questEmptyScans = 0
 			state.questGroup.difficultySince = nil
@@ -10843,7 +11192,10 @@ local function toggle(parent, label, key, order)
 		elseif key == "autoClaimQuests" then
 			questStatusText = state[key] and "Auto Claim active" or "Ready"
 		end
-		for _, changedKey in ipairs({ key, "farmCoins", "growExisting", "growNew", "autoQuests", "autoClaimQuests", "autoEat", "autoDrink" }) do
+		for _, changedKey in ipairs({
+			key, "farmCoins", "growExisting", "growAllSlots", "growNew",
+			"autoQuests", "autoClaimQuests", "autoEat", "autoDrink"
+		}) do
 			if renders[changedKey] then renders[changedKey]() end
 		end
 	end)
@@ -10879,6 +11231,175 @@ local function sectionLabel(parent, text, order)
 	return wrap
 end
 
+
+local function coinFarmAnimalSelector(parent, order)
+	local wrap = Instance.new("Frame")
+	wrap.Size = UDim2.new(1, 0, 0, 40)
+	wrap.LayoutOrder = order or 0
+	wrap.BackgroundTransparency = 1
+	wrap.ClipsDescendants = true
+	wrap.Parent = parent
+
+	local main = Instance.new("TextButton")
+	main.Size = UDim2.new(1, 0, 0, 40)
+	main.BackgroundColor3 = COLOR_CARD
+	main.BorderSizePixel = 0
+	main.AutoButtonColor = false
+	main.Font = FONT_BUTTON
+	main.TextSize = 11
+	main.TextColor3 = COLOR_TEXT
+	main.TextXAlignment = Enum.TextXAlignment.Left
+	main.Parent = wrap
+	corner(main, 999)
+	local mainStroke = stroke(main, Color3.fromRGB(48, 24, 42), 1)
+
+	local mainPadding = Instance.new("UIPadding")
+	mainPadding.PaddingLeft = UDim.new(0, 14)
+	mainPadding.PaddingRight = UDim.new(0, 14)
+	mainPadding.Parent = main
+
+	local options = Instance.new("Frame")
+	options.Position = UDim2.fromOffset(0, 46)
+	options.Size = UDim2.new(1, 0, 0, 0)
+	options.BackgroundTransparency = 1
+	options.Visible = false
+	options.Parent = wrap
+
+	local optionLayout = Instance.new("UIListLayout")
+	optionLayout.Padding = UDim.new(0, 5)
+	optionLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	optionLayout.Parent = options
+
+	local open = false
+
+	local function renderMain()
+		local selected = state.coinFarmPreferredAnimal
+		main.Text = selected
+			and ("AFK Coin Animal:  " .. selected .. "   ▴")
+			or "AFK Coin Animal:  Current (no switch)   ▾"
+
+		if not open and selected then
+			main.Text = "AFK Coin Animal:  " .. selected .. "   ▾"
+		elseif open and not selected then
+			main.Text = "AFK Coin Animal:  Current (no switch)   ▴"
+		end
+
+		mainStroke.Color = selected
+			and COLOR_ACCENT
+			or Color3.fromRGB(48, 24, 42)
+	end
+
+	local function clearOptions()
+		for _, child in ipairs(options:GetChildren()) do
+			if child ~= optionLayout then
+				child:Destroy()
+			end
+		end
+	end
+
+	local function addOption(textValue, animalName, orderIndex)
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.new(1, 0, 0, 32)
+		button.LayoutOrder = orderIndex
+		button.BackgroundColor3 = COLOR_CARD
+		button.BorderSizePixel = 0
+		button.AutoButtonColor = false
+		button.Font = FONT_BODY
+		button.TextSize = 11
+		button.TextColor3 = COLOR_TEXT
+		button.TextXAlignment = Enum.TextXAlignment.Left
+		button.Text = textValue
+		button.Parent = options
+		corner(button, 8)
+		stroke(button, Color3.fromRGB(48, 24, 42), 1)
+
+		local padding = Instance.new("UIPadding")
+		padding.PaddingLeft = UDim.new(0, 12)
+		padding.PaddingRight = UDim.new(0, 12)
+		padding.Parent = button
+
+		button.Activated:Connect(function()
+			state.coinFarmPreferredAnimal = animalName
+			open = false
+			options.Visible = false
+			options.Size = UDim2.new(1, 0, 0, 0)
+			wrap.Size = UDim2.new(1, 0, 0, 40)
+
+			renderMain()
+
+			if state.farmCoins then
+				state.coinFarmRequestPreferredSwitch(
+					"AFK Coin animal changed by player"
+				)
+			else
+				runtimeMessage = animalName
+					and (
+						"AFK Coin preferred animal saved: "
+						.. animalName
+					)
+					or "AFK Coin animal selection cleared; current animal will be kept"
+			end
+		end)
+	end
+
+	local function rebuildOptions()
+		clearOptions()
+
+		local animals = state.coinFarmUniqueAnimals(
+			savedCharacters()
+		)
+
+		addOption(
+			"Current animal (no automatic switch)",
+			nil,
+			1
+		)
+
+		for index, animalName in ipairs(animals) do
+			addOption(
+				animalName,
+				animalName,
+				index + 1
+			)
+		end
+
+		local count = #animals + 1
+		local height = count * 32
+			+ math.max(0, count - 1) * 5
+
+		options.Size = UDim2.new(1, 0, 0, height)
+		wrap.Size = UDim2.new(1, 0, 0, 46 + height)
+	end
+
+	main.Activated:Connect(function()
+		open = not open
+
+		if open then
+			rebuildOptions()
+			options.Visible = true
+		else
+			options.Visible = false
+			options.Size = UDim2.new(1, 0, 0, 0)
+			wrap.Size = UDim2.new(1, 0, 0, 40)
+		end
+
+		renderMain()
+	end)
+
+	main.MouseEnter:Connect(function()
+		main.BackgroundColor3 = COLOR_CARD_ON
+	end)
+
+	main.MouseLeave:Connect(function()
+		main.BackgroundColor3 = COLOR_CARD
+	end)
+
+	renders.coinFarmAnimal = renderMain
+	renderMain()
+
+	return wrap
+end
+
 -- ============================================================
 -- Aba: Survival
 -- ============================================================
@@ -10888,18 +11409,20 @@ toggle(tabContents.Survival, "Auto Drink", "autoDrink", 2)
 toggle(tabContents.Survival, "Escape Terrain Clip", "escapeTerrain", 3)
 sectionLabel(tabContents.Survival, "AUTOMATION", 4)
 toggle(tabContents.Survival, "AFK Coin Farm", "farmCoins", 5)
+coinFarmAnimalSelector(tabContents.Survival, 6)
 
 -- ============================================================
 -- Aba: Growth
 -- ============================================================
 sectionLabel(tabContents.Growth, "GROWTH MODE", 0)
 toggle(tabContents.Growth, "Grow Existing Slots", "growExisting", 1)
-toggle(tabContents.Growth, "Grow New Slots", "growNew", 2)
+toggle(tabContents.Growth, "Grow All Slots", "growAllSlots", 2)
+toggle(tabContents.Growth, "Grow New Slots", "growNew", 3)
 
-sectionLabel(tabContents.Growth, "NEW SLOT GENDER", 3)
+sectionLabel(tabContents.Growth, "NEW SLOT GENDER", 4)
 local genderRow = Instance.new("Frame")
 genderRow.Size = UDim2.new(1, 0, 0, 32)
-genderRow.LayoutOrder = 4
+genderRow.LayoutOrder = 5
 genderRow.BackgroundTransparency = 1
 genderRow.Parent = tabContents.Growth
 local genderLayout = Instance.new("UIListLayout", genderRow)
@@ -10985,7 +11508,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Manual Grow Existing stays on the current animal species. When Auto Quests starts Grow Existing automatically, HUD shows AUTO: ALL ANIMALS and the farm cycles every saved species below 100% before AFK Coins."
+questInfoBody.Text = "Grow Existing stays on the current species; Grow All cycles every saved slot. Before AFK Coins you can preselect one owned animal in Survival. The list shows each species once; with Current selected, Coin Farm keeps whichever animal is active when it starts."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
@@ -11303,12 +11826,20 @@ task.spawn(function()
 		local mode, color
 		if state.autoQuests then
 			mode, color = "Auto Quests", Color3.fromRGB(90, 210, 255)
+		elseif state.growAllSlots then
+			mode, color = "Growing all slots", Color3.fromRGB(80, 200, 120)
 		elseif state.growExisting then
-			mode, color = "Growing existing slots", Color3.fromRGB(80, 200, 120)
+			mode, color = state.growExistingAutomaticAll
+				and "Auto-growing all existing slots"
+				or "Growing existing slots",
+				Color3.fromRGB(80, 200, 120)
 		elseif state.growNew then
 			mode, color = "Growing new slots", Color3.fromRGB(255, 150, 80)
 		elseif state.farmCoins then
-			mode, color = "AFK coin farming", Color3.fromRGB(255, 200, 50)
+			mode, color = state.coinFarmPreferredAnimal
+				and ("AFK coins · " .. state.coinFarmPreferredAnimal)
+				or "AFK coins · current animal",
+				Color3.fromRGB(255, 200, 50)
 		else
 			mode, color = "Idle", Color3.fromRGB(120, 120, 120)
 		end
@@ -11370,6 +11901,7 @@ task.spawn(function()
 
 		local character = player.Character
 		if state.farmCoins
+			and not state.coinFarmSwitching
 			and not DAMAGE.active
 			and not state.questGrowthReset.exclusive then
 			state.autoEat, state.autoDrink = true, true
@@ -11380,6 +11912,33 @@ task.spawn(function()
 			blockClientSubState = false
 		end
 		task.wait(1)
+	end
+end)
+
+
+task.spawn(function()
+	local wasFarmCoins = false
+
+	while state.alive do
+		local active = state.farmCoins == true
+
+		if active and not wasFarmCoins then
+			state.coinFarmRequestPreferredSwitch(
+				"AFK Coin Farm activated"
+			)
+
+		elseif not active and wasFarmCoins then
+			state.coinFarmSwitchPending = false
+			state.coinFarmSwitchReason = nil
+		end
+
+		wasFarmCoins = active
+
+		if active then
+			pcall(state.coinFarmTryPreferredSwitch)
+		end
+
+		task.wait(0.5)
 	end
 end)
 
@@ -11497,6 +12056,7 @@ task.spawn(function()
 				state.farmCoins = false
 				state.growExisting = false
 				state.growExistingAutomaticAll = false
+				state.growAllSlots = false
 				state.growNew = false
 				state.questPostGrowAll = false
 				state.questSeenAny = true
@@ -11509,7 +12069,7 @@ task.spawn(function()
 
 				if renders then
 					for _, key in ipairs({
-						"farmCoins", "growExisting", "growNew",
+						"farmCoins", "growExisting", "growAllSlots", "growNew",
 						"autoQuests", "autoEat", "autoDrink"
 					}) do
 						if renders[key] then renders[key]() end
