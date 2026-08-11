@@ -102,6 +102,8 @@ local state = {
 		busy = false,
 		temp = nil,
 		failedUntil = {},
+		blockedAnimals = {},
+		lastSkippedAnimal = nil,
 	},
 	drinkSearch = {
 		failedAreas = {},
@@ -129,6 +131,14 @@ local state = {
 		difficultySince = nil,
 		lastServerAnalysisAt = 0,
 		pendingPackAnimal = nil,
+
+		-- GroupTime is not allowed to hold the whole quest system forever.
+		-- Once the server has had no real grouping possibility for long enough,
+		-- ignore GroupTime until a NEW possibility actually appears.
+		ignoredUntilPossibility = false,
+		impossibleSince = nil,
+		availabilityAnimal = nil,
+		lastPossibilityAt = 0,
 	},
 	newSlotGender = "Female",
 	busy = false,
@@ -6366,20 +6376,40 @@ function state.questSlots.createForQuest(quest, targetAnimal, records)
 
 	records = records or savedCharacters()
 
+	local previousEntry
+	local currentCharacter = player.Character
+	local currentCharacterName = currentCharacter
+		and currentCharacter:GetAttribute("CharacterName")
+
+	if type(currentCharacterName) == "string" then
+		for _, entry in ipairs(records) do
+			if type(entry) == "table"
+				and entry.CharacterName == currentCharacterName then
+				previousEntry = entry
+				break
+			end
+		end
+	end
+
 	-- Never create a duplicate if replication changed since the previous scan.
 	local existing = state.questSlots.findAnimalSlot(records, targetAnimal)
 	if existing then return false end
 
-	if #records >= (state.questSlots.maxSlots or 40) then
-		questStatusText = "Specific animal needed, but all 40 slots are occupied: " .. targetAnimal
-		runtimeMessage = "Quest slot: no free slot for " .. targetAnimal
+	if #records >= (state.questSlots.maxSlots or 40)
+		and not state.questSlots.hasDeletableTemp(records, targetAnimal) then
+
+		state.questSlots.markBlocked(targetAnimal, "no_free_slot")
+		questStatusText = "Skipping " .. targetAnimal .. ": NO FREE SLOT"
+		runtimeMessage =
+			"Specific-animal quest skipped; checking other quests / Growth / AFK Coins"
 		return false
 	end
 
 	local failedUntil = state.questSlots.failedUntil[targetAnimal:lower()] or 0
 	if tick() < failedUntil then
-		questStatusText = "Waiting before retrying quest slot: " .. targetAnimal
-		return true
+		state.questSlots.markBlocked(targetAnimal, "create_retry")
+		questStatusText = "Skipping " .. targetAnimal .. " until slot-create retry"
+		return false
 	end
 
 	local characterName = state.questSlots.generateQuestName(records)
@@ -6419,10 +6449,19 @@ function state.questSlots.createForQuest(quest, targetAnimal, records)
 		end
 
 		if #refreshedBefore >= (state.questSlots.maxSlots or 40) then
-			questStatusText = "No free slot after final verification: " .. targetAnimal
-			runtimeMessage = "Quest slot creation cancelled: 40/40"
+			state.questSlots.markBlocked(targetAnimal, "no_free_slot")
+			questStatusText = "Skipping " .. targetAnimal .. ": NO FREE SLOT"
+			runtimeMessage =
+				"Quest slot creation cancelled at 40/40; recovering previous slot and moving on"
+
+			if previousEntry then
+				spawnSlot(previousEntry, true)
+			end
+
+			state.autoEat, state.autoDrink = true, true
 			state.questSlots.busy = false
 			questSwitchingAnimal = false
+			state.questForceFastRecheckUntil = tick() + 20
 			return
 		end
 
@@ -6460,11 +6499,21 @@ function state.questSlots.createForQuest(quest, targetAnimal, records)
 			questStatusText = "Created quest slot: " .. targetAnimal
 			spawnSlot(created)
 		else
-			-- If the account does not own the animal, the server should reject
-			-- the Create call. We never mark a temp slot without replication proof.
+			-- If the account does not own the animal, do not leave the player on
+			-- the menu and do not freeze every other quest for 60 seconds.
 			state.questSlots.failedUntil[targetAnimal:lower()] = tick() + 60
-			runtimeMessage = "Quest slot not created/owned or server rejected: " .. targetAnimal
-			questStatusText = "Could not verify/create owned animal slot: " .. targetAnimal
+			state.questSlots.markBlocked(targetAnimal, "create_retry")
+			runtimeMessage =
+				"Quest slot unavailable/rejected; previous slot restored and other quests continue"
+			questStatusText =
+				"Skipping unavailable quest animal for now: " .. targetAnimal
+
+			if previousEntry then
+				spawnSlot(previousEntry, true)
+			end
+
+			state.autoEat, state.autoDrink = true, true
+			state.questForceFastRecheckUntil = tick() + 20
 		end
 
 		state.questSlots.busy = false
@@ -6472,6 +6521,293 @@ function state.questSlots.createForQuest(quest, targetAnimal, records)
 	end)
 
 	return true
+end
+
+
+function state.questSlots.hasDeletableTemp(records, targetAnimal)
+	local temp = state.questSlots.temp
+	if type(temp) ~= "table"
+		or type(temp.characterName) ~= "string"
+		or type(temp.animalName) ~= "string" then
+		return false
+	end
+
+	if type(targetAnimal) == "string"
+		and state.questAnimalKey(temp.animalName)
+			== state.questAnimalKey(targetAnimal) then
+		return false
+	end
+
+	return state.questSlots.findExactSlot(
+		records or {},
+		temp.characterName,
+		temp.animalName
+	) ~= nil
+end
+
+function state.questSlots.markBlocked(targetAnimal, reason)
+	if type(targetAnimal) ~= "string" or targetAnimal == "" then return end
+
+	local key = state.questAnimalKey(targetAnimal)
+	if key == "" then return end
+
+	local previous = state.questSlots.blockedAnimals[key]
+
+	state.questSlots.blockedAnimals[key] = {
+		animalName = targetAnimal,
+		reason = reason or "unavailable",
+		since = previous and previous.since or tick(),
+	}
+
+	state.questSlots.lastSkippedAnimal = targetAnimal
+	state.questForceFastRecheckUntil = tick() + 15
+end
+
+function state.questSlots.clearBlocked(targetAnimal)
+	if type(targetAnimal) ~= "string" then return end
+	local key = state.questAnimalKey(targetAnimal)
+	if key ~= "" then
+		state.questSlots.blockedAnimals[key] = nil
+	end
+end
+
+function state.questSlots.unavailableReason(targetAnimal, records)
+	if type(targetAnimal) ~= "string" or targetAnimal == "" then
+		return nil
+	end
+
+	records = records or savedCharacters()
+
+	-- A slot appeared later: immediately make the quest viable again.
+	if state.questSlots.findAnimalSlot(records, targetAnimal) then
+		state.questSlots.clearBlocked(targetAnimal)
+		state.questSlots.failedUntil[targetAnimal:lower()] = nil
+		return nil
+	end
+
+	local key = state.questAnimalKey(targetAnimal)
+	local maxSlots = state.questSlots.maxSlots or 40
+
+	-- A confirmed script-created temp slot can be deleted to make room, so a
+	-- 40/40 account is NOT considered impossible in that case.
+	local deletableTemp =
+		state.questSlots.hasDeletableTemp(records, targetAnimal)
+
+	if #records >= maxSlots and not deletableTemp then
+		state.questSlots.markBlocked(targetAnimal, "no_free_slot")
+		return "no_free_slot"
+	end
+
+	-- If a slot has been manually deleted later, clear a persistent 40/40
+	-- block and let Auto Quests try the animal again.
+	local blocked = state.questSlots.blockedAnimals[key]
+	if blocked and blocked.reason == "no_free_slot" then
+		state.questSlots.blockedAnimals[key] = nil
+	end
+
+	-- A server rejection / ownership failure should not freeze every other
+	-- quest for a minute. Ignore only THIS animal until its retry cooldown ends.
+	local failedUntil =
+		state.questSlots.failedUntil[targetAnimal:lower()] or 0
+
+	if tick() < failedUntil then
+		state.questSlots.markBlocked(targetAnimal, "create_retry")
+		return "create_retry"
+	end
+
+	if blocked and blocked.reason == "create_retry" then
+		state.questSlots.blockedAnimals[key] = nil
+	end
+
+	return nil
+end
+
+-- ============================================================
+-- GroupTime viability
+-- ============================================================
+function state.questGroup.hasRealPossibility(records, allowAnimalSwitch)
+	local handler = state.questGroup.resolveHandler()
+	if not handler then return false end
+
+	records = records or savedCharacters()
+
+	local animalName = state.questGroup.getPlayerAnimal(player)
+	if type(animalName) ~= "string" or animalName == "" then
+		return false
+	end
+
+	local currentPack = state.questGroup.getCurrentPack(handler)
+	if currentPack
+		and state.questGroup.sameAnimal(currentPack.AnimalName, animalName)
+		and state.questGroup.hasOtherMember(currentPack) then
+		return true
+	end
+
+	-- Somebody of our current species exists: we can invite them or they can
+	-- join our AutoAccept pack.
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player
+			and state.questGroup.sameAnimal(
+				state.questGroup.getPlayerAnimal(other),
+				animalName
+			) then
+			return true
+		end
+	end
+
+	-- Existing AutoAccept packs are also real possibilities. Generic GroupTime
+	-- may switch species only when we already own a usable saved slot.
+	if type(handler.GetData) == "function" then
+		local ok, packs = pcall(handler.GetData)
+
+		if ok and type(packs) == "table" then
+			for _, candidate in pairs(packs) do
+				if type(candidate) == "table"
+					and type(candidate.AnimalName) == "string"
+					and candidate.AnimalName ~= ""
+					and candidate.Owner
+					and not state.questGroup.samePlayer(candidate.Owner, player)
+					and candidate.JoinRequirements == "AutoAccept" then
+
+					if state.questGroup.sameAnimal(
+						candidate.AnimalName,
+						animalName
+					) then
+						return true
+					end
+
+					if allowAnimalSwitch
+						and not (
+							state.questIsFlyingAnimalName(candidate.AnimalName)
+							and (
+								state.questBlockFlying
+								or (state.questPendingLandCount or 0) > 0
+							)
+						)
+						and state.questGroup.findOwnedSlot(
+							records,
+							candidate.AnimalName
+						) then
+						return true
+					end
+				end
+			end
+		end
+	end
+
+	return false
+end
+
+function state.questGroup.refreshAvailability(records, allowAnimalSwitch)
+	local animalName = state.questGroup.getPlayerAnimal(player)
+
+	if state.questGroup.availabilityAnimal ~= animalName then
+		state.questGroup.availabilityAnimal = animalName
+		state.questGroup.impossibleSince = nil
+		state.questGroup.ignoredUntilPossibility = false
+	end
+
+	local possible = state.questGroup.hasRealPossibility(
+		records,
+		allowAnimalSwitch == true
+	)
+
+	if possible then
+		local wasIgnored = state.questGroup.ignoredUntilPossibility
+
+		state.questGroup.impossibleSince = nil
+		state.questGroup.ignoredUntilPossibility = false
+		state.questGroup.lastPossibilityAt = tick()
+
+		if wasIgnored then
+			state.questGroup.difficultySince = tick()
+			state.questGroup.statusText =
+				"Grouping: new server possibility detected; GroupTime resumed"
+			runtimeMessage =
+				"GroupTime resumed: a valid player/pack is now available"
+			state.questForceFastRecheckUntil = tick() + 20
+		end
+
+		return true
+	end
+
+	if not state.questGroup.impossibleSince then
+		state.questGroup.impossibleSince = tick()
+	end
+
+	-- Empty server can be classified quickly. Otherwise give players/packs a
+	-- short grace period before declaring this GroupTime currently impossible.
+	local grace = #Players:GetPlayers() <= 1 and 8 or 25
+
+	if tick() - state.questGroup.impossibleSince >= grace then
+		if not state.questGroup.ignoredUntilPossibility then
+			state.questGroup.ignoredUntilPossibility = true
+			state.questGroup.statusText =
+				"Grouping ignored: no viable player/pack in this server"
+			runtimeMessage =
+				"GroupTime skipped until a new grouping possibility appears"
+			state.questForceFastRecheckUntil = tick() + 20
+		end
+
+		return false
+	end
+
+	state.questGroup.statusText =
+		"Grouping: checking server possibilities before skipping"
+
+	return true
+end
+
+-- ============================================================
+-- One common "can this quest actually be worked on now?" filter.
+-- Ignored quests stay visible/incomplete on Roblox, but they no longer block
+-- Growth Existing Slots -> AFK Coin handoff.
+-- ============================================================
+function state.questIsActionable(quest, records)
+	if type(quest) ~= "table"
+		or type(quest.props) ~= "table"
+		or state.questGroup.questComplete(quest) then
+		return false
+	end
+
+	records = records or savedCharacters()
+
+	local targetAnimal = findSpecificAnimalTarget(quest, records)
+	if targetAnimal then
+		local reason =
+			state.questSlots.unavailableReason(targetAnimal, records)
+
+		if reason then
+			return false, reason, targetAnimal
+		end
+	end
+
+	if quest.props.QuestType == "GroupTime" then
+		local possible = state.questGroup.refreshAvailability(
+			records,
+			true
+		)
+
+		if not possible
+			and state.questGroup.ignoredUntilPossibility then
+			return false, "group_unavailable", nil
+		end
+	end
+
+	return true, nil, targetAnimal
+end
+
+function state.questHasActionablePending(quests, records)
+	records = records or savedCharacters()
+
+	for _, quest in ipairs(quests or {}) do
+		local actionable = state.questIsActionable(quest, records)
+		if actionable then
+			return true
+		end
+	end
+
+	return false
 end
 
 
@@ -7906,12 +8242,26 @@ local function updateQuestAutomation()
 	-- 1) crescer TODOS os slots existentes abaixo de 100%;
 	-- 2) quando não restar nenhum, AFK Coin Farm.
 	local incompleteQuestCount = 0
+	local actionableQuestCount = 0
 	state.questTravelActive = false
-	for _, quest in ipairs(quests) do
-		if not state.questGroup.questComplete(quest) then
-			incompleteQuestCount += 1
-			if isTravelQuestForAutoRun(quest.props) then
-				state.questTravelActive = true
+
+	do
+		local availabilityRecords = savedCharacters()
+
+		for _, quest in ipairs(quests) do
+			if not state.questGroup.questComplete(quest) then
+				incompleteQuestCount += 1
+
+				local actionable =
+					state.questIsActionable(quest, availabilityRecords)
+
+				if actionable then
+					actionableQuestCount += 1
+
+					if isTravelQuestForAutoRun(quest.props) then
+						state.questTravelActive = true
+					end
+				end
 			end
 		end
 	end
@@ -7921,7 +8271,7 @@ local function updateQuestAutomation()
 		growthDebtActive = state.questGrowthResetMaintain(savedCharacters())
 	end
 
-	if incompleteQuestCount == 0 and growthDebtActive then
+	if actionableQuestCount == 0 and growthDebtActive then
 		state.questClearReturnZone()
 		questTargetZoneName = nil
 		questTravelWanted = false
@@ -7934,7 +8284,7 @@ local function updateQuestAutomation()
 		return
 	end
 
-	if #quests == 0 or incompleteQuestCount == 0 then
+	if #quests == 0 or actionableQuestCount == 0 then
 		state.questClearReturnZone()
 		questTargetZoneName = nil
 		questTravelWanted = false
@@ -7966,14 +8316,30 @@ local function updateQuestAutomation()
 			state.questPostGrowAll = true
 			state.growExisting = true
 			state.farmCoins = false
-			questStatusText = "All quests done -> growing incomplete slots"
-			runtimeMessage = "Quests complete: growing all existing slots"
+
+			if incompleteQuestCount > 0 then
+				questStatusText =
+					"Remaining quests unavailable -> Grow Existing Slots"
+				runtimeMessage =
+					"Unworkable quests skipped; growing every existing slot below 100%"
+			else
+				questStatusText = "All quests done -> growing incomplete slots"
+				runtimeMessage = "Quests complete: growing all existing slots"
+			end
 		else
 			state.questPostGrowAll = false
 			state.growExisting = false
 			state.farmCoins = true
-			questStatusText = "All quests + slots complete -> AFK Coin Farm"
-			runtimeMessage = "All quests/slots complete: AFK coin farming"
+
+			if incompleteQuestCount > 0 then
+				questStatusText =
+					"Remaining quests unavailable -> AFK Coin Farm"
+				runtimeMessage =
+					"Unworkable quests skipped; AFK coin farming until a real possibility appears"
+			else
+				questStatusText = "All quests + slots complete -> AFK Coin Farm"
+				runtimeMessage = "All quests/slots complete: AFK coin farming"
+			end
 		end
 
 		state.autoEat, state.autoDrink = true, true
@@ -8432,11 +8798,23 @@ local function updateQuestAutomation()
 	for _, quest in ipairs(quests) do
 		if not state.questGroup.questComplete(quest) then
 			local targetAnimal = findSpecificAnimalTarget(quest, records)
+
 			if targetAnimal then
-				if state.questIsFlyingAnimalName(targetAnimal)
+				local unavailableReason =
+					state.questSlots.unavailableReason(
+						targetAnimal,
+						records
+					)
+
+				if unavailableReason then
+					-- Keep scanning for another specific-animal quest that CAN be
+					-- completed. This quest remains visible but cannot monopolize
+					-- Auto Eat/Drink, Growth, Zone, Travel or Coin handoff.
+					state.questSlots.lastSkippedAnimal = targetAnimal
+
+				elseif state.questIsFlyingAnimalName(targetAnimal)
 					and state.questBlockFlying then
-					-- Keep scanning: a non-flying specific quest later in the list
-					-- can still run together with Land Distance.
+
 					state.questFlyingDeferred = true
 				else
 					specificAnimalFocus = true
@@ -8525,6 +8903,15 @@ local function updateQuestAutomation()
 					questStatusText = "Preparing quest-only slot: " .. focusAnimal
 					return
 				end
+
+				if state.questSlots.unavailableReason(
+					focusAnimal,
+					savedCharacters()
+				) then
+					focusQuest = nil
+					focusAnimal = nil
+					specificAnimalFocus = false
+				end
 			end
 		end
 	end
@@ -8534,12 +8921,29 @@ local function updateQuestAutomation()
 	-- sai/desfaz o pack incompatível e procura/cria outro correto.
 	local groupingQuestActive = false
 	for _, quest in ipairs(quests) do
-		if quest.props.QuestType == "GroupTime" and not state.questGroup.questComplete(quest) then
-			groupingQuestActive = true
-			state.questGroup.ensureForCurrentAnimal(
-				records,
-				not specificAnimalFocus or state.questGrowthOwnsCurrent
-			)
+		if quest.props.QuestType == "GroupTime"
+			and not state.questGroup.questComplete(quest) then
+
+			local groupingPossible =
+				state.questGroup.refreshAvailability(
+					records,
+					not specificAnimalFocus
+						or state.questGrowthOwnsCurrent
+				)
+
+			if groupingPossible then
+				groupingQuestActive = true
+				state.questGroup.ensureForCurrentAnimal(
+					records,
+					not specificAnimalFocus
+						or state.questGrowthOwnsCurrent
+				)
+			elseif state.questGroup.ignoredUntilPossibility then
+				-- Deliberately ignored. Do not let GroupTime own the status or block
+				-- Zone/Travel/Growth/AFK handoff.
+				groupingQuestActive = false
+			end
+
 			break
 		end
 	end
@@ -10500,7 +10904,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Growth always uses existing slots below 100% before any reset; flyers wait until Run quests finish. Elephant/Crocodile/Hippo/Rhino resets are protected and only used for full PlayTime overlap or as a true last resort."
+questInfoBody.Text = "Impossible quests no longer freeze the farm: missing animal at 40/40 is skipped until a slot becomes possible, and GroupTime is ignored when the server has no viable player/pack. Remaining work continues into Grow Existing Slots, then AFK Coins."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
@@ -11003,14 +11407,10 @@ task.spawn(function()
 		-- while we are coin farming, switch back to Auto Quests automatically.
 		if state.farmCoins and not state.autoQuests then
 			local coinQuests = getAllQuests()
-			local hasPending = false
-
-			for _, quest in ipairs(coinQuests) do
-				if not state.questGroup.questComplete(quest) then
-					hasPending = true
-					break
-				end
-			end
+			local hasPending = state.questHasActionablePending(
+				coinQuests,
+				savedCharacters()
+			)
 
 			if hasPending then
 				state.farmCoins = false
@@ -11021,8 +11421,9 @@ task.spawn(function()
 				state.questEmptyScans = 0
 				state.autoQuests = true
 				state.autoEat, state.autoDrink = true, true
-				questStatusText = "Pending quests found -> Auto Quests"
-				runtimeMessage = "AFK Coins: new quests detected; Auto Quests active"
+				questStatusText = "Actionable quest opportunity found -> Auto Quests"
+				runtimeMessage =
+					"AFK Coins: a previously impossible/new quest is now actually workable"
 
 				if renders then
 					for _, key in ipairs({
