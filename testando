@@ -2695,7 +2695,7 @@ local function baboonApproachFood(targetPart, distance)
 
 	return ragdollTeleport(
 		hit.Position,
-		4,
+		1,
 		targetPart.Position
 	)
 end
@@ -2717,10 +2717,16 @@ local function baboonEatLockedTarget(selected)
 	BABOON.targetStartedAt = tick()
 
 	local function cancelled()
+		local liveCharacter = player.Character
+		local liveWater = liveCharacter
+			and (liveCharacter:GetAttribute("Water") or 100)
+			or 100
+
 		return myToken ~= BABOON.cancelToken
 			or state.questGrowthReset.exclusive
 			or not state.autoEat
 			or drinkingToFull
+			or liveWater <= 75
 			or criticalRecoveryActive
 	end
 
@@ -2808,35 +2814,13 @@ local function baboonEatLockedTarget(selected)
 		return
 	end
 
-	-- Do NOT do a second "closer teleport". If the first safe position cannot
-	-- interact, this source is rejected instead of repeatedly TPing on top of it.
-	local promptDeadline = tick() + 2.5
-	local available = detectAvailableFood(character)
-
-	while available ~= "Eat"
-		and tick() < promptDeadline
-		and not cancelled() do
-
-		task.wait(0.20)
-		character, root = characterParts()
-		if not character or not root then break end
-		available = detectAvailableFood(character)
-	end
-
-	if not character or not root or cancelled() then
-		BABOON.busy = false
-		BABOON.clearTarget()
-		return
-	end
-
-	if available ~= "Eat" then
-		baboonIgnoreAntHill(selected.object, 60)
-		BABOON.busy = false
-		BABOON.clearTarget()
-		runtimeMessage = "Baboon: AntHill has no Eat interaction from safe ground; switching source"
-		return
-	end
-
+	-- IMPORTANT:
+	-- AntHill is a special Baboon food source. The generic
+	-- DetectMeatGrassWater helper is not authoritative for it, so do not reject
+	-- a valid AntHill just because that helper does not return "Eat".
+	--
+	-- Start the interaction exactly ONCE. The order matches normal player use:
+	-- press E once, then reinforce the Eating substate once.
 	local startFood = character:GetAttribute("Food") or 0
 	local lastFood = startFood
 	local lastProgressAt = tick()
@@ -2845,9 +2829,16 @@ local function baboonEatLockedTarget(selected)
 	BABOON.lastFood = startFood
 	BABOON.lastProgressAt = lastProgressAt
 
-	-- Start eating ONCE, exactly like the game's normal interaction.
-	setSubState("Eating")
 	baboonTapEatKey()
+	task.wait(0.08)
+
+	if cancelled() then
+		BABOON.busy = false
+		BABOON.clearTarget()
+		return
+	end
+
+	setSubState("Eating")
 
 	runtimeMessage = string.format(
 		"Baboon eating AntHill - Food %d%%",
@@ -2954,6 +2945,11 @@ local function baboonEatLockedTarget(selected)
 	end
 
 	BABOON.busy = false
+
+	if not state.questGrowthReset.exclusive
+		and not drinkingToFull then
+		blockClientSubState = false
+	end
 end
 
 
@@ -2980,6 +2976,15 @@ local function virtualEatKick()
 	end
 
 	if isBaboonCharacter(character) then
+		-- Water has absolute priority for Baboon.
+		if (character:GetAttribute("Water") or 100) <= 75 then
+			state.questBaboonFeeding = false
+			eatingToFull = false
+			BABOON.cancel()
+			eatingStuckSince = nil
+			return
+		end
+
 		-- The dedicated Baboon routine owns AntHill interaction. Never use the
 		-- generic watchdog to spam E or reposition while that routine is active.
 		if BABOON.busy then
@@ -3045,12 +3050,24 @@ local function autoEatStep()
 	if carcassEatBusy or BABOON.busy or GIRAFFE.busy then return end
 
 	local food = character:GetAttribute("Food") or 100
+	local water = character:GetAttribute("Water") or 100
 	local giraffe = isGiraffeCharacter(character)
 	local baboon = not giraffe and isBaboonCharacter(character)
 	local carnivore = not giraffe and not baboon and isCarnivoreCharacter(character)
 	local questCarnivore = state.autoQuests and carnivore and not preSwitchFoodTarget
 	local questBaboon = state.autoQuests and baboon and not preSwitchFoodTarget
 	local questGiraffe = state.autoQuests and giraffe and not preSwitchFoodTarget
+
+	-- Baboon never competes with Auto Drink. If Water needs service, drop all
+	-- Baboon food ownership immediately and let autoDrinkStep take over.
+	if baboon and water <= 75 then
+		state.questBaboonFeeding = false
+		eatingToFull = false
+		BABOON.cancel()
+		eatingStuckSince = nil
+		lastEatWatchdogFood = food
+		return
+	end
 
 	-- Giraffe eats ONLY tree Leaves from workspace.MapAssets.MainAssets.
 	-- During Auto Quests it pauses the route at <=70% and feeds to 100%.
@@ -4507,9 +4524,27 @@ end
 
 local function autoDrinkStep()
 	if state.questGrowthReset.exclusive then return end
-	if not state.autoDrink or state.busy or criticalRecoveryActive then return end
+	if not state.autoDrink or criticalRecoveryActive then return end
+
 	local character, root, humanoid = characterParts()
 	if not character or not root or not humanoid then return end
+
+	local earlyWater = character:GetAttribute("Water") or 100
+
+	-- Baboon food must NEVER block thirst handling. Cancel its logical ownership
+	-- before checking state.busy; if a one-shot AntHill TP is still settling,
+	-- Auto Drink will take over on the next scan instead of restarting food.
+	if isBaboonCharacter(character) and earlyWater <= 75 then
+		state.questBaboonFeeding = false
+		eatingToFull = false
+		eatingSourcePosition = nil
+		activeCarcass = nil
+		BABOON.cancel()
+		eatingStuckSince = nil
+		blockClientSubState = false
+	end
+
+	if state.busy then return end
 
 	if state.drinkPostureWatch(character, root, humanoid) then
 		return
@@ -4550,7 +4585,7 @@ local function autoDrinkStep()
 		CROC.dinoLastTeleportAt = nil
 	end
 
-	local water = character:GetAttribute("Water") or 100
+	local water = earlyWater
 
 	if not state.questSwimActive
 		and tick() < (state.drinkSearch.retryAfter or 0) then
@@ -4615,7 +4650,10 @@ local function autoDrinkStep()
 		state.questGiraffeFeeding = false
 		BABOON.cancel()
 		GIRAFFE.cancel()
-		runtimeMessage = "Indo beber agua"
+		blockClientSubState = false
+		runtimeMessage = isBaboonCharacter(character)
+			and "Baboon: Water <= 75%; drinking has priority"
+			or "Indo beber agua"
 	end
 	if drinkingToFull and water >= (preSwitchWaterTarget or 98) then
 		local wasUnderground = state.drinkSearch.undergroundMode
@@ -10053,7 +10091,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. Baboon locks the nearest Carcass/AntHill and starts AntHill eating with one interaction only. Giraffe skips leaves outside its calculated reach. Growth resets stay isolated."
+questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. Baboon gives Water absolute priority, then locks the nearest Carcass/AntHill; AntHill uses one E press and no repeated teleports. Giraffe skips unreachable leaves."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
