@@ -64,6 +64,12 @@ local state = {
 	questCarnivoreFeeding = false,
 	questBaboonFeeding = false,
 	questGiraffeFeeding = false,
+	questReturnZone = {
+		name = nil,
+		reason = nil,
+		capturedAt = 0,
+		lastTeleportAt = 0,
+	},
 	questPostGrowAll = false,
 	questSeenAny = false,
 	questEmptyScans = 0,
@@ -360,6 +366,47 @@ local function getAnimalClass(character)
 	if type(class) == "string" and class ~= "" then return class end
 	return nil
 end
+
+function state.questCurrentZoneName()
+	local zone = player:GetAttribute("ZoneName")
+	if type(zone) == "string" and zone ~= "" then return zone end
+
+	local value = player:FindFirstChild("ZoneName")
+	if value and value:IsA("StringValue") and value.Value ~= "" then
+		return value.Value
+	end
+
+	local character = player.Character or workspace:FindFirstChild(player.Name)
+	if character then
+		zone = character:GetAttribute("ZoneName")
+		if type(zone) == "string" and zone ~= "" then return zone end
+
+		value = character:FindFirstChild("ZoneName")
+		if value and value:IsA("StringValue") and value.Value ~= "" then
+			return value.Value
+		end
+	end
+end
+
+function state.questRememberZoneBeforeFeeding(reason)
+	if not state.autoQuests or state.questReturnZone.name then return end
+
+	local zone = state.questCurrentZoneName()
+	if type(zone) ~= "string" or zone == "" then return end
+
+	state.questReturnZone.name = zone
+	state.questReturnZone.reason = reason or "feeding"
+	state.questReturnZone.capturedAt = tick()
+	state.questReturnZone.lastTeleportAt = 0
+end
+
+function state.questClearReturnZone()
+	state.questReturnZone.name = nil
+	state.questReturnZone.reason = nil
+	state.questReturnZone.capturedAt = 0
+	state.questReturnZone.lastTeleportAt = 0
+end
+
 
 local function isCarnivoreCharacter(character)
 	if not character then return false end
@@ -3073,6 +3120,7 @@ local function autoEatStep()
 	-- During Auto Quests it pauses the route at <=70% and feeds to 100%.
 	if questGiraffe then
 		if not state.questGiraffeFeeding and food <= 70 then
+			state.questRememberZoneBeforeFeeding("Giraffe feeding")
 			state.questGiraffeFeeding = true
 			eatingToFull = true
 			runtimeMessage = "Giraffe: Food <= 70%; pausing quests to eat tree leaves"
@@ -3101,6 +3149,7 @@ local function autoEatStep()
 	-- source remains locked until it feeds successfully or is proven bad.
 	if questBaboon then
 		if not state.questBaboonFeeding and food <= 70 then
+			state.questRememberZoneBeforeFeeding("Baboon feeding")
 			state.questBaboonFeeding = true
 			eatingToFull = true
 			runtimeMessage = "Baboon: Food <= 70%; pausing quests to feed"
@@ -3130,6 +3179,7 @@ local function autoEatStep()
 	-- Depois que começa, continua procurando/comendo carcaça até 100%.
 	if questCarnivore then
 		if not state.questCarnivoreFeeding and food <= 70 then
+			state.questRememberZoneBeforeFeeding("Carnivore feeding")
 			state.questCarnivoreFeeding = true
 			eatingToFull = true
 			runtimeMessage = "Carnivore: Food <= 70%; pausing quests to eat"
@@ -3199,6 +3249,9 @@ local function autoEatStep()
 		end
 	end
 
+	if not eatingToFull then
+		state.questRememberZoneBeforeFeeding("feeding")
+	end
 	eatingToFull = true
 
 	if lastEatWatchdogFood == nil or food > lastEatWatchdogFood then
@@ -5850,18 +5903,7 @@ local function findZoneInQuest(quest)
 end
 
 local function getPlayerZoneName()
-	local zone = player:GetAttribute("ZoneName")
-	if type(zone) == "string" and zone ~= "" then return zone end
-	local value = player:FindFirstChild("ZoneName")
-	if value and value:IsA("StringValue") and value.Value ~= "" then return value.Value end
-
-	local character = workspace:FindFirstChild(player.Name)
-	if character then
-		zone = character:GetAttribute("ZoneName")
-		if type(zone) == "string" and zone ~= "" then return zone end
-		value = character:FindFirstChild("ZoneName")
-		if value and value:IsA("StringValue") and value.Value ~= "" then return value.Value end
-	end
+	return state.questCurrentZoneName()
 end
 
 local function getZonePosition(zoneName)
@@ -7427,6 +7469,114 @@ local function claimQuestRewards(quests)
 	end
 end
 
+function state.questReturnZoneStillNeeded(quests, zoneName)
+	if type(zoneName) ~= "string" or zoneName == "" then return false end
+
+	for _, quest in ipairs(quests or {}) do
+		if quest.props
+			and quest.props.QuestType == "ZoneTime"
+			and not state.questGroup.questComplete(quest) then
+
+			local targetZone = findZoneInQuest(quest)
+			if type(targetZone) == "string"
+				and targetZone:lower() == zoneName:lower() then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+function state.questReturnToZoneAfterFeeding(quests)
+	local returnZone = state.questReturnZone.name
+	if type(returnZone) ~= "string" or returnZone == "" then
+		return false
+	end
+
+	-- Only return if that exact zone still has an incomplete ZoneTime quest.
+	if not state.questReturnZoneStillNeeded(quests, returnZone) then
+		state.questClearReturnZone()
+		return false
+	end
+
+	-- Feeding/drinking/reset still owns the animal: keep the zone remembered,
+	-- but let the normal survival pause code handle this scan.
+	if state.questGrowthReset.exclusive
+		or state.questGrowthReset.busy
+		or state.questGrowthReset.active
+		or state.busy
+		or questSwitchingAnimal
+		or criticalRecoveryActive
+		or DAMAGE.active
+		or drinkingToFull
+		or eatingToFull
+		or state.questCarnivoreFeeding
+		or state.questBaboonFeeding
+		or state.questGiraffeFeeding
+		or carcassEatBusy
+		or BABOON.busy
+		or GIRAFFE.busy
+		or CROC.approachBusy
+		or forcingPostDrinkTeleport then
+		return false
+	end
+
+	local character, root = characterParts()
+	if not character or not root then return true end
+
+	local food = character:GetAttribute("Food") or 100
+	local water = character:GetAttribute("Water") or 100
+
+	-- Don't return just to leave again for survival.
+	if food <= 68 or water <= 75 then
+		return false
+	end
+
+	local position = getZonePosition(returnZone)
+	if not position then
+		runtimeMessage = "Could not resolve saved quest zone after feeding"
+		state.questClearReturnZone()
+		return false
+	end
+
+	local currentZone = getPlayerZoneName()
+	local physicallyNear = Vector3.new(
+		root.Position.X - position.X,
+		0,
+		root.Position.Z - position.Z
+	).Magnitude <= 150
+
+	local zoneMatches = type(currentZone) == "string"
+		and currentZone:lower() == returnZone:lower()
+
+	if zoneMatches or physicallyNear then
+		state.questClearReturnZone()
+		state.questForceFastRecheckUntil = tick() + 20
+		runtimeMessage = "Returned to " .. returnZone .. " after feeding; quest resumed"
+		return false
+	end
+
+	-- Hard-block other quest movement until the saved ZoneTime location is back.
+	questTravelWanted = false
+	state.questTravelActive = false
+	state.questLandInputActive = false
+	state.questMotionMoving = false
+	state.questMotionMode = nil
+	state.questSetW(false)
+
+	questStatusText = "Returning to " .. returnZone .. " after feeding"
+
+	if tick() - (state.questReturnZone.lastTeleportAt or 0) >= 3 then
+		state.questReturnZone.lastTeleportAt = tick()
+		runtimeMessage = "Feeding complete; returning to quest zone: " .. returnZone
+		ragdollTeleport(position, 6)
+	end
+
+	return true
+end
+
+
 local function updateQuestAutomation()
 	if state.questGrowthReset.exclusive then
 		questTargetZoneName = nil
@@ -7522,6 +7672,7 @@ local function updateQuestAutomation()
 	end
 
 	if incompleteQuestCount == 0 and growthDebtActive then
+		state.questClearReturnZone()
 		questTargetZoneName = nil
 		questTravelWanted = false
 		state.questTravelActive = false
@@ -7534,6 +7685,7 @@ local function updateQuestAutomation()
 	end
 
 	if #quests == 0 or incompleteQuestCount == 0 then
+		state.questClearReturnZone()
 		questTargetZoneName = nil
 		questTravelWanted = false
 		state.questTravelActive = false
@@ -7784,6 +7936,12 @@ local function updateQuestAutomation()
 		state.questSetW(false)
 	end
 
+	-- Feeding may temporarily move any animal away from an active ZoneTime
+	-- mission. Once survival is stable, return there BEFORE other quest routing.
+	if state.questReturnToZoneAfterFeeding(quests) then
+		return
+	end
+
 	-- ========================================================
 	-- Flying animals vs Land Distance
 	-- ========================================================
@@ -7947,6 +8105,7 @@ local function updateQuestAutomation()
 		and food <= 70
 		and not preSwitchFoodTarget then
 
+		state.questRememberZoneBeforeFeeding("Giraffe feeding")
 		state.questGiraffeFeeding = true
 		eatingToFull = true
 		state.questForceFastRecheckUntil = tick() + 10
@@ -7961,6 +8120,7 @@ local function updateQuestAutomation()
 		and food <= 70
 		and not preSwitchFoodTarget then
 
+		state.questRememberZoneBeforeFeeding("Baboon feeding")
 		state.questBaboonFeeding = true
 		eatingToFull = true
 		state.questForceFastRecheckUntil = tick() + 10
@@ -7971,6 +8131,7 @@ local function updateQuestAutomation()
 	end
 
 	if state.autoQuests and carnivore and food <= 70 and not preSwitchFoodTarget then
+		state.questRememberZoneBeforeFeeding("Carnivore feeding")
 		state.questCarnivoreFeeding = true
 		eatingToFull = true
 		state.questForceFastRecheckUntil = tick() + 10
@@ -7981,6 +8142,14 @@ local function updateQuestAutomation()
 	end
 
 	local waterCritical = water <= 45
+
+	if state.autoQuests
+		and not carnivore
+		and not baboon
+		and not giraffe
+		and food <= 68 then
+		state.questRememberZoneBeforeFeeding("feeding")
+	end
 
 	if state.questCarnivoreFeeding
 		or state.questBaboonFeeding
@@ -9937,6 +10106,7 @@ local function toggle(parent, label, key, order)
 			questStatusText = "Scanning Daily + Weekly quests"
 			runtimeMessage = "Auto Quests active"
 		elseif key == "autoQuests" and not state[key] then
+			state.questClearReturnZone()
 			questTravelWanted = false
 			state.questTravelActive = false
 			state.questLandInputActive = false
@@ -10091,7 +10261,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. Baboon gives Water absolute priority, then locks the nearest Carcass/AntHill; AntHill uses one E press and no repeated teleports. Giraffe skips unreachable leaves."
+questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. If any animal leaves an active Zone quest to feed, the farm remembers that zone and returns there before resuming other quest actions. Water still has priority."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
