@@ -2660,11 +2660,44 @@ local function baboonApproachFood(targetPart, distance)
 	)
 
 	if flat.Magnitude < 0.5 then
-		flat = root.CFrame.LookVector * -1
+		flat = Vector3.new(
+			-root.CFrame.LookVector.X,
+			0,
+			-root.CFrame.LookVector.Z
+		)
 	end
 
-	local stand = targetPart.Position + flat.Unit * (distance or 4)
-	return ragdollTeleport(stand, 4, targetPart.Position)
+	if flat.Magnitude < 0.1 then
+		flat = Vector3.new(1, 0, 0)
+	else
+		flat = flat.Unit
+	end
+
+	local desired = targetPart.Position + flat * (distance or 4)
+
+	-- Always land on real Terrain next to the AntHill. The old code preserved
+	-- the AntHill mesh Y, which could put the Baboon on top of/inside the model.
+	local castY = math.max(
+		targetPart.Position.Y + 120,
+		root.Position.Y + 120,
+		250
+	)
+
+	local hit = workspace:Raycast(
+		Vector3.new(desired.X, castY, desired.Z),
+		Vector3.new(0, -500, 0),
+		terrainOnlyRayParams
+	)
+
+	if not hit or hit.Material == Enum.Material.Water then
+		return false
+	end
+
+	return ragdollTeleport(
+		hit.Position,
+		4,
+		targetPart.Position
+	)
 end
 
 local function baboonEatLockedTarget(selected)
@@ -2752,9 +2785,20 @@ local function baboonEatLockedTarget(selected)
 		selected.distance or 0
 	)
 
-	if (root.Position - selected.part.Position).Magnitude > 10 then
-		baboonApproachFood(selected.part, 4)
-		task.wait(0.25)
+	-- ONE positioning action only.
+	-- If already close, do not teleport at all.
+	if (root.Position - selected.part.Position).Magnitude > 9 then
+		local approached = baboonApproachFood(selected.part, 4)
+
+		if not approached then
+			baboonIgnoreAntHill(selected.object, 60)
+			BABOON.busy = false
+			BABOON.clearTarget()
+			runtimeMessage = "Baboon: could not find safe ground beside AntHill"
+			return
+		end
+
+		task.wait(0.35)
 	end
 
 	character, root = characterParts()
@@ -2764,11 +2808,19 @@ local function baboonEatLockedTarget(selected)
 		return
 	end
 
-	-- One closer attempt if Savannah's Eat detector is not in range yet.
-	if detectAvailableFood(character) ~= "Eat" then
-		baboonApproachFood(selected.part, 2)
-		task.wait(0.25)
+	-- Do NOT do a second "closer teleport". If the first safe position cannot
+	-- interact, this source is rejected instead of repeatedly TPing on top of it.
+	local promptDeadline = tick() + 2.5
+	local available = detectAvailableFood(character)
+
+	while available ~= "Eat"
+		and tick() < promptDeadline
+		and not cancelled() do
+
+		task.wait(0.20)
 		character, root = characterParts()
+		if not character or not root then break end
+		available = detectAvailableFood(character)
 	end
 
 	if not character or not root or cancelled() then
@@ -2777,18 +2829,34 @@ local function baboonEatLockedTarget(selected)
 		return
 	end
 
-	local holdPosition = root.Position
+	if available ~= "Eat" then
+		baboonIgnoreAntHill(selected.object, 60)
+		BABOON.busy = false
+		BABOON.clearTarget()
+		runtimeMessage = "Baboon: AntHill has no Eat interaction from safe ground; switching source"
+		return
+	end
+
 	local startFood = character:GetAttribute("Food") or 0
 	local lastFood = startFood
 	local lastProgressAt = tick()
-	local startedAt = tick()
 	local foodEverRose = false
-	local nextEatPulseAt = 0
 
 	BABOON.lastFood = startFood
 	BABOON.lastProgressAt = lastProgressAt
 
-	while state.alive and tick() - startedAt < 24 do
+	-- Start eating ONCE, exactly like the game's normal interaction.
+	setSubState("Eating")
+	baboonTapEatKey()
+
+	runtimeMessage = string.format(
+		"Baboon eating AntHill - Food %d%%",
+		math.floor(startFood)
+	)
+
+	-- From this point onward there are NO more E presses and NO teleports.
+	-- We only observe Food and the safety state.
+	while state.alive do
 		if cancelled() then break end
 		if not selected.object.Parent or not selected.part.Parent then break end
 
@@ -2798,7 +2866,6 @@ local function baboonEatLockedTarget(selected)
 		local humanoid = character:FindFirstChildOfClass("Humanoid")
 		if not humanoid or humanoid.Health <= 0 then break end
 
-		-- Never let an AntHill feeding attempt drag the Baboon into water.
 		if humanoid:GetState() == Enum.HumanoidStateType.Swimming
 			or isPositionUnderwater(root.Position) then
 
@@ -2824,61 +2891,39 @@ local function baboonEatLockedTarget(selected)
 			foodEverRose = true
 			BABOON.lastFood = currentFood
 			BABOON.lastProgressAt = lastProgressAt
-		end
 
-		-- If THIS locked AntHill does not feed us, fail it before looking at a
-		-- different source. This is the anti-oscillation rule.
-		if tick() - lastProgressAt >= 7 then
-			baboonIgnoreAntHill(selected.object, 90)
-			runtimeMessage = "Baboon: AntHill gave no Food progress for 7s; switching source"
-			break
-		end
-
-		-- Hold the same interaction position instead of chasing another target.
-		root.AssemblyLinearVelocity = Vector3.new(
-			0,
-			root.AssemblyLinearVelocity.Y,
-			0
-		)
-
-		if (root.Position - holdPosition).Magnitude > 5 then
-			root.CFrame = CFrame.lookAt(
-				holdPosition,
-				Vector3.new(
-					selected.part.Position.X,
-					holdPosition.Y,
-					selected.part.Position.Z
-				),
-				Vector3.yAxis
+			runtimeMessage = string.format(
+				"Baboon eating AntHill - Food %d%%",
+				math.floor(currentFood)
 			)
 		end
 
-		if RAGDOLL_STATES[humanoid:GetState()] then
-			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		-- If the Baboon gets displaced away from the AntHill, do NOT teleport
+		-- it back on top. End this attempt cleanly and reacquire later.
+		if (root.Position - selected.part.Position).Magnitude > 13 then
+			runtimeMessage = "Baboon moved away from AntHill; ending feed attempt without teleporting"
+			break
 		end
 
-		setSubState("Eating")
-
-		if tick() >= nextEatPulseAt then
-			nextEatPulseAt = tick() + 0.65
-			baboonTapEatKey()
+		-- One E press should start the entire feeding session. If Food never
+		-- moves, this AntHill is simply not usable from this position.
+		if tick() - lastProgressAt >= 7 then
+			baboonIgnoreAntHill(selected.object, 90)
+			runtimeMessage = foodEverRose
+				and "Baboon: AntHill stopped giving Food for 7s; switching source"
+				or "Baboon: AntHill gave no Food after one Eat press; switching source"
+			break
 		end
-
-		runtimeMessage = string.format(
-			"Baboon eating AntHill - Food %d%%",
-			math.floor(currentFood)
-		)
 
 		task.wait(0.20)
 	end
 
 	character, root = characterParts()
-	if root then
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
-	end
 
-	local foodAfter = character and (character:GetAttribute("Food") or 0) or 0
+	local foodAfter = character
+		and (character:GetAttribute("Food") or 0)
+		or 0
+
 	local targetFood = (
 		state.autoQuests
 		and state.questBaboonFeeding
@@ -2888,6 +2933,7 @@ local function baboonEatLockedTarget(selected)
 	if foodAfter >= targetFood then
 		runtimeMessage = "Baboon finished feeding from AntHill"
 		BABOON.clearTarget()
+
 	elseif not selected.object.Parent
 		or baboonAntHillIsIgnored(selected.object)
 		or not foodEverRose then
@@ -2895,10 +2941,13 @@ local function baboonEatLockedTarget(selected)
 		if not foodEverRose and selected.object.Parent then
 			baboonIgnoreAntHill(selected.object, 90)
 		end
+
 		BABOON.clearTarget()
+
 	else
-		-- Food rose, so the source is valid. Keep it locked for the next pass
-		-- instead of re-comparing it with nearby carcasses.
+		-- It was a valid source and Food increased. Keep the same AntHill locked
+		-- if the attempt ended for an external reason; do not compare distances
+		-- again and do not teleport while already eating.
 		BABOON.targetKind = "AntHill"
 		BABOON.targetObject = selected.object
 		BABOON.targetPart = selected.part
@@ -2931,14 +2980,19 @@ local function virtualEatKick()
 	end
 
 	if isBaboonCharacter(character) then
-		if BABOON.busy then return end
+		-- The dedicated Baboon routine owns AntHill interaction. Never use the
+		-- generic watchdog to spam E or reposition while that routine is active.
+		if BABOON.busy then
+			eatingStuckSince = nil
+			return
+		end
 
 		local selected = chooseBaboonFood(root)
 		if selected then
-			runtimeMessage = "Baboon: Eat stalled; retrying locked food source"
+			runtimeMessage = "Baboon: feed attempt ended; reacquiring locked food source"
 			task.spawn(baboonEatLockedTarget, selected)
 		else
-			runtimeMessage = "Baboon: Eat stalled; no carcass or AntHill available"
+			runtimeMessage = "Baboon: no carcass or AntHill available"
 		end
 
 		eatingStuckSince = nil
@@ -9999,7 +10053,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. Baboon locks the nearest Carcass/AntHill. Giraffe calculates its current body reach and skips tree leaves that are too high to eat. Growth resets stay isolated."
+questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. Baboon locks the nearest Carcass/AntHill and starts AntHill eating with one interaction only. Giraffe skips leaves outside its calculated reach. Growth resets stay isolated."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
