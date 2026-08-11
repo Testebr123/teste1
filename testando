@@ -77,6 +77,7 @@ local state = {
 	questPendingLandCount = 0,
 	questFlyingDeferred = false,
 	questBlockFlying = false,
+	questGrowthOwnsCurrent = false,
 	questExpectedSlot = nil,
 	questZoneLastTeleportAt = 0,
 	questZoneLastTarget = nil,
@@ -7190,6 +7191,296 @@ function state.questHasIncompleteGrowth(quests)
 	return false
 end
 
+function state.questGrowthIsProtectedAnimal(animalName)
+	local key = state.questAnimalKey(animalName)
+
+	if key == "elephant"
+		or key == "crocodile"
+		or key == "croc"
+		or key == "hippo"
+		or key == "hippopotamus"
+		or key == "rhino"
+		or key == "rhinoceros" then
+		return true
+	end
+
+	-- Covers variants such as WhiteRhino / BlackRhino without making unrelated
+	-- animals protected.
+	return key:find("rhino", 1, true) ~= nil
+end
+
+function state.questGrowthSlotAllowed(entry)
+	if type(entry) ~= "table" or type(entry.AnimalName) ~= "string" then
+		return false
+	end
+
+	-- Latest rule: flyers may participate in Growth, but only after every
+	-- terrestrial running quest is finished.
+	if state.questIsFlyingAnimalName(entry.AnimalName)
+		and (state.questBlockFlying or (state.questPendingLandCount or 0) > 0) then
+		return false
+	end
+
+	return true
+end
+
+function state.questGrowthFindIncompleteSlot(records, currentName, focusAnimal)
+	records = records or {}
+
+	local function usable(entry)
+		return type(entry) == "table"
+			and not isGrowthComplete(entry.GrowthPercentage)
+			and state.questGrowthSlotAllowed(entry)
+	end
+
+	-- 1) Never abandon the current slot if it is already growing and is allowed
+	--    by the terrestrial/flying rule.
+	for _, entry in ipairs(records) do
+		if usable(entry)
+			and type(currentName) == "string"
+			and entry.CharacterName == currentName then
+			return entry, "current"
+		end
+	end
+
+	-- 2) Among pre-existing growing slots, prefer the species that also satisfies
+	--    the currently required specific-animal quest.
+	if type(focusAnimal) == "string" then
+		local wanted = state.questAnimalKey(focusAnimal)
+		for _, entry in ipairs(records) do
+			if usable(entry)
+				and state.questAnimalKey(entry.AnimalName) == wanted then
+				return entry, "specific"
+			end
+		end
+	end
+
+	-- 3) Prefer grounded growing slots before flyers. Flyers only reach the
+	--    second pass after all terrestrial Run quests are complete.
+	for _, entry in ipairs(records) do
+		if usable(entry)
+			and not state.questIsFlyingAnimalName(entry.AnimalName) then
+			return entry, "grounded"
+		end
+	end
+
+	for _, entry in ipairs(records) do
+		if usable(entry) then
+			return entry, "flying"
+		end
+	end
+
+	return nil, nil
+end
+
+function state.questGrowthRemainingTime(quests)
+	local longestRemaining
+	local foundGrowth = false
+
+	for _, quest in ipairs(quests or {}) do
+		if state.questGrowthQuestIncomplete(quest) then
+			foundGrowth = true
+			local current, maximum = state.questProgressValues(quest)
+
+			if type(current) == "number"
+				and type(maximum) == "number"
+				and maximum > 0 then
+
+				local remaining = math.max(maximum - current, 0)
+				longestRemaining = math.max(longestRemaining or 0, remaining)
+			end
+		end
+	end
+
+	return longestRemaining, foundGrowth
+end
+
+function state.questSpecificPlayRemainingTime(quests, records, animalName)
+	if type(animalName) ~= "string" then
+		return nil, false
+	end
+
+	local wanted = state.questAnimalKey(animalName)
+	local longestRemaining
+	local foundSpecific = false
+
+	for _, quest in ipairs(quests or {}) do
+		local props = quest.props
+		local data = props and props.QuestData
+
+		if props
+			and props.QuestType == "PlayTime"
+			and data
+			and data.ShouldBeSpawnedAsAnimal == true
+			and data.ShouldBeSpawnedAsSpecificAnimalName
+			and not state.questGroup.questComplete(quest) then
+
+			local target = findSpecificAnimalTarget(quest, records)
+			if type(target) == "string"
+				and state.questAnimalKey(target) == wanted then
+
+				foundSpecific = true
+				local current, maximum = state.questProgressValues(quest)
+
+				if type(current) == "number"
+					and type(maximum) == "number"
+					and maximum > 0 then
+
+					local remaining = math.max(maximum - current, 0)
+					longestRemaining = math.max(
+						longestRemaining or 0,
+						remaining
+					)
+				end
+			end
+		end
+	end
+
+	return longestRemaining, foundSpecific
+end
+
+function state.questGrowthChooseResetSlot(
+	quests,
+	records,
+	currentEntry,
+	focusAnimal
+)
+	records = records or {}
+
+	local normal = {}
+	local protected = {}
+
+	for _, entry in ipairs(records) do
+		if type(entry) == "table"
+			and isGrowthComplete(entry.GrowthPercentage)
+			and state.questGrowthSlotAllowed(entry) then
+
+			if state.questGrowthIsProtectedAnimal(entry.AnimalName) then
+				protected[#protected + 1] = entry
+			else
+				normal[#normal + 1] = entry
+			end
+		end
+	end
+
+	local function sameAnimal(entry, animalName)
+		return entry
+			and type(animalName) == "string"
+			and state.questAnimalKey(entry.AnimalName)
+				== state.questAnimalKey(animalName)
+	end
+
+	local function preferFrom(list)
+		if type(focusAnimal) == "string" then
+			for _, entry in ipairs(list) do
+				if sameAnimal(entry, focusAnimal) then
+					return entry
+				end
+			end
+		end
+
+		if currentEntry then
+			for _, entry in ipairs(list) do
+				if entry.CharacterName == currentEntry.CharacterName then
+					return entry
+				end
+			end
+		end
+
+		-- Even after Run quests finish, keep a grounded mature animal ahead of a
+		-- flyer when both are equally valid reset choices.
+		for _, entry in ipairs(list) do
+			if not state.questIsFlyingAnimalName(entry.AnimalName) then
+				return entry
+			end
+		end
+
+		return list[1]
+	end
+
+	local normalChoice = preferFrom(normal)
+	local growthRemaining = state.questGrowthRemainingTime(quests)
+
+	-- Protected exception #1:
+	-- If that exact expensive species MUST still be played, only prefer
+	-- resetting it over a normal alternative when the mandatory PlayTime
+	-- remaining is at least the remaining GrowTime. Then the expensive growth
+	-- happens "for free" underneath time we already had to spend as that animal.
+	local bestCoveredProtected
+	local bestCoveredPlay = -1
+
+	if type(growthRemaining) == "number" and growthRemaining > 0 then
+		for _, entry in ipairs(protected) do
+			local playRemaining, hasSpecific =
+				state.questSpecificPlayRemainingTime(
+					quests,
+					records,
+					entry.AnimalName
+				)
+
+			if hasSpecific
+				and type(playRemaining) == "number"
+				and playRemaining >= growthRemaining
+				and playRemaining > bestCoveredPlay then
+
+				bestCoveredProtected = entry
+				bestCoveredPlay = playRemaining
+			end
+		end
+	end
+
+	if bestCoveredProtected then
+		return bestCoveredProtected, "protected_play_covers_growth",
+			growthRemaining, bestCoveredPlay
+	end
+
+	-- Normal mature animals always win if there is a viable one.
+	if normalChoice then
+		return normalChoice, "normal_reset", growthRemaining, nil
+	end
+
+	-- Protected exception #2:
+	-- No mature non-protected animal exists. We are now genuinely out of safer
+	-- reset choices, so a protected animal is allowed as LAST RESORT.
+	if #protected > 0 then
+		local bestProtected
+		local bestPlay = -1
+
+		-- If one of the protected species also has mandatory PlayTime remaining,
+		-- choose the one that gives the most overlap.
+		for _, entry in ipairs(protected) do
+			local playRemaining, hasSpecific =
+				state.questSpecificPlayRemainingTime(
+					quests,
+					records,
+					entry.AnimalName
+				)
+
+			if hasSpecific then
+				local score = type(playRemaining) == "number"
+					and playRemaining
+					or 0
+
+				if score > bestPlay then
+					bestPlay = score
+					bestProtected = entry
+				end
+			end
+		end
+
+		if not bestProtected then
+			bestProtected = preferFrom(protected)
+		end
+
+		return bestProtected, "protected_last_resort",
+			growthRemaining,
+			bestPlay >= 0 and bestPlay or nil
+	end
+
+	return nil, "no_reset_candidate", growthRemaining, nil
+end
+
+
 function state.questFindGroundedGrowthSlot(records, excludedName)
 	records = records or {}
 
@@ -7240,10 +7531,15 @@ function state.questFindGroundedGrowthSlot(records, excludedName)
 	return nil
 end
 
-local function trySwitchToGrowingSlot(quests, records, specificAnimalFocus)
-	local hasGrowthQuest = state.questHasIncompleteGrowth(quests)
+local function trySwitchToGrowingSlot(
+	quests,
+	records,
+	specificAnimalFocus,
+	focusAnimal
+)
+	state.questGrowthOwnsCurrent = false
 
-	if not hasGrowthQuest then
+	if not state.questHasIncompleteGrowth(quests) then
 		state.questGrowthResetMaintain(records)
 		return false
 	end
@@ -7252,23 +7548,23 @@ local function trySwitchToGrowingSlot(quests, records, specificAnimalFocus)
 		return false
 	end
 
-	-- A slot deliberately reset by us owns the Growth quest until it reaches 100.
-	-- Compatible Zone/Travel/Group/Survive quests still run on the same animal.
+	records = records or savedCharacters()
+
+	-- A slot deliberately reset by us becomes an existing <100% slot. Keep it
+	-- until 100%; never abandon that debt for another mature reset.
 	if state.questGrowthResetMaintain(records) then
+		state.questGrowthOwnsCurrent = true
+		questStatusText = "Growth: finishing previously reset slot before any new reset"
 		return false
 	end
 
 	local character = player.Character
 	if not character then return false end
 
-	records = records or savedCharacters()
-
 	local currentName = character:GetAttribute("CharacterName")
 	local currentAnimal = character:GetAttribute("AnimalName")
 	local currentEntry = state.questFindCurrentSavedEntry(records, character)
 
-	-- Never guess a different mature slot while the just-spawned character
-	-- identity is still replicating. Run/Zone can continue in the meantime.
 	if not currentEntry and state.questExpectedSlot then
 		local requestedAt = state.questExpectedSlot.requestedAt or 0
 		if requestedAt > 0 and tick() - requestedAt <= 8 then
@@ -7278,115 +7574,37 @@ local function trySwitchToGrowingSlot(quests, records, specificAnimalFocus)
 		state.questExpectedSlot = nil
 	end
 
-	-- SavedCharacters is the authoritative Growth source for reset decisions.
-	-- Character GrowthPercentage can be absent/stale right after a switch.
-	local currentGrowth = currentEntry and currentEntry.GrowthPercentage
-	if currentGrowth == nil then
-		currentGrowth = character:GetAttribute("GrowthPercentage")
-	end
-
-	-- Already growing: PERFECT. Do not switch/reset; let every compatible
-	-- mission progress on this animal.
-	if currentGrowth ~= nil and not isGrowthComplete(currentGrowth) then
-		questStatusText = "Growth active together with compatible quests"
-		return false
-	end
-
-	if tick() - questLastAnimalSwitch < 2.5 then
-		-- Give SavedCharacters a moment to update after spawn, but do not wait
-		-- the old 6 seconds before noticing a mature slot.
-		return false
-	end
-
-	local targetSlot
-
 	-- ========================================================
-	-- Specific animal + Growth
+	-- RULE #1: EXISTING <100% SLOTS FIRST. NO RESET BEFORE THIS.
 	-- ========================================================
-	if specificAnimalFocus and type(currentAnimal) == "string" then
-		-- First choice: another slot of the SAME required species already <100%.
-		for _, entry in ipairs(records) do
-			if type(entry) == "table"
-				and entry.CharacterName ~= currentName
-				and type(entry.AnimalName) == "string"
-				and state.questAnimalKey(entry.AnimalName) == state.questAnimalKey(currentAnimal)
-				and not isGrowthComplete(entry.GrowthPercentage) then
+	local incompleteSlot, incompleteReason =
+		state.questGrowthFindIncompleteSlot(
+			records,
+			currentName,
+			focusAnimal
+		)
 
-				targetSlot = entry
-				break
-			end
+	if incompleteSlot then
+		local sameCurrent = type(currentName) == "string"
+			and incompleteSlot.CharacterName == currentName
+
+		if sameCurrent then
+			state.questGrowthOwnsCurrent = true
+			questStatusText = state.questIsFlyingAnimalName(
+				incompleteSlot.AnimalName
+			)
+				and "Growth: existing flying slot <100% (Run quests already complete)"
+				or "Growth: existing slot <100% has absolute priority"
+
+			runtimeMessage = "Growth reset denied: continuing an existing slot below 100%"
+			return false
 		end
 
-		if targetSlot then
-			questLastAnimalSwitch = tick()
-			questSwitchingAnimal = true
-			questTravelWanted = false
-			state.questTravelActive = false
-			state.questLandInputActive = false
-			state.questSetW(false)
-			state.questMotionMoving = false
-			state.questMotionMode = nil
-
-			runtimeMessage = "Specific + Growth: switching to growing " .. tostring(targetSlot.AnimalName)
-
-			task.spawn(function()
-				if ResetRemote then
-					pcall(ResetRemote.InvokeServer, ResetRemote)
-					task.wait(1.15)
-				end
-
-				local spawned = spawnSlot(targetSlot, true)
-				questSwitchingAnimal = false
-
-				if spawned then
-					state.questForceFastRecheckUntil = tick() + 25
-					questStatusText = "Specific + Growth active together"
-					runtimeMessage = "Required species is growing; compatible quests resumed"
-				end
-			end)
-			return true
+		if tick() - questLastAnimalSwitch < 2.5 then
+			questStatusText = "Growth: existing <100% slot queued before any reset"
+			return false
 		end
 
-		-- CRITICAL FIX:
-		-- No same-species growing slot exists. If CURRENT required animal is
-		-- mature, reset CURRENT immediately even if some unrelated slot is <100.
-		-- The unrelated slot must NEVER steal priority from a stackable specific
-		-- animal + Growth combination.
-		if currentEntry and isGrowthComplete(currentEntry.GrowthPercentage) then
-			state.questGrowthReset.pendingResetName = nil
-			questStatusText = "Specific + Growth: current required animal is 100%; resetting it"
-			runtimeMessage = "Resetting current required species so both quests progress together"
-			return state.questGrowthResetCurrent(currentEntry)
-		end
-
-		-- Current saved entry can briefly be missing after spawn. Find the mature
-		-- saved slot of the current required species and reset that instead.
-		for _, entry in ipairs(records) do
-			if type(entry) == "table"
-				and type(entry.AnimalName) == "string"
-				and state.questAnimalKey(entry.AnimalName) == state.questAnimalKey(currentAnimal)
-				and isGrowthComplete(entry.GrowthPercentage) then
-
-				state.questGrowthReset.pendingResetName = nil
-				questStatusText = "Specific + Growth: resetting required species before continuing"
-				runtimeMessage = "Required species is mature; clearing Growth before continuing"
-				return state.questGrowthResetCurrent(entry)
-			end
-		end
-
-		questStatusText = "Growth pending: waiting for required species slot replication"
-		return false
-	end
-
-	-- ========================================================
-	-- Generic Growth + whatever current compatible missions exist
-	-- ========================================================
-
-	-- Prefer another grounded slot that is already below 100%.
-	targetSlot = state.questFindGroundedGrowthSlot(records, currentName)
-
-	-- questFindGroundedGrowthSlot can return a mature slot as fallback.
-	if targetSlot and not isGrowthComplete(targetSlot.GrowthPercentage) then
 		questLastAnimalSwitch = tick()
 		questSwitchingAnimal = true
 		questTravelWanted = false
@@ -7396,7 +7614,13 @@ local function trySwitchToGrowingSlot(quests, records, specificAnimalFocus)
 		state.questMotionMoving = false
 		state.questMotionMode = nil
 
-		runtimeMessage = "Growth: switching to incomplete grounded " .. tostring(targetSlot.AnimalName)
+		questStatusText = "Growth priority: existing <100% -> "
+			.. tostring(incompleteSlot.AnimalName)
+
+		runtimeMessage = string.format(
+			"Using existing growing slot (%s); mature reset blocked",
+			tostring(incompleteReason or "available")
+		)
 
 		task.spawn(function()
 			if ResetRemote then
@@ -7404,51 +7628,77 @@ local function trySwitchToGrowingSlot(quests, records, specificAnimalFocus)
 				task.wait(1.15)
 			end
 
-			local spawned = spawnSlot(targetSlot, true)
+			local spawned = spawnSlot(incompleteSlot, true)
 			questSwitchingAnimal = false
 
 			if spawned then
+				state.questGrowthOwnsCurrent = true
 				state.questForceFastRecheckUntil = tick() + 25
-				questStatusText = "Growth + compatible quests active"
-				runtimeMessage = "Growing grounded slot ready; route/group/zone resumed"
+				runtimeMessage = "Existing <100% Growth slot active; compatible quests resumed"
 			end
 		end)
+
 		return true
 	end
 
-	-- If current animal is grounded and mature, resetting CURRENT is normally
-	-- optimal: no unnecessary species switch and Land/Zone/Group can resume on
-	-- exactly the same animal after the verified 0% reset.
-	if currentEntry
-		and type(currentAnimal) == "string"
-		and not state.questIsFlyingAnimalName(currentAnimal)
-		and isGrowthComplete(currentEntry.GrowthPercentage) then
-
-		state.questGrowthReset.pendingResetName = nil
-		questStatusText = "Growth: current compatible animal is 100%; resetting it"
-		runtimeMessage = "Keeping same animal and resetting Growth to stack missions"
-		return state.questGrowthResetCurrent(currentEntry)
+	-- There is now NO eligible existing slot below 100%.
+	-- Only at this point is a reset legal.
+	if tick() - questLastAnimalSwitch < 2.5 then
+		return false
 	end
 
-	-- Current animal may be a flyer or current saved entry may be unavailable.
-	-- Pick a grounded mature slot and reset it BEFORE spawn.
-	if targetSlot and isGrowthComplete(targetSlot.GrowthPercentage) then
-		state.questGrowthReset.pendingResetName = nil
-		questStatusText = "Growth: resetting grounded slot -> " .. tostring(targetSlot.AnimalName)
-		runtimeMessage = "No grounded growing slot; resetting chosen grounded animal before spawn"
-		return state.questGrowthResetCurrent(targetSlot)
+	local resetSlot, resetReason, growthRemaining, playRemaining =
+		state.questGrowthChooseResetSlot(
+			quests,
+			records,
+			currentEntry,
+			specificAnimalFocus and focusAnimal or nil
+		)
+
+	if not resetSlot then
+		questStatusText = state.questBlockFlying
+			and "Growth pending: no grounded <100% or safe reset slot; flyers wait for Run"
+			or "Growth pending: no saved slot available for growth/reset"
+		return false
 	end
 
-	local groundedMature = state.questFindGroundedSlot(records, currentName, false)
-	if groundedMature and isGrowthComplete(groundedMature.GrowthPercentage) then
-		state.questGrowthReset.pendingResetName = nil
-		questStatusText = "Growth: fallback grounded reset -> " .. tostring(groundedMature.AnimalName)
-		runtimeMessage = "Growth fallback: clearing grounded slot before spawn"
-		return state.questGrowthResetCurrent(groundedMature)
+	state.questGrowthReset.pendingResetName = nil
+
+	if resetReason == "protected_play_covers_growth" then
+		questStatusText = string.format(
+			"Growth protected exception: %s PlayTime covers GrowTime",
+			tostring(resetSlot.AnimalName)
+		)
+
+		runtimeMessage = string.format(
+			"Protected reset approved: %s play %.0f >= growth %.0f",
+			tostring(resetSlot.AnimalName),
+			tonumber(playRemaining) or 0,
+			tonumber(growthRemaining) or 0
+		)
+
+	elseif resetReason == "protected_last_resort" then
+		questStatusText = "Growth last resort: no normal mature reset candidate -> "
+			.. tostring(resetSlot.AnimalName)
+
+		if type(playRemaining) == "number" and playRemaining > 0 then
+			runtimeMessage = string.format(
+				"Protected last-resort reset: %s; required PlayTime overlap %.0f",
+				tostring(resetSlot.AnimalName),
+				playRemaining
+			)
+		else
+			runtimeMessage = "Protected last-resort reset: no non-protected mature slot exists"
+		end
+
+	else
+		questStatusText = "Growth: no existing <100%; safe reset -> "
+			.. tostring(resetSlot.AnimalName)
+
+		runtimeMessage = "Growth reset allowed only after every eligible existing <100% slot was exhausted"
 	end
 
-	questStatusText = "Growth pending: no compatible saved slot available yet"
-	return false
+	return state.questGrowthResetCurrent(resetSlot)
 end
 
 local function claimQuestRewards(quests)
@@ -7972,38 +8222,31 @@ local function updateQuestAutomation()
 				and landCharacter:GetAttribute("CharacterName")
 			local growthPending = state.questHasIncompleteGrowth(quests)
 
-			local grounded = growthPending
-				and state.questFindGroundedGrowthSlot(landRecords, currentName)
-				or state.questFindGroundedSlot(
+			local grounded
+
+			if growthPending then
+				-- Only an ALREADY-growing grounded slot may be selected here.
+				-- Mature reset decisions are centralized later so protected species
+				-- and global <100%-first rules cannot be bypassed.
+				for _, entry in ipairs(landRecords) do
+					if type(entry) == "table"
+						and entry.CharacterName ~= currentName
+						and type(entry.AnimalName) == "string"
+						and not state.questIsFlyingAnimalName(entry.AnimalName)
+						and not isGrowthComplete(entry.GrowthPercentage) then
+						grounded = entry
+						break
+					end
+				end
+			else
+				grounded = state.questFindGroundedSlot(
 					landRecords,
 					currentName,
 					true
 				)
+			end
 
 			if grounded then
-				local groundedIsGrowing = not isGrowthComplete(grounded.GrowthPercentage)
-
-				-- BEST CASE: there is a running mission + Growth, but every useful
-				-- grounded slot is mature. Do not spawn it at 100% and waste time:
-				-- reset that SAVED slot first, verify 0%, then spawn it.
-				if growthPending and not groundedIsGrowing then
-					questStatusText = string.format(
-						"Land + Growth: resetting %s before run",
-						tostring(grounded.AnimalName)
-					)
-					runtimeMessage = "Combining Land Distance + Growth on the same grounded animal"
-					state.questGrowthReset.pendingResetName = nil
-
-					if state.questGrowthResetCurrent(grounded) then
-						return
-					end
-
-					-- Reset is cooling down/failed. Do NOT spawn a known 100% slot
-					-- and waste Growth; wait for the next safe reset attempt.
-					questStatusText = "Land + Growth: reset retry pending; mature slot not selected"
-					return
-				end
-
 				questLastAnimalSwitch = tick()
 				questSwitchingAnimal = true
 				questTravelWanted = false
@@ -8011,16 +8254,19 @@ local function updateQuestAutomation()
 				state.questLandInputActive = false
 				state.questSetW(false)
 
-				questStatusText = string.format(
-					growthPending
-						and "Land + Growth (%d run pending) -> %s"
-						or "Land Distance first (%d pending) -> %s",
-					state.questPendingLandCount,
-					tostring(grounded.AnimalName)
-				)
+				if growthPending then
+					questStatusText = "Land + Growth: existing <100% grounded -> "
+						.. tostring(grounded.AnimalName)
+				else
+					questStatusText = string.format(
+						"Land Distance first (%d pending) -> %s",
+						state.questPendingLandCount,
+						tostring(grounded.AnimalName)
+					)
+				end
 
 				runtimeMessage = growthPending
-					and "Ground growing animal selected; Run + Growth will progress together"
+					and "Existing grounded Growth slot selected; no reset performed"
 					or "Flying animal blocked until Land Distance quests finish"
 
 				task.spawn(function()
@@ -8035,12 +8281,14 @@ local function updateQuestAutomation()
 					if spawned then
 						state.questForceFastRecheckUntil = tick() + 25
 						runtimeMessage = growthPending
-							and "Run + Growth active together"
+							and "Run + existing Growth slot active together"
 							or "Ground animal ready; completing Land Distance first"
 					end
 				end)
 
 				return
+			elseif growthPending then
+				questStatusText = "Land + Growth: no grounded <100%; safe reset policy will choose next"
 			else
 				questStatusText = "Land Distance pending, but no grounded saved slot was found"
 			end
@@ -8069,19 +8317,13 @@ local function updateQuestAutomation()
 
 			if runEntry then
 				if not isGrowthComplete(runEntry.GrowthPercentage) then
-					-- Perfect: keep this exact animal. Run + Growth together.
+					-- Perfect: current runner is one of the existing <100% slots.
 					state.questGrowthResetMaintain(runRecords)
-				elseif not state.questGrowthReset.active
-					and not state.questGrowthReset.busy then
-
-					questStatusText = "Run + Growth: current runner is 100%; resetting same slot"
-					runtimeMessage = "Yellow Hornbill ignored; resetting current grounded runner for Growth"
-
-					state.questGrowthReset.pendingResetName = nil
-					if state.questGrowthResetCurrent(runEntry) then
-						return
-					end
-					-- false means reset is on cooldown; Run continues below.
+				else
+					-- DO NOT reset here. Another saved slot may already be below 100%,
+					-- and protected animals must pass the centralized reset policy.
+					questStatusText = "Run + Growth: mature runner; checking all existing <100% slots first"
+					runtimeMessage = "Growth reset deferred to global incomplete-first policy"
 				end
 			else
 				-- Never guess another 100% slot just because CharacterName
@@ -8180,6 +8422,7 @@ local function updateQuestAutomation()
 
 	local records = savedCharacters()
 	state.questGrowthResetMaintain(records)
+	state.questGrowthOwnsCurrent = false
 
 	local specificAnimalFocus = false
 	local focusQuest
@@ -8226,31 +8469,33 @@ local function updateQuestAutomation()
 		focusAnimal = nil
 	end
 
-	if focusQuest and focusAnimal and not state.questGrowthReset.active then
+	-- Growth policy runs BEFORE a specific-animal switch. This guarantees that a
+	-- mature Baboon/Elephant/etc. can never steal priority from ANY existing
+	-- <100% slot just because a PlayTime quest also exists.
+	if state.questHasIncompleteGrowth(quests) then
+		if trySwitchToGrowingSlot(
+			quests,
+			records,
+			specificAnimalFocus,
+			focusAnimal
+		) then
+			questStatusText = state.questGrowthReset.busy
+				and "Growth policy: resetting approved mature slot"
+				or "Growth policy: using existing <100% slot"
+			return
+		end
+	end
+
+	if focusQuest
+		and focusAnimal
+		and not state.questGrowthReset.active
+		and not state.questGrowthOwnsCurrent then
+
 		local character = player.Character
 		local currentAnimal = character and character:GetAttribute("AnimalName")
 		local targetSlot = state.questSlots.findAnimalSlot(records, focusAnimal)
 
 		if targetSlot then
-			local growthPending = state.questHasIncompleteGrowth(quests)
-			local sameAnimalNow = type(currentAnimal) == "string"
-				and state.questAnimalKey(currentAnimal) == state.questAnimalKey(focusAnimal)
-
-			-- If Growth can be stacked with this specific-animal quest, reset the
-			-- required mature slot BEFORE entering it. One transition instead of two.
-			if growthPending
-				and not sameAnimalNow
-				and isGrowthComplete(targetSlot.GrowthPercentage) then
-
-				questStatusText = "Specific + Growth: resetting " .. tostring(focusAnimal)
-				runtimeMessage = "Combining specific-animal quest with Growth before spawn"
-				state.questGrowthReset.pendingResetName = nil
-
-				if state.questGrowthResetCurrent(targetSlot) then
-					return
-				end
-			end
-
 			if trySwitchToQuestAnimal(focusQuest, records, focusAnimal) then
 				questStatusText = "Changing animal for " .. tostring(focusQuest.props.Title)
 				return
@@ -8284,15 +8529,6 @@ local function updateQuestAutomation()
 		end
 	end
 
-	-- Growth must run in parallel with Land/Travel/Zone/Group whenever possible.
-	-- Blocking flying animals must NOT block the Growth optimizer itself.
-	if trySwitchToGrowingSlot(quests, records, specificAnimalFocus) then
-		questStatusText = state.questGrowthReset.busy
-			and "Growth + other quests: resetting mature slot"
-			or "Growth + other quests: using growing slot"
-		return
-	end
-
 	-- Grouping roda em paralelo com Zone/Travel. A cada verificação confirma
 	-- que o pack pertence ao animal atual; se o jogador trocar de animal,
 	-- sai/desfaz o pack incompatível e procura/cria outro correto.
@@ -8300,7 +8536,10 @@ local function updateQuestAutomation()
 	for _, quest in ipairs(quests) do
 		if quest.props.QuestType == "GroupTime" and not state.questGroup.questComplete(quest) then
 			groupingQuestActive = true
-			state.questGroup.ensureForCurrentAnimal(records, not specificAnimalFocus)
+			state.questGroup.ensureForCurrentAnimal(
+				records,
+				not specificAnimalFocus or state.questGrowthOwnsCurrent
+			)
 			break
 		end
 	end
@@ -10261,7 +10500,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. If any animal leaves an active Zone quest to feed, the farm remembers that zone and returns there before resuming other quest actions. Water still has priority."
+questInfoBody.Text = "Growth always uses existing slots below 100% before any reset; flyers wait until Run quests finish. Elephant/Crocodile/Hippo/Rhino resets are protected and only used for full PlayTime overlap or as a true last resort."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
