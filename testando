@@ -260,6 +260,11 @@ local GIRAFFE = {
 	repositionAttempts = 0,
 	cancelToken = 0,
 	failedTrees = {},
+
+	-- Calculated from the current Giraffe model. These are only interaction
+	-- margins, not a hard-coded animal height.
+	reachVerticalMargin = 3.5,
+	reachHorizontal = 11.5,
 }
 
 function GIRAFFE.clearTarget()
@@ -1463,6 +1468,181 @@ local function giraffeTreeAnchorPart(tree, leafPart)
 	return tree:FindFirstChildWhichIsA("BasePart", true) or leafPart
 end
 
+local function giraffeCharacterReachProfile(character, root)
+	if not character or not root then return nil end
+
+	local highestY = root.Position.Y
+	local lowestY = root.Position.Y
+
+	for _, object in ipairs(character:GetDescendants()) do
+		if object:IsA("BasePart") then
+			local halfY = object.Size.Y * 0.5
+			highestY = math.max(
+				highestY,
+				object.Position.Y + halfY
+			)
+			lowestY = math.min(
+				lowestY,
+				object.Position.Y - halfY
+			)
+		end
+	end
+
+	return {
+		topAboveRoot = math.max(highestY - root.Position.Y, 4),
+		rootAboveBottom = math.max(root.Position.Y - lowestY, 1.5),
+		bodyHeight = math.max(highestY - lowestY, 6),
+	}
+end
+
+local function giraffeGroundAtXZ(x, z, referenceY)
+	local castY = math.max((referenceY or 0) + 180, 300)
+
+	local hit = workspace:Raycast(
+		Vector3.new(x, castY, z),
+		Vector3.new(0, -650, 0),
+		terrainOnlyRayParams
+	)
+
+	if not hit or hit.Material == Enum.Material.Water then
+		return nil
+	end
+
+	return hit.Position
+end
+
+local function giraffeLeafLowestY(part)
+	if not part or not part:IsA("BasePart") then
+		return math.huge
+	end
+
+	return part.Position.Y - part.Size.Y * 0.5
+end
+
+local function giraffeLeafHorizontalRadius(part)
+	if not part or not part:IsA("BasePart") then
+		return 0
+	end
+
+	return math.sqrt(
+		(part.Size.X * 0.5) ^ 2
+			+ (part.Size.Z * 0.5) ^ 2
+	)
+end
+
+local function giraffeReachableApproach(
+	tree,
+	leafPart,
+	character,
+	root,
+	startIndex
+)
+	if not tree or not leafPart or not character or not root then
+		return nil
+	end
+
+	local profile = giraffeCharacterReachProfile(character, root)
+	if not profile then return nil end
+
+	local anchor = giraffeTreeAnchorPart(tree, leafPart)
+	if not anchor then return nil end
+
+	local base = anchor.Position
+	local lowestLeafY = giraffeLeafLowestY(leafPart)
+	local leafRadius = giraffeLeafHorizontalRadius(leafPart)
+	local firstIndex = math.floor(tonumber(startIndex) or 0) % 8
+
+	-- Check several sides around the trunk because one side can be blocked or
+	-- lower/higher than another on sloped terrain.
+	for offset = 0, 7 do
+		local index = (firstIndex + offset) % 8
+		local angle = index / 8 * math.pi * 2
+		local radius = (index % 2 == 0) and 4.5 or 6.5
+
+		local x = base.X + math.cos(angle) * radius
+		local z = base.Z + math.sin(angle) * radius
+		local ground = giraffeGroundAtXZ(x, z, base.Y)
+
+		if ground then
+			-- Project this exact Giraffe's top/head height onto the candidate
+			-- ground. This automatically adapts to different growth percentages.
+			local projectedRootY = ground.Y + profile.rootAboveBottom
+			local reachableTopY = projectedRootY
+				+ profile.topAboveRoot
+				+ GIRAFFE.reachVerticalMargin
+
+			local centerHorizontal = Vector3.new(
+				leafPart.Position.X - ground.X,
+				0,
+				leafPart.Position.Z - ground.Z
+			).Magnitude
+
+			-- Large leaf meshes can extend several studs toward the animal, so
+			-- compare against the nearest edge instead of only the mesh center.
+			local effectiveHorizontal = math.max(
+				centerHorizontal - leafRadius,
+				0
+			)
+
+			if lowestLeafY <= reachableTopY
+				and effectiveHorizontal <= GIRAFFE.reachHorizontal then
+
+				return {
+					ground = ground,
+					reachableTopY = reachableTopY,
+					lowestLeafY = lowestLeafY,
+					horizontal = effectiveHorizontal,
+					approachIndex = index,
+				}
+			end
+		end
+	end
+
+	return nil
+end
+
+local function giraffeBestReachableLeaf(tree, character, root, startIndex)
+	local info = giraffeTreeLeafState(tree)
+	if not info or info.depleted then
+		return nil, info, nil
+	end
+
+	local bestPart
+	local bestApproach
+	local bestScore = math.huge
+
+	for _, part in ipairs(info.visibleParts) do
+		local approach = giraffeReachableApproach(
+			tree,
+			part,
+			character,
+			root,
+			startIndex
+		)
+
+		if approach then
+			local verticalSlack = math.max(
+				approach.reachableTopY - approach.lowestLeafY,
+				0
+			)
+
+			-- Prefer comfortably reachable leaves over marginally reachable ones.
+			local score = approach.horizontal
+				- math.min(verticalSlack, 10) * 0.12
+				+ (part.Position - root.Position).Magnitude * 0.02
+
+			if score < bestScore then
+				bestScore = score
+				bestPart = part
+				bestApproach = approach
+			end
+		end
+	end
+
+	return bestPart, info, bestApproach
+end
+
+
 local function giraffeGroundNearTree(tree, leafPart, root, approachIndex)
 	if not tree or not leafPart or not root then return nil end
 
@@ -1509,32 +1689,41 @@ end
 local function nearestGiraffeTree(root)
 	if not root then return nil end
 
-	-- If a tree is already locked and still has at least ONE visible Leaves
-	-- mesh, keep it. Never oscillate between trees while this one still feeds.
+	local character = player.Character
+	if not character then return nil end
+
+	-- A locked tree remains locked only while at least one visible leaf is
+	-- reachable. If the lower leaves are gone and only unreachable high leaves
+	-- remain, move to another tree.
 	if GIRAFFE.targetTree and GIRAFFE.targetTree.Parent then
-		local leafPart, info = giraffeBestVisibleLeaf(
+		local leafPart, info, approach = giraffeBestReachableLeaf(
 			GIRAFFE.targetTree,
+			character,
 			root
 		)
 
-		if info and not info.depleted and leafPart then
+		if info and not info.depleted and leafPart and approach then
 			GIRAFFE.targetLeaves = info.leaves
 			GIRAFFE.targetLeafPart = leafPart
+
 			return {
 				tree = GIRAFFE.targetTree,
 				leaves = info.leaves,
 				leafPart = leafPart,
+				approach = approach,
 				distance = (leafPart.Position - root.Position).Magnitude,
 				locked = true,
 			}
 		end
 
-		-- Only clear a normal consumed target after ALL leaf MeshParts are 1.
 		if info and info.depleted then
-			GIRAFFE.clearTarget()
-		elseif not info then
-			GIRAFFE.clearTarget()
+			runtimeMessage = "Giraffe: current tree is fully depleted"
+		elseif info and not info.depleted then
+			giraffeIgnoreTree(GIRAFFE.targetTree, 75)
+			runtimeMessage = "Giraffe: remaining leaves are too high to reach; switching tree"
 		end
+
+		GIRAFFE.clearTarget()
 	end
 
 	local mapAssets = workspace:FindFirstChild("MapAssets")
@@ -1546,9 +1735,17 @@ local function nearestGiraffeTree(root)
 
 	for _, tree in ipairs(mainAssets:GetChildren()) do
 		if not giraffeTreeIsIgnored(tree) then
-			local leafPart, info = giraffeBestVisibleLeaf(tree, root)
+			local leafPart, info, approach = giraffeBestReachableLeaf(
+				tree,
+				character,
+				root
+			)
 
-			if info and not info.depleted and leafPart then
+			if info
+				and not info.depleted
+				and leafPart
+				and approach then
+
 				local anchor = giraffeTreeAnchorPart(tree, leafPart)
 				local distancePart = anchor or leafPart
 				local distance = (distancePart.Position - root.Position).Magnitude
@@ -1559,6 +1756,7 @@ local function nearestGiraffeTree(root)
 						tree = tree,
 						leaves = info.leaves,
 						leafPart = leafPart,
+						approach = approach,
 						distance = distance,
 					}
 				end
@@ -1576,7 +1774,6 @@ local function nearestGiraffeTree(root)
 
 	return best
 end
-
 
 local RAGDOLL_STATES = {
 	[Enum.HumanoidStateType.Physics] = true,
@@ -2091,19 +2288,28 @@ local function giraffeApproachLockedTree(selected, approachIndex)
 		return false
 	end
 
-	local ground = giraffeGroundNearTree(
-		selected.tree,
-		selected.leafPart,
-		root,
-		approachIndex or 0
-	)
+	local approach
 
-	if not ground then
+	if (approachIndex or 0) <= 0 and selected.approach then
+		approach = selected.approach
+	else
+		approach = giraffeReachableApproach(
+			selected.tree,
+			selected.leafPart,
+			character,
+			root,
+			approachIndex or 0
+		)
+	end
+
+	if not approach or not approach.ground then
 		return false
 	end
 
+	selected.approach = approach
+
 	return ragdollTeleport(
-		ground,
+		approach.ground,
 		4,
 		selected.leafPart.Position
 	)
@@ -2143,7 +2349,11 @@ local function giraffeEatLockedTree(selected)
 
 	-- Re-check depletion BEFORE moving. A different player may have finished
 	-- this tree after we selected it.
-	local leafPart, info = giraffeBestVisibleLeaf(selected.tree, root)
+	local leafPart, info, initialApproach = giraffeBestReachableLeaf(
+		selected.tree,
+		character,
+		root
+	)
 	if not info or info.depleted then
 		runtimeMessage = "Giraffe: tree leaves are depleted; selecting another tree"
 		GIRAFFE.clearTarget()
@@ -2151,7 +2361,16 @@ local function giraffeEatLockedTree(selected)
 		return
 	end
 
+	if not leafPart then
+		giraffeIgnoreTree(selected.tree, 75)
+		runtimeMessage = "Giraffe: tree still has leaves, but they are above reach"
+		GIRAFFE.clearTarget()
+		GIRAFFE.busy = false
+		return
+	end
+
 	selected.leafPart = leafPart
+	selected.approach = initialApproach
 	GIRAFFE.targetLeafPart = leafPart
 
 	runtimeMessage = string.format(
@@ -2200,8 +2419,9 @@ local function giraffeEatLockedTree(selected)
 
 		-- CRITICAL tree depletion check:
 		-- switch ONLY when every BasePart under this tree's Leaves is transparent.
-		local currentLeaf, currentInfo = giraffeBestVisibleLeaf(
+		local currentLeaf, currentInfo, currentApproach = giraffeBestReachableLeaf(
 			selected.tree,
+			character,
 			root
 		)
 
@@ -2217,11 +2437,19 @@ local function giraffeEatLockedTree(selected)
 			break
 		end
 
+		if not currentLeaf then
+			giraffeIgnoreTree(selected.tree, 75)
+			runtimeMessage = "Giraffe: visible leaves remain, but none are within reach; switching tree"
+			GIRAFFE.clearTarget()
+			break
+		end
+
 		-- Individual leaf meshes disappear while the tree is consumed.
 		-- Update the target INSIDE the same tree instead of switching trees.
 		if currentLeaf and currentLeaf ~= GIRAFFE.targetLeafPart then
 			GIRAFFE.targetLeafPart = currentLeaf
 			selected.leafPart = currentLeaf
+			selected.approach = currentApproach
 		end
 
 		local currentFood = character:GetAttribute("Food") or 0
@@ -2289,13 +2517,22 @@ local function giraffeEatLockedTree(selected)
 		-- No Food progress does NOT immediately switch trees.
 		-- First verify the Leaves meshes, then reposition around the SAME tree.
 		if tick() - lastProgressAt >= 6.5 then
-			local verifyLeaf, verifyInfo = giraffeBestVisibleLeaf(
+			local verifyLeaf, verifyInfo, verifyApproach = giraffeBestReachableLeaf(
 				selected.tree,
-				root
+				character,
+				root,
+				GIRAFFE.repositionAttempts + 1
 			)
 
 			if verifyInfo and verifyInfo.depleted then
 				runtimeMessage = "Giraffe: verified all Leaves depleted; switching tree"
+				GIRAFFE.clearTarget()
+				break
+			end
+
+			if verifyInfo and not verifyInfo.depleted and not verifyLeaf then
+				giraffeIgnoreTree(selected.tree, 75)
+				runtimeMessage = "Giraffe: remaining leaves are too high; switching tree"
 				GIRAFFE.clearTarget()
 				break
 			end
@@ -2306,6 +2543,7 @@ local function giraffeEatLockedTree(selected)
 				and verifyLeaf then
 
 				selected.leafPart = verifyLeaf
+				selected.approach = verifyApproach
 				GIRAFFE.targetLeafPart = verifyLeaf
 
 				runtimeMessage = string.format(
@@ -2360,13 +2598,18 @@ local function giraffeEatLockedTree(selected)
 	if foodAfter >= targetFood then
 		GIRAFFE.clearTarget()
 	elseif GIRAFFE.targetTree and GIRAFFE.targetTree.Parent then
-		local _, finalInfo = giraffeBestVisibleLeaf(
+		local finalLeaf, finalInfo = giraffeBestReachableLeaf(
 			GIRAFFE.targetTree,
+			character,
 			root
 		)
 
 		if finalInfo and finalInfo.depleted then
 			runtimeMessage = "Giraffe: current tree exhausted; next feed will use another tree"
+			GIRAFFE.clearTarget()
+		elseif finalInfo and not finalInfo.depleted and not finalLeaf then
+			giraffeIgnoreTree(GIRAFFE.targetTree, 75)
+			runtimeMessage = "Giraffe: remaining tree leaves are outside reach; selecting another tree"
 			GIRAFFE.clearTarget()
 		elseif not finalInfo then
 			GIRAFFE.clearTarget()
@@ -9756,7 +9999,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. Baboon locks the nearest Carcass/AntHill. Giraffe eats MainAssets tree Leaves and changes trees only after all leaf meshes are depleted. Growth resets stay isolated."
+questInfoBody.Text = "Land/Travel quests use ground animals first; flying quests wait. Baboon locks the nearest Carcass/AntHill. Giraffe calculates its current body reach and skips tree leaves that are too high to eat. Growth resets stay isolated."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
