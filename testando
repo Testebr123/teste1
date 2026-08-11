@@ -23,6 +23,7 @@ local state = {
 	autoDrink = false,
 	escapeTerrain = false,
 	growExisting = false,
+	growExistingAutomaticAll = false,
 	growNew = false,
 	farmCoins = false,
 	autoQuests = false,
@@ -5293,25 +5294,51 @@ local function isGrowthComplete(value)
 	return value >= 99.9
 end
 
-local function nextExistingSlot(animalName, records)
+local function nextExistingSlot(animalName, records, includeAllAnimals)
 	records = records or savedCharacters()
 	if #records == 0 then return nil end
+
 	local currentCharacter = player.Character
-	local currentName = currentCharacter and currentCharacter:GetAttribute("CharacterName")
+	local currentName = currentCharacter
+		and currentCharacter:GetAttribute("CharacterName")
+
 	for _ = 1, #records do
 		slotIndex = slotIndex % #records + 1
 		local entry = records[slotIndex]
-		local name = type(entry) == "table" and entry.CharacterName
-		if type(name) == "string" and name ~= ""
-			and name ~= currentName and not sessionCompletedSlots[name]
-			and not state.questIsFlyingAnimalName(entry.AnimalName)
-			and (not animalName or entry.AnimalName == animalName)
-			and not isGrowthComplete(entry.GrowthPercentage) then
-			runtimeMessage = string.format(
-				"Testando slot: %s (salvo: %s)",
-				name,
-				tostring(entry.GrowthPercentage or "?")
+		local name = type(entry) == "table"
+			and entry.CharacterName
+
+		local animalAllowed =
+			includeAllAnimals == true
+			or (
+				type(entry) == "table"
+				and not state.questIsFlyingAnimalName(entry.AnimalName)
+				and (
+					not animalName
+					or entry.AnimalName == animalName
+				)
 			)
+
+		if type(name) == "string"
+			and name ~= ""
+			and name ~= currentName
+			and not sessionCompletedSlots[name]
+			and animalAllowed
+			and not isGrowthComplete(entry.GrowthPercentage) then
+
+			runtimeMessage = includeAllAnimals
+				and string.format(
+					"AUTO Grow All: next %s slot -> %s (%s%%)",
+					tostring(entry.AnimalName or "animal"),
+					name,
+					tostring(entry.GrowthPercentage or "?")
+				)
+				or string.format(
+					"Testando slot: %s (salvo: %s)",
+					name,
+					tostring(entry.GrowthPercentage or "?")
+				)
+
 			return entry
 		end
 	end
@@ -8315,20 +8342,23 @@ local function updateQuestAutomation()
 		if hasIncompleteSlot then
 			state.questPostGrowAll = true
 			state.growExisting = true
+			state.growExistingAutomaticAll = true
 			state.farmCoins = false
 
 			if incompleteQuestCount > 0 then
 				questStatusText =
-					"Remaining quests unavailable -> Grow Existing Slots"
+					"AUTO Grow Existing: ALL ANIMALS (<100%)"
 				runtimeMessage =
-					"Unworkable quests skipped; growing every existing slot below 100%"
+					"Automatic Growth mode: switching across ALL animal species until every existing slot reaches 100%"
 			else
-				questStatusText = "All quests done -> growing incomplete slots"
-				runtimeMessage = "Quests complete: growing all existing slots"
+				questStatusText = "AUTO Grow Existing: ALL ANIMALS (<100%)"
+				runtimeMessage =
+					"Quests complete: automatic all-species Growth enabled until every existing slot reaches 100%"
 			end
 		else
 			state.questPostGrowAll = false
 			state.growExisting = false
+			state.growExistingAutomaticAll = false
 			state.farmCoins = true
 
 			if incompleteQuestCount > 0 then
@@ -9969,11 +9999,20 @@ local function growthStep()
 
 	local entry
 	if state.growExisting then
-		runtimeMessage = "Abrindo lista de " .. tostring(completedAnimal or "animais")
+		local automaticAll = state.growExistingAutomaticAll == true
+
+		runtimeMessage = automaticAll
+			and "AUTO Grow Existing: scanning ALL animal species for slots below 100%"
+			or "Abrindo lista de " .. tostring(completedAnimal or "animais")
+
 		if ResetRemote then pcall(ResetRemote.InvokeServer, ResetRemote) end
 		task.wait(2.5)
+
 		local refreshed = savedCharacters()
-		entry = nextExistingSlot(state.questPostGrowAll and nil or completedAnimal, refreshed)
+
+		entry = automaticAll
+			and nextExistingSlot(nil, refreshed, true)
+			or nextExistingSlot(completedAnimal, refreshed, false)
 		if not previousEntry then
 			for _, candidate in ipairs(refreshed) do
 				if candidate.CharacterName == completedName then
@@ -9984,12 +10023,24 @@ local function growthStep()
 		end
 	end
 	if entry then
+		if state.growExistingAutomaticAll then
+			questStatusText = string.format(
+				"AUTO Grow All: %s · %s%%",
+				tostring(entry.AnimalName or "Animal"),
+				tostring(entry.GrowthPercentage or "?")
+			)
+			runtimeMessage =
+				"Automatic Grow Existing switched species to continue every saved slot below 100%"
+		end
+
 		spawnSlot(entry)
+
 	elseif state.growNew then
 		local totalSlots = #savedCharacters()
 		if totalSlots >= MAX_SLOTS then
 			runtimeMessage = "Limite de " .. MAX_SLOTS .. " slots atingido; ativando Farm Coins"
 			state.growExisting, state.growNew = false, false
+			state.growExistingAutomaticAll = false
 			state.farmCoins = true
 			if previousEntry then spawnSlot(previousEntry) end
 		else
@@ -9997,7 +10048,14 @@ local function growthStep()
 			createNextSlot()
 		end
 	elseif state.growExisting then
-		if state.questPostGrowAll then
+		if state.growExistingAutomaticAll then
+			runtimeMessage =
+				"AUTO Grow Existing complete: ALL animal slots are 100%; activating AFK Coin Farm"
+			questStatusText =
+				"AUTO Grow All complete -> AFK Coin Farm"
+			state.growExistingAutomaticAll = false
+			state.questPostGrowAll = false
+		elseif state.questPostGrowAll then
 			runtimeMessage = "Todos os slots existentes estão 100%; ativando Farm Coins"
 			state.questPostGrowAll = false
 		else
@@ -10007,6 +10065,7 @@ local function growthStep()
 			spawnSlot(previousEntry)
 		end
 		state.growExisting, state.growNew = false, false
+		state.growExistingAutomaticAll = false
 		state.farmCoins = true
 	end
 	state.autoEat, state.autoDrink = true, true
@@ -10672,7 +10731,7 @@ local function toggle(parent, label, key, order)
 	local rowStroke = stroke(row, Color3.fromRGB(48, 24, 42), 1)
 
 	local labelText = Instance.new("TextLabel")
-	labelText.Size = UDim2.new(1, -66, 1, 0)
+	labelText.Size = UDim2.new(1, -58, 1, 0)
 	labelText.Position = UDim2.fromOffset(14, 0)
 	labelText.BackgroundTransparency = 1
 	labelText.Font = FONT_BUTTON
@@ -10717,6 +10776,18 @@ local function toggle(parent, label, key, order)
 	end
 	local function render()
 		local on = state[key]
+
+		if key == "growExisting" then
+			labelText.Text =
+				on and state.growExistingAutomaticAll
+				and "Grow Existing Slots  [AUTO: ALL ANIMALS]"
+				or label
+			labelText.TextSize =
+				on and state.growExistingAutomaticAll
+				and 10
+				or 12
+		end
+
 		labelText.TextColor3 = on and COLOR_ACCENT or COLOR_TEXT
 		TweenService:Create(track, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
 			BackgroundColor3 = on and COLOR_ACCENT or Color3.fromRGB(50, 27, 44),
@@ -10731,16 +10802,26 @@ local function toggle(parent, label, key, order)
 	row.MouseLeave:Connect(function() hovering = false; applyVisual() end)
 	row.Activated:Connect(function()
 		state[key] = not state[key]
+
+		-- User interaction always means MANUAL Grow Existing.
+		-- Manual mode intentionally stays limited to the current animal species.
+		if key == "growExisting" then
+			state.growExistingAutomaticAll = false
+		end
+
 		if key == "farmCoins" and state[key] then
 			state.questPostGrowAll = false
+			state.growExistingAutomaticAll = false
 			state.growExisting, state.growNew, state.autoQuests = false, false, false
 			state.autoEat, state.autoDrink = true, true
 			runtimeMessage = "AFK coin farming active"
 		elseif (key == "growExisting" or key == "growNew") and state[key] then
 			state.questPostGrowAll = false
+			state.growExistingAutomaticAll = false
 			state.farmCoins, state.autoQuests = false, false
 		elseif key == "autoQuests" and state[key] then
 			state.questPostGrowAll = false
+			state.growExistingAutomaticAll = false
 			state.questSeenAny = false
 			state.questEmptyScans = 0
 			state.questGroup.difficultySince = nil
@@ -10904,7 +10985,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Impossible quests no longer freeze the farm: missing animal at 40/40 is skipped until a slot becomes possible, and GroupTime is ignored when the server has no viable player/pack. Remaining work continues into Grow Existing Slots, then AFK Coins."
+questInfoBody.Text = "Manual Grow Existing stays on the current animal species. When Auto Quests starts Grow Existing automatically, HUD shows AUTO: ALL ANIMALS and the farm cycles every saved species below 100% before AFK Coins."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
@@ -11415,6 +11496,7 @@ task.spawn(function()
 			if hasPending then
 				state.farmCoins = false
 				state.growExisting = false
+				state.growExistingAutomaticAll = false
 				state.growNew = false
 				state.questPostGrowAll = false
 				state.questSeenAny = true
