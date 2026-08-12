@@ -192,6 +192,15 @@ local state = {
 		manualLabel = nil,
 		manualCancelledAt = 0,
 	},
+	heavyGlide = {
+		character = nil,
+		collisionSnapshot = nil,
+		movementDisabled = nil,
+		autoRotate = nil,
+		platformStand = nil,
+		lastAt = 0,
+	},
+
 	questSlots = {
 		maxSlots = 40,
 		busy = false,
@@ -872,6 +881,116 @@ function state.aquaticWaterStandOffset(character)
 	return math.clamp(clearance + 0.20, 2.5, 8)
 end
 
+function state.heavyGlideStop(character)
+	local glide = state.heavyGlide
+	if not glide then return end
+	local activeCharacter = character or glide.character
+	if activeCharacter and activeCharacter.Parent then
+		if type(glide.collisionSnapshot) == "table" then
+			for part, canCollide in pairs(glide.collisionSnapshot) do
+				if part and part.Parent then
+					pcall(function() part.CanCollide = canCollide == true end)
+				end
+			end
+		end
+		local humanoid = activeCharacter:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			pcall(function()
+				humanoid.PlatformStand = glide.platformStand == true
+				humanoid.AutoRotate = glide.autoRotate ~= false
+				humanoid:Move(Vector3.zero, false)
+			end)
+		end
+		activeCharacter:SetAttribute("MovementDisabled", glide.movementDisabled == true)
+	end
+	glide.character = nil
+	glide.collisionSnapshot = nil
+	glide.movementDisabled = nil
+	glide.autoRotate = nil
+	glide.platformStand = nil
+	glide.lastAt = 0
+end
+
+function state.heavyGlidePrepare(character)
+	if not character or not state.isHeavyGroundMover(character) then return false end
+	local glide = state.heavyGlide
+	if glide.character and glide.character ~= character then
+		state.heavyGlideStop(glide.character)
+	end
+	if glide.character ~= character or type(glide.collisionSnapshot) ~= "table" then
+		glide.character = character
+		glide.collisionSnapshot = {}
+		glide.movementDisabled = character:GetAttribute("MovementDisabled")
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			glide.autoRotate = humanoid.AutoRotate
+			glide.platformStand = humanoid.PlatformStand
+		end
+		for _, object in ipairs(character:GetDescendants()) do
+			if object:IsA("BasePart") then glide.collisionSnapshot[object] = object.CanCollide end
+		end
+	end
+	for part in pairs(glide.collisionSnapshot) do
+		if part and part.Parent then part.CanCollide = false end
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		pcall(function()
+			humanoid.PlatformStand = false
+			humanoid.AutoRotate = false
+		end)
+	end
+	character:SetAttribute("MovementDisabled", false)
+	return true
+end
+
+function state.heavyGlideSupport(character, root, worldPosition, purpose)
+	if not character or not root or typeof(worldPosition) ~= "Vector3" then return nil, "invalid" end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { workspace.Terrain }
+	params.IgnoreWater = false
+	local topY = math.max(root.Position.Y + 140, worldPosition.Y + 140)
+	local hit = workspace:Raycast(
+		Vector3.new(worldPosition.X, topY, worldPosition.Z),
+		Vector3.new(0, -360, 0),
+		params
+	)
+	if not hit then return nil, "no_ground" end
+	if hit.Material == Enum.Material.Water then
+		local allowWater = isAquaticCharacter(character)
+			and (purpose == "safety" or (purpose == "water" and not CROC.isCharacter(character)))
+		if not allowWater then return nil, "water" end
+		return hit.Position.Y + state.aquaticWaterStandOffset(character), "water"
+	end
+	return hit.Position.Y + state.movementRootClearance(character) + 0.20, "terrain"
+end
+
+function state.heavyGlideStep(character, root, humanoid, direction, speed, purpose)
+	if not character or not root or not humanoid or typeof(direction) ~= "Vector3" then return false, "invalid" end
+	local flat = Vector3.new(direction.X, 0, direction.Z)
+	if flat.Magnitude <= 0.05 then return true, "idle" end
+	if not state.heavyGlidePrepare(character) then return false, "prepare" end
+	local glide = state.heavyGlide
+	local now = tick()
+	local dt = glide.lastAt > 0 and math.clamp(now - glide.lastAt, 1 / 240, 0.065) or 1 / 60
+	glide.lastAt = now
+	local glideSpeed = math.clamp(tonumber(speed) or 18, 6, 70)
+	local stepDistance = math.min(glideSpeed * dt, 4.5)
+	local heading = flat.Unit
+	local nextFlat = root.Position + heading * stepDistance
+	local supportY, supportKind = state.heavyGlideSupport(character, root, nextFlat, purpose)
+	if not supportY then return false, supportKind end
+	local maxVerticalStep = math.max(0.75, stepDistance * 0.90)
+	local nextY = root.Position.Y + math.clamp(supportY - root.Position.Y, -maxVerticalStep, maxVerticalStep)
+	local nextPosition = Vector3.new(nextFlat.X, nextY, nextFlat.Z)
+	root.CFrame = CFrame.lookAt(nextPosition, nextPosition + heading, Vector3.yAxis)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	pcall(humanoid.Move, humanoid, Vector3.zero, false)
+	return true, supportKind
+end
+
 function state.releaseMovementNow(character, zeroHorizontal)
 	pcall(function()
 		local env = (getgenv and getgenv()) or _G
@@ -973,20 +1092,18 @@ function state.safeNudgeToward(root, targetPosition, speedScale)
 	local character = player.Character
 	if state.isHeavyGroundMover(character) then
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local flatNative = Vector3.new(
-			targetPosition.X - root.Position.X,
-			0,
-			targetPosition.Z - root.Position.Z
-		)
-		if flatNative.Magnitude <= 0.15 then return true end
+		local flatGlide = Vector3.new(targetPosition.X - root.Position.X, 0, targetPosition.Z - root.Position.Z)
+		if flatGlide.Magnitude <= 0.15 then return true end
 		if humanoid then
-			pcall(function()
-				humanoid.PlatformStand = false
-				humanoid.AutoRotate = true
-				humanoid:Move(flatNative.Unit, false)
-			end)
-			setSubState("Walking")
-			return true
+			local moved = state.heavyGlideStep(
+				character,
+				root,
+				humanoid,
+				flatGlide.Unit,
+				state.safeMovementSpeed(character) * math.clamp(tonumber(speedScale) or 0.35, 0.05, 1),
+				"food"
+			)
+			if moved then setSubState("Walking"); return true end
 		end
 	end
 
@@ -1801,6 +1918,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 	end
 
 	local function cleanup()
+		state.heavyGlideStop(character)
 		local _, liveRoot, liveHumanoid = characterParts()
 
 		if liveHumanoid then
@@ -2109,20 +2227,12 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 
 			state.safeMove.landQuestW = landQuestW == true
 
-			local heavyNativeW =
-				state.safeMove.heavy
-					and not verticalMovement
-					and not calmRiverApproach
-					and flatDistance > math.max(tolerance * 1.35, 7)
-
-			state.safeMove.nativeW = heavyNativeW == true
+			state.safeMove.nativeW = false
 
 			if state.questSetW then
-				if landQuestW or heavyNativeW then
-					if landQuestW then
-						state.questMotionMoving = true
-						state.questMotionMode = "Land"
-					end
+				if landQuestW then
+					state.questMotionMoving = true
+					state.questMotionMode = "Land"
 					if tick() - lastMoveWReassertAt >= 3.5 then
 						lastMoveWReassertAt = tick()
 						state.questSetW(true, true)
@@ -2834,13 +2944,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					Vector3.zero
 			end
 
-			if state.safeMove.heavy and not verticalMovement then
-				pcall(function()
-					humanoid.PlatformStand = false
-					humanoid.AutoRotate = true
-				end)
-			else
-				-- Orientation only: the root position is not changed.
+			if not (state.safeMove.heavy and not verticalMovement) then
 				pcall(function()
 					local face = Vector3.new(desired.X, 0, desired.Z)
 					if face.Magnitude > 0.1 then
@@ -2853,11 +2957,9 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				pcall(
 					humanoid.Move,
 					humanoid,
-					Vector3.new(
-						desired.X,
-						0,
-						desired.Z
-					),
+					(state.safeMove.heavy and not verticalMovement)
+						and Vector3.zero
+						or Vector3.new(desired.X, 0, desired.Z),
 					false
 				)
 			else
@@ -2900,11 +3002,10 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					desired.Z * speed
 				)
 			elseif state.safeMove.heavy then
-				-- Native locomotion: do not push large colliders through Terrain every frame.
-				local planar = Vector3.new(velocity.X, 0, velocity.Z)
-				if planar.Magnitude > maximumSpeed * 1.20 then
-					local capped = planar.Unit * maximumSpeed
-					root.AssemblyLinearVelocity = Vector3.new(capped.X, velocity.Y, capped.Z)
+				local glideOk = state.heavyGlideStep(character, root, humanoid, desired, speed, purpose)
+				if not glideOk then
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
 				end
 			else
 				root.AssemblyLinearVelocity = Vector3.new(
@@ -7505,8 +7606,8 @@ function state.moveAquaticToDryTerrain(character, root)
 	local moved = safeMoveToPosition(target, 10, nil, {
 		purpose = "safety",
 		tolerance = math.clamp(state.movementFootprint(character) * 0.65, 8, 15),
-		vertical = deeplySubmerged == true,
-		constantSpeed = not deeplySubmerged,
+		vertical = false,
+		constantSpeed = true,
 		stopOnDryGround = true,
 		maxDuration = 260,
 		routeCheckInterval = 0.10,
@@ -12460,10 +12561,57 @@ function state.questGroup.sameAnimal(a, b)
 	return type(a) == "string" and type(b) == "string" and a:lower() == b:lower()
 end
 
-function state.questGroup.getCurrentPack(handler)
-	if not handler or type(handler.GetPlayerPackData) ~= "function" then return nil end
-	local ok, pack = pcall(handler.GetPlayerPackData, player)
+function state.questGroup.getPlayerPack(handler, targetPlayer)
+	if not handler or type(handler.GetPlayerPackData) ~= "function" or not targetPlayer then return nil end
+	local ok, pack = pcall(handler.GetPlayerPackData, targetPlayer)
+	if not ok then
+		ok, pack = pcall(handler.GetPlayerPackData, handler, targetPlayer)
+	end
 	return ok and type(pack) == "table" and pack or nil
+end
+
+function state.questGroup.requestJoinIfFree(handler, packId)
+	if not handler or type(handler.RequestJoin) ~= "function" or packId == nil then
+		return false, "unavailable"
+	end
+	local current = state.questGroup.getPlayerPack(handler, player)
+	if current then return false, "already_grouped" end
+	local ok = pcall(handler.RequestJoin, packId)
+	if not ok then ok = pcall(handler.RequestJoin, handler, packId) end
+	return ok, ok and "requested" or "request_failed"
+end
+
+function state.questGroup.acceptInviteIfFree(handler)
+	if not handler
+		or type(handler.AcceptInvite) ~= "function" then
+		return false, "unavailable"
+	end
+
+	if state.questGroup.getPlayerPack(
+		handler,
+		player
+	) then
+		return false, "already_grouped"
+	end
+
+	local ok =
+		pcall(handler.AcceptInvite)
+
+	if not ok then
+		ok =
+			pcall(
+				handler.AcceptInvite,
+				handler
+			)
+	end
+
+	return ok,
+		ok and "accepted"
+			or "accept_failed"
+end
+
+function state.questGroup.getCurrentPack(handler)
+	return state.questGroup.getPlayerPack(handler, player)
 end
 
 function state.questGroup.hasOtherMember(pack)
@@ -12549,12 +12697,18 @@ function state.questGroup.inviteMatchingPlayers(handler, animalName)
 	local invited = 0
 	for _, other in ipairs(Players:GetPlayers()) do
 		if other ~= player and state.questGroup.sameAnimal(state.questGroup.getPlayerAnimal(other), animalName) then
-			local last = state.questGroup.lastInviteAt[other.UserId] or 0
-			if tick() - last >= 30 then
-				state.questGroup.lastInviteAt[other.UserId] = tick()
-				pcall(handler.RequestInvite, other)
-				invited += 1
-				if invited >= 3 then break end
+			local otherPack = state.questGroup.getPlayerPack(handler, other)
+			if not otherPack then
+				local last = state.questGroup.lastInviteAt[other.UserId] or 0
+				if tick() - last >= 30 then
+					local ok = pcall(handler.RequestInvite, other)
+					if not ok then ok = pcall(handler.RequestInvite, handler, other) end
+					if ok then
+						state.questGroup.lastInviteAt[other.UserId] = tick()
+						invited += 1
+						if invited >= 3 then break end
+					end
+				end
 			end
 		end
 	end
@@ -13222,7 +13376,7 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 
 				if tick() - state.questGroup.lastActionAt >= 2 then
 					state.questGroup.lastActionAt = tick()
-					pcall(handler.RequestJoin, sameMMB.packId)
+					state.questGroup.requestJoinIfFree(handler, sameMMB.packId)
 				end
 
 				state.questGroup.statusText =
@@ -13329,7 +13483,7 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 				if type(handler.RequestJoin) == "function"
 					and tick() - state.questGroup.lastActionAt >= 2 then
 					state.questGroup.lastActionAt = tick()
-					pcall(handler.RequestJoin, mmbLeader.packId)
+					state.questGroup.requestJoinIfFree(handler, mmbLeader.packId)
 				end
 
 				state.questGroup.statusText =
@@ -13440,7 +13594,7 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 					and tick() - state.questGroup.lastActionAt >= 4 then
 
 					state.questGroup.lastActionAt = tick()
-					pcall(handler.RequestJoin, best.packId)
+					state.questGroup.requestJoinIfFree(handler, best.packId)
 					state.questGroup.statusText = string.format(
 						"Grouping: joining %s pack (%d animals)",
 						animalName,
@@ -13531,7 +13685,7 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 
 			if tick() - state.questGroup.lastActionAt >= 2 then
 				state.questGroup.lastActionAt = tick()
-				pcall(handler.RequestJoin, lateMMB.packId)
+				state.questGroup.requestJoinIfFree(handler, lateMMB.packId)
 			end
 
 			state.questGroup.statusText =
@@ -13576,7 +13730,7 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 
 				if tick() - state.questGroup.lastActionAt >= 5 then
 					state.questGroup.lastActionAt = tick()
-					pcall(handler.RequestJoin, preferredId)
+					state.questGroup.requestJoinIfFree(handler, preferredId)
 				end
 
 				state.questGroup.statusText = string.format(
@@ -13719,7 +13873,7 @@ function state.questGroup.assistMMBForCurrentAnimal()
 		and tick() - state.questGroup.lastActionAt >= 2 then
 
 		state.questGroup.lastActionAt = tick()
-		pcall(handler.RequestJoin, best.packId)
+		state.questGroup.requestJoinIfFree(handler, best.packId)
 
 		state.questGroup.statusText =
 			"MMB helper: joining "
@@ -14129,10 +14283,7 @@ function state.questGroup.beginAFKHelp(handler, target)
 	if target.sameSpecies then
 		coop.helperLastActionAt = tick()
 
-		pcall(
-			handler.RequestJoin,
-			target.packId
-		)
+		state.questGroup.requestJoinIfFree(handler, target.packId)
 
 		runtimeMessage =
 			"MMB helper: joining "
@@ -14201,10 +14352,7 @@ function state.questGroup.beginAFKHelp(handler, target)
 			coop.helperTargetPackId = packId
 			coop.helperLastActionAt = tick()
 
-			pcall(
-				liveHandler.RequestJoin,
-				packId
-			)
+			state.questGroup.requestJoinIfFree(liveHandler, packId)
 
 			runtimeMessage =
 				"MMB helper: switched species and requested join to "
@@ -14279,10 +14427,24 @@ function state.questGroup.coopResumeAfterProbe(handler)
 		)
 			and pack.JoinRequirements == "AutoAccept" then
 
-			pcall(
-				handler.RequestJoin,
-				packId
-			)
+			local requested, joinReason =
+				state.questGroup.requestJoinIfFree(
+					handler,
+					packId
+				)
+
+			-- After Leave(), PackHandler can briefly keep the old membership
+			-- replicated. Do not clear probeLeft until RequestJoin was ACTUALLY
+			-- sent; otherwise the client can believe it rejoined while the old
+			-- Leave is still finishing.
+			if not requested then
+				state.questGroup.statusText =
+					joinReason == "already_grouped"
+						and "MMB co-op probe: waiting for Leave replication before rejoin"
+						or "MMB co-op probe: rejoin request not ready"
+
+				return false
+			end
 
 			coop.probeLeft = false
 			coop.probePackName = nil
@@ -14484,10 +14646,7 @@ function state.questGroup.coopLifecycleStep()
 				coop.helperLastActionAt = tick()
 				coop.helperTargetPackId = packId
 
-				pcall(
-					handler.RequestJoin,
-					packId
-				)
+				state.questGroup.requestJoinIfFree(handler, packId)
 			end
 
 			return
@@ -23850,18 +24009,7 @@ task.spawn(function()
 					)
 
 					if state.isHeavyGroundMover(character) then
-						if humanoid then
-							pcall(function()
-								humanoid.PlatformStand = false
-								humanoid.AutoRotate = true
-								humanoid:Move(direction, false)
-							end)
-						end
-						local planar = Vector3.new(velocity.X, 0, velocity.Z)
-						if planar.Magnitude > speed * 1.20 then
-							local capped = planar.Unit * speed
-							root.AssemblyLinearVelocity = Vector3.new(capped.X, velocity.Y, capped.Z)
-						end
+						state.heavyGlideStep(character, root, humanoid, direction, speed, "autorun")
 					else
 						if landMove and state.questLandInputActive then
 							pcall(function()
@@ -23874,6 +24022,7 @@ task.spawn(function()
 				end
 			end
 		else
+			state.heavyGlideStop(player.Character)
 			autoProgressPosition = nil
 			autoProgressAt = 0
 			autoBlockingInstance = nil
@@ -24002,6 +24151,7 @@ shared.__uiRootCleanup = function()
 		player.Character
 
 	if cleanupCharacter then
+		pcall(state.heavyGlideStop, cleanupCharacter)
 		pcall(state.releaseMovementNow, cleanupCharacter, true)
 		pcall(state.questSlotsNormalizeControl, cleanupCharacter)
 	end
