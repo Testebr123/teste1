@@ -87,6 +87,16 @@ local state = {
 	questMoveSubState = "Running",
 	questLastSubStateAt = 0,
 	questLastEatTapAt = 0,
+	questMoveInteract = {
+		character = nil,
+		lastCheckAt = 0,
+		lastEatRemoteAt = 0,
+		lastDrinkRemoteAt = 0,
+		grassGraceUntil = 0,
+		drinkGraceUntil = 0,
+		lastFood = nil,
+		lastWater = nil,
+	},
 	questTravelActive = false,
 	questMotionMoving = false,
 	questMotionMode = nil,
@@ -883,8 +893,30 @@ function state.heavyObstacleProbe(
 	forward = forward.Unit
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = {character,workspace.Terrain}
+	local ignored = {character,workspace.Terrain}
+	params.FilterDescendantsInstances = ignored
 	params.IgnoreWater = true
+	pcall(function()
+		params.RespectCanCollide = true
+	end)
+
+	local function castBlocking(origin, ray)
+		for _ = 1, 10 do
+			params.FilterDescendantsInstances = ignored
+			local hit = workspace:Raycast(origin, ray, params)
+			if not hit then return nil end
+			local instance = hit.Instance
+			if instance
+				and instance:IsA("BasePart")
+				and instance.CanCollide == false then
+				table.insert(ignored, instance)
+			else
+				return hit
+			end
+		end
+		return nil
+	end
+
 	local right = Vector3.new(-forward.Z,0,forward.X)
 	local halfWidth = math.clamp(state.movementFootprint(character)*0.42,2.6,8.5)
 	local verticalSpread = math.clamp(state.movementBodySize(character).Y*0.20,1.4,4.5)
@@ -893,7 +925,7 @@ function state.heavyObstacleProbe(
 	-- 3 body-width lanes x 3 vertical layers = 9 rays.
 	for _, lateral in ipairs({-halfWidth,0,halfWidth}) do
 		for _, vertical in ipairs({-verticalSpread,0,verticalSpread}) do
-			local hit = workspace:Raycast(baseOrigin+right*lateral+Vector3.new(0,vertical,0),forward*probeDistance,params)
+			local hit = castBlocking(baseOrigin+right*lateral+Vector3.new(0,vertical,0),forward*probeDistance)
 			if hit and (not nearest or hit.Distance<nearest.Distance) then nearest=hit end
 		end
 	end
@@ -903,7 +935,7 @@ function state.heavyObstacleProbe(
 		local side=Vector3.new(forward.X*c-forward.Z*s,0,forward.X*s+forward.Z*c).Unit
 		local length=probeDistance*1.35; local nearestSide=length
 		for _, lateral in ipairs({-halfWidth*0.72,0,halfWidth*0.72}) do
-			local hit=workspace:Raycast(baseOrigin+right*lateral,side*length,params)
+			local hit=castBlocking(baseOrigin+right*lateral,side*length)
 			if hit then nearestSide=math.min(nearestSide,hit.Distance) end
 		end
 		return nearestSide
@@ -7545,6 +7577,211 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local eatingStuckSince
 local lastEatWatchdogFood
 
+function state.questMovementOpportunisticInteract(
+	character,
+	root
+)
+	local data =
+		state.questMoveInteract
+
+	if not data
+		or not character
+		or not root
+		or not state.autoQuests
+		or not state.questMotionMoving
+		or state.questMotionMode ~= "Land"
+		or state.questGrowthReset.exclusive
+		or state.busy
+		or criticalRecoveryActive
+		or DAMAGE.active
+		or eatingToFull
+		or drinkingToFull
+		or carcassEatBusy
+		or BABOON.busy
+		or GIRAFFE.busy then
+
+		return nil
+	end
+
+	if data.character ~= character then
+		data.character = character
+		data.lastCheckAt = 0
+		data.lastEatRemoteAt = 0
+		data.lastDrinkRemoteAt = 0
+		data.grassGraceUntil = 0
+		data.drinkGraceUntil = 0
+		data.lastFood = nil
+		data.lastWater = nil
+	end
+
+	local velocity =
+		root.AssemblyLinearVelocity
+
+	local planarSpeed =
+		Vector3.new(
+			velocity.X,
+			0,
+			velocity.Z
+		).Magnitude
+
+	if planarSpeed < 2 then
+		return nil
+	end
+
+	local now = tick()
+
+	if now - (data.lastCheckAt or 0) < 0.08 then
+		if now < (data.grassGraceUntil or 0) then
+			return "eat_grace"
+		end
+
+		if now < (data.drinkGraceUntil or 0) then
+			return "drink_grace"
+		end
+
+		return nil
+	end
+
+	data.lastCheckAt = now
+
+	local food =
+		tonumber(
+			character:GetAttribute("Food")
+		) or 100
+
+	local water =
+		tonumber(
+			character:GetAttribute("Water")
+		) or 100
+
+	if type(data.lastFood) == "number"
+		and food > data.lastFood + 0.01 then
+
+		data.grassGraceUntil =
+			math.max(
+				data.grassGraceUntil or 0,
+				now + 1.25
+			)
+	end
+
+	if type(data.lastWater) == "number"
+		and water > data.lastWater + 0.01 then
+
+		data.drinkGraceUntil =
+			math.max(
+				data.drinkGraceUntil or 0,
+				now + 1.35
+			)
+	end
+
+	data.lastFood = food
+	data.lastWater = water
+
+	local detected =
+		detectAvailableFood(
+			character
+		)
+
+	local class =
+		getAnimalClass(
+			character
+		)
+
+	local classLower =
+		type(class) == "string"
+			and class:lower()
+			or ""
+
+	local herbivore =
+		classLower:find(
+			"herb",
+			1,
+			true
+		) ~= nil
+
+	local carnivore =
+		classLower:find(
+			"carn",
+			1,
+			true
+		) ~= nil
+
+	if classLower == "" then
+		carnivore =
+			isCarnivoreCharacter(
+				character
+			)
+
+		herbivore =
+			not carnivore
+				and not isBaboonCharacter(
+					character
+				)
+	end
+
+	-- Grass is opportunistic only: never search, steer, rotate or stop for it.
+	if detected == "Eat"
+		and herbivore
+		and not isGiraffeCharacter(character)
+		and state.autoEat
+		and food < 99 then
+
+		data.grassGraceUntil =
+			now + 1.35
+
+		-- E is only cosmetic. Consumption is started through the same
+		-- AskServerToSetSubState remote used by normal Auto Eat.
+		if now
+			- (data.lastEatRemoteAt or 0)
+			>= 0.55 then
+
+			data.lastEatRemoteAt = now
+			setSubState("Eating")
+
+			runtimeMessage =
+				"Auto Run: eating grass by remote while moving"
+		end
+
+		return "eat"
+	end
+
+	-- Water works the same way for herbivores/carnivores: use only water that
+	-- is already under/next to the running animal. Never create a water route.
+	if detected == "Drink"
+		and (herbivore or carnivore)
+		and state.autoDrink
+		and water < 99 then
+
+		data.drinkGraceUntil =
+			now + 1.50
+
+		-- E is only cosmetic here too. Keep the physical Auto Run untouched and
+		-- request Drinking directly from the server while water is underfoot.
+		if now
+			- (data.lastDrinkRemoteAt or 0)
+			>= 0.55 then
+
+			data.lastDrinkRemoteAt = now
+			setSubState("Drinking")
+
+			runtimeMessage =
+				"Auto Run: drinking by remote while moving"
+		end
+
+		return "drink"
+	end
+
+	if now < (data.grassGraceUntil or 0) then
+		return "eat_grace"
+	end
+
+	if now < (data.drinkGraceUntil or 0) then
+		return "drink_grace"
+	end
+
+	return nil
+end
+
 local function giraffeTapEatKey()
 	pcall(function()
 		VirtualInputManager:SendKeyEvent(
@@ -8583,14 +8820,38 @@ local function autoEatStep()
 	end
 
 	local availableFood = detectAvailableFood(character)
+	local movementInteraction
 
-	-- v109 TravelDistance grass policy:
-	-- Comfortable (>60%): NEVER leave the run just to search grass.
-	-- Grass already underfoot can still be tapped while W/Auto Run continues.
-	-- Low-food cycle (<=60%): allow normal Auto Eat routing until 85%.
+	if state.questMovementOpportunisticInteract then
+		movementInteraction =
+			state.questMovementOpportunisticInteract(
+				character,
+				root
+			)
+	end
+
+	-- TravelDistance grass policy:
+	-- if grass is already under the running herbivore, use it in-place while
+	-- Auto Run keeps owning movement. A real grass route is allowed only after
+	-- that on-path opportunity/grace is gone.
 	if travelHerbivoreFeeding then
-		if availableFood == "Eat"
-			and not state.questTravelHerbivoreFeed.active then
+		local grassOnPath =
+			availableFood == "Eat"
+				and state.questMotionMoving
+				and state.questMotionMode == "Land"
+
+		local grassGrace =
+			state.questMoveInteract
+				and tick()
+					< (
+						state.questMoveInteract.grassGraceUntil
+							or 0
+					)
+
+		if grassOnPath
+			or movementInteraction == "eat"
+			or movementInteraction == "eat_grace"
+			or grassGrace then
 
 			eatingToFull = false
 			eatingSourcePosition = nil
@@ -8598,35 +8859,7 @@ local function autoEatStep()
 			eatingStuckSince = nil
 
 			runtimeMessage =
-				"Auto Run: eating grass on the path"
-
-			if tick()
-				- (state.questLastEatTapAt or 0)
-				>= 0.8 then
-
-				state.questLastEatTapAt =
-					tick()
-
-				pcall(function()
-					VirtualInputManager:SendKeyEvent(
-						true,
-						Enum.KeyCode.E,
-						false,
-						game
-					)
-
-					task.wait(0.04)
-
-					VirtualInputManager:SendKeyEvent(
-						false,
-						Enum.KeyCode.E,
-						false,
-						game
-					)
-				end)
-
-				setSubState("Eating")
-			end
+				"Auto Run: eating grass while moving"
 
 			return
 		end
@@ -12767,6 +13000,35 @@ local function autoDrinkStep()
 			character:GetAttribute("Water")
 		) or 100
 
+	local movementInteraction
+	if state.questMovementOpportunisticInteract then
+		movementInteraction =
+			state.questMovementOpportunisticInteract(
+				character,
+				root
+			)
+	end
+
+	local movingDrinkGrace =
+		state.questMoveInteract
+			and state.questMotionMoving
+			and state.questMotionMode == "Land"
+			and tick()
+				< (
+					state.questMoveInteract.drinkGraceUntil
+						or 0
+				)
+
+	-- Water encountered naturally on the running path gets first chance.
+	-- Keep the route moving; only if that contact stops helping does the normal
+	-- Auto Drink search take ownership.
+	if movementInteraction == "drink"
+		or movementInteraction == "drink_grace"
+		or movingDrinkGrace then
+
+		return
+	end
+
 	-- Hippo/Croc need solid MainWaterPart BEFORE the approach. Enabling it
 	-- after arrival is too late for their large body physics.
 	if isAquaticCharacter(character)
@@ -14339,6 +14601,48 @@ function state.questGroup.samePlayer(a, b)
 	return okA and okB and idA ~= nil and idA == idB
 end
 
+function state.questGroup.getPlayerTeamName(targetPlayer)
+	if not targetPlayer then return nil end
+
+	local ok, team =
+		pcall(function()
+			return targetPlayer.Team
+		end)
+
+	if not ok or not team then
+		return nil
+	end
+
+	local name
+
+	if typeof(team) == "Instance" then
+		name = team.Name
+	elseif type(team) == "string" then
+		name = team
+	end
+
+	if type(name) == "string"
+		and name ~= "" then
+		return name
+	end
+
+	return nil
+end
+
+function state.questGroup.getPlayerMMBTeamName(targetPlayer)
+	local name =
+		state.questGroup.getPlayerTeamName(
+			targetPlayer
+		)
+
+	if type(name) == "string"
+		and name:match("^MMB[%w]$") then
+		return name
+	end
+
+	return nil
+end
+
 function state.questGroup.getPlayerAnimal(targetPlayer)
 	if not targetPlayer then return nil end
 	local character = targetPlayer.Character or workspace:FindFirstChild(targetPlayer.Name)
@@ -14362,6 +14666,11 @@ function state.questGroup.getPlayerPack(
 		return nil
 	end
 
+	local teamMMBName =
+		state.questGroup.getPlayerMMBTeamName(
+			targetPlayer
+		)
+
 	if type(handler.GetPlayerPackData)
 		== "function" then
 
@@ -14381,7 +14690,26 @@ function state.questGroup.getPlayerPack(
 		end
 
 		if ok and type(pack) == "table" then
-			return pack
+			if teamMMBName
+				and state.questGroup.getMMBPackName then
+
+				local directName =
+					state.questGroup.getMMBPackName(
+						pack
+					)
+
+				if type(directName) == "string"
+					and directName:lower()
+						== teamMMBName:lower() then
+
+					return pack
+				end
+
+				-- Team says the player is in another MMB pack. Treat this direct
+				-- result as stale and continue to the all-pack scan.
+			else
+				return pack
+			end
 		end
 	end
 
@@ -14408,6 +14736,25 @@ function state.questGroup.getPlayerPack(
 			) do
 				if type(candidate)
 					== "table" then
+
+					-- Player.Team is authoritative for MMB membership. The game sets
+					-- Team to the pack name (e.g. MMB3) before PackHandler membership
+					-- tables are always fully replicated.
+					if teamMMBName
+						and state.questGroup.getMMBPackName then
+
+						local candidateName =
+							state.questGroup.getMMBPackName(
+								candidate
+							)
+
+						if type(candidateName) == "string"
+							and candidateName:lower()
+								== teamMMBName:lower() then
+
+							return candidate
+						end
+					end
 
 					if candidate.Owner
 						and state.questGroup.samePlayer(
@@ -14445,6 +14792,16 @@ function state.questGroup.requestJoinIfFree(handler, packId)
 	if not handler or type(handler.RequestJoin) ~= "function" or packId == nil then
 		return false, "unavailable"
 	end
+
+	local teamName =
+		state.questGroup.getPlayerMMBTeamName(
+			player
+		)
+
+	if teamName then
+		return false, "already_grouped_team"
+	end
+
 	local current = state.questGroup.getPlayerPack(handler, player)
 	if current then return false, "already_grouped" end
 	local ok = pcall(handler.RequestJoin, packId)
@@ -14456,6 +14813,12 @@ function state.questGroup.acceptInviteIfFree(handler)
 	if not handler
 		or type(handler.AcceptInvite) ~= "function" then
 		return false, "unavailable"
+	end
+
+	if state.questGroup.getPlayerMMBTeamName(
+		player
+	) then
+		return false, "already_grouped_team"
 	end
 
 	if state.questGroup.getPlayerPack(
@@ -14487,16 +14850,57 @@ end
 
 function state.questGroup.hasOtherMember(pack)
 	if type(pack) ~= "table" then return false end
-	if pack.Owner and not state.questGroup.samePlayer(pack.Owner, player) then
+
+	if pack.Owner
+		and not state.questGroup.samePlayer(
+			pack.Owner,
+			player
+		) then
+
 		return true
 	end
+
 	if type(pack.NormalMembers) == "table" then
 		for _, member in pairs(pack.NormalMembers) do
-			if member and not state.questGroup.samePlayer(member, player) then
+			if member
+				and not state.questGroup.samePlayer(
+					member,
+					player
+				) then
+
 				return true
 			end
 		end
 	end
+
+	-- PackHandler member tables can lag. The live Team property is visible on
+	-- each Player immediately and carries the exact MMB pack name.
+	local packName =
+		state.questGroup.getMMBPackName
+			and state.questGroup.getMMBPackName(
+				pack
+			)
+
+	if type(packName) == "string" then
+		for _, other in ipairs(
+			Players:GetPlayers()
+		) do
+			if other ~= player then
+				local otherTeam =
+					state.questGroup.getPlayerMMBTeamName(
+						other
+					)
+
+				if type(otherTeam) == "string"
+					and otherTeam:lower()
+						== packName:lower() then
+
+					return true
+				end
+			end
+		end
+	end
+
 	return false
 end
 
@@ -14565,35 +14969,157 @@ end
 
 function state.questGroup.inviteMatchingPlayers(handler, animalName)
 	if not handler or type(handler.RequestInvite) ~= "function" then return 0 end
+
+	local ownTeamName =
+		state.questGroup.getPlayerMMBTeamName(
+			player
+		)
+
+	local ownPack =
+		state.questGroup.getCurrentPack(
+			handler
+		)
+
+	local ownPackName =
+		ownTeamName
+			or (
+				ownPack
+					and state.questGroup.getMMBPackName
+					and state.questGroup.getMMBPackName(
+						ownPack
+					)
+			)
+
 	local invited = 0
+
 	for _, other in ipairs(Players:GetPlayers()) do
-		if other ~= player and state.questGroup.sameAnimal(state.questGroup.getPlayerAnimal(other), animalName) then
-			local otherPack = state.questGroup.getPlayerPack(handler, other)
-			if not otherPack then
-				local last = state.questGroup.lastInviteAt[other.UserId] or 0
-				if tick() - last >= 30 then
-					local ok = pcall(handler.RequestInvite, other)
-					if not ok then ok = pcall(handler.RequestInvite, handler, other) end
-					if ok then
-						state.questGroup.lastInviteAt[other.UserId] = tick()
-						invited += 1
-						if invited >= 3 then break end
+		if other ~= player
+			and state.questGroup.sameAnimal(
+				state.questGroup.getPlayerAnimal(other),
+				animalName
+			) then
+
+			local otherTeamName =
+				state.questGroup.getPlayerMMBTeamName(
+					other
+				)
+
+			local teamAlreadyConfirmsMembership =
+				type(otherTeamName) == "string"
+					and (
+						not ownPackName
+							or otherTeamName:lower()
+								== ownPackName:lower()
+							or otherTeamName:match("^MMB[%w]$")
+					)
+
+			-- Team replication is treated as authoritative. If Properties already
+			-- shows Team = MMBx, never send another invite even if PackHandler's
+			-- NormalMembers table is temporarily stale.
+			if not teamAlreadyConfirmsMembership then
+				local otherPack =
+					state.questGroup.getPlayerPack(
+						handler,
+						other
+					)
+
+				if not otherPack then
+					local last =
+						state.questGroup.lastInviteAt[
+							other.UserId
+						] or 0
+
+					if tick() - last >= 30 then
+						local ok =
+							pcall(
+								handler.RequestInvite,
+								other
+							)
+
+						if not ok then
+							ok =
+								pcall(
+									handler.RequestInvite,
+									handler,
+									other
+								)
+						end
+
+						if ok then
+							state.questGroup.lastInviteAt[
+								other.UserId
+							] = tick()
+
+							invited += 1
+
+							if invited >= 3 then
+								break
+							end
+						end
 					end
 				end
 			end
 		end
 	end
+
 	return invited
 end
 
 function state.questGroup.memberCount(pack)
 	if type(pack) ~= "table" then return 0 end
-	local count = pack.Owner and 1 or 0
+
+	local count = 0
+	local seenUserIds = {}
+
+	local function addMember(member)
+		if not member then return end
+
+		local ok, userId =
+			pcall(function()
+				return member.UserId
+			end)
+
+		if ok and userId ~= nil then
+			if seenUserIds[userId] then return end
+			seenUserIds[userId] = true
+		end
+
+		count += 1
+	end
+
+	addMember(pack.Owner)
+
 	if type(pack.NormalMembers) == "table" then
 		for _, member in pairs(pack.NormalMembers) do
-			if member then count += 1 end
+			addMember(member)
 		end
 	end
+
+	-- Include Team-confirmed members that have not reached NormalMembers yet.
+	local packName =
+		state.questGroup.getMMBPackName
+			and state.questGroup.getMMBPackName(
+				pack
+			)
+
+	if type(packName) == "string" then
+		for _, livePlayer in ipairs(
+			Players:GetPlayers()
+		) do
+			local teamName =
+				state.questGroup.getPlayerMMBTeamName(
+					livePlayer
+				)
+
+			if type(teamName) == "string"
+				and teamName:lower()
+					== packName:lower() then
+
+				addMember(livePlayer)
+			end
+		end
+	end
+
 	return count
 end
 
@@ -14618,6 +15144,26 @@ function state.questGroup.getMMBPackName(pack)
 	end
 
 	return nil
+end
+
+function state.questGroup.teamMatchesPack(
+	targetPlayer,
+	pack
+)
+	local teamName =
+		state.questGroup.getPlayerMMBTeamName(
+			targetPlayer
+		)
+
+	local packName =
+		state.questGroup.getMMBPackName(
+			pack
+		)
+
+	return type(teamName) == "string"
+		and type(packName) == "string"
+		and teamName:lower()
+			== packName:lower()
 end
 
 function state.questGroup.isMMBPack(pack)
@@ -15124,6 +15670,26 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 	end
 
 	local pack = state.questGroup.getCurrentPack(handler)
+	local liveTeamName =
+		state.questGroup.getPlayerMMBTeamName(
+			player
+		)
+
+	-- If Roblox already exposes Team = MMBx, membership is confirmed even when
+	-- PackHandler is one replication step behind. Do not create/join/leave any
+	-- pack until the handler catches up.
+	if not pack
+		and liveTeamName then
+
+		state.questGroup.difficultySince = nil
+		state.questGroup.pendingPackAnimal = nil
+		state.questGroup.statusText =
+			"MMB co-op active via Team: "
+			.. liveTeamName
+
+		return true
+	end
+
 	if pack then
 		-- Do not act on the short stale PackHandler cache after an animal switch.
 		if not state.questGroup.sameAnimal(pack.AnimalName, animalName) then
@@ -16246,6 +16812,19 @@ function state.questGroup.coopLeaveForProbe(handler, pack)
 		return false
 	end
 
+	-- The actual Player.Team value is a stronger live membership signal than
+	-- the synchronized probe. Never force a confirmed MMB member to leave and
+	-- rejoin just to test PackHandler replication.
+	if state.questGroup.teamMatchesPack(
+		player,
+		pack
+	) then
+		state.questGroup.statusText =
+			"MMB co-op: Team confirms membership; staying in group"
+
+		return false
+	end
+
 	coop.probePackName =
 		state.questGroup.getMMBPackName(pack)
 
@@ -16268,6 +16847,27 @@ function state.questGroup.coopResumeAfterProbe(handler)
 
 	if not coop.probeLeft then
 		return false
+	end
+
+	local liveTeamName =
+		state.questGroup.getPlayerMMBTeamName(
+			player
+		)
+
+	if type(liveTeamName) == "string"
+		and type(coop.probePackName) == "string"
+		and liveTeamName:lower()
+			== coop.probePackName:lower() then
+
+		coop.probeLeft = false
+		coop.probePackName = nil
+		coop.probePackAnimal = nil
+		coop.probePackId = nil
+
+		state.questGroup.statusText =
+			"MMB co-op: Team already confirms group membership"
+
+		return true
 	end
 
 	local inWindow =
@@ -16365,6 +16965,30 @@ function state.questGroup.coopLifecycleStep()
 
 	local pack =
 		state.questGroup.getCurrentPack(handler)
+
+	local liveTeamName =
+		state.questGroup.getPlayerMMBTeamName(
+			player
+		)
+
+	-- PackHandler can lag behind Player.Team. While Team already says MMBx,
+	-- never fall through to the "not grouped" branch and request another join.
+	if not pack
+		and liveTeamName then
+
+		if coop.probeLeft then
+			coop.probeLeft = false
+			coop.probePackName = nil
+			coop.probePackAnimal = nil
+			coop.probePackId = nil
+		end
+
+		state.questGroup.statusText =
+			"MMB co-op active via Team: "
+			.. liveTeamName
+
+		return
+	end
 
 	-- --------------------------------------------------------
 	-- CURRENTLY IN AN MMB PACK
@@ -20105,7 +20729,9 @@ local function updateQuestAutomation()
 			incompleteTravelCount += 1
 			questTravelWanted = true
 
-			if isLandDistanceQuest(quest.props) then
+			-- Any TravelDistance handled on land needs virtual W held so the game
+			-- sees the normal movement input state while MoveTo owns steering.
+			if not isSwimQuest(quest.props) then
 				state.questLandInputActive = true
 			end
 
@@ -20961,21 +21587,13 @@ function state.questLandWWatchStep()
 			watch.lastProgressAt = now
 			watch.hardRefreshCount += 1
 
-			if state.autoRunMoveOwnsInput then
-				runtimeMessage =
-					string.format(
-						"Land movement stalled for %.0fs; route controller recovering",
-						stalledFor
-					)
-			else
-				state.questHardRefreshW(
-					string.format(
-						"Land quest stalled for %.0fs; virtual W refreshed automatically",
-						stalledFor
-					),
-					false
-				)
-			end
+			state.questHardRefreshW(
+				string.format(
+					"Land quest stalled for %.0fs; virtual W refreshed automatically",
+					stalledFor
+				),
+				false
+			)
 		end
 	else
 		-- Rare fallback: if this server does not expose readable quest progress,
@@ -20983,14 +21601,10 @@ function state.questLandWWatchStep()
 		if now - (watch.lastHardRefreshAt or 0) >= 12 then
 			watch.lastHardRefreshAt = now
 
-			if state.autoRunMoveOwnsInput then
-				-- No keyboard pulse while world-space AutoRun owns movement.
-			else
-				state.questHardRefreshW(
-					"Land quest progress unreadable; virtual W refreshed as a safeguard",
-					true
-				)
-			end
+			state.questHardRefreshW(
+				"Land quest progress unreadable; virtual W refreshed as a safeguard",
+				true
+			)
 		end
 	end
 
@@ -24291,12 +24905,11 @@ end)
 
 
 -- Physical movement input can emit a real KeyUp/Move command that overrides the
--- virtual held W. Reassert ONLY when the player actually interacts with movement
--- controls; there is no continuous W spam.
+-- virtual held W. Reassert after real player movement input even while MoveTo owns
+-- Auto Run steering; W is a quest-state signal, not the steering source.
 local function questLandInputShouldStayHeld()
 	return state.alive
 		and state.autoQuests
-		and not state.autoRunMoveOwnsInput
 		and not state.questGrowthReset.exclusive
 		and (state.questLandInputActive or state.questSwimActive)
 		and not questSwitchingAnimal
@@ -24518,13 +25131,26 @@ task.spawn(function()
 	local autoProgressPosition
 	local autoProgressAt = 0
 
-	-- v118: stable MoveTo-compatible orbit state.
+	-- v130: high-resolution world-space orbit.
+	-- The target index is monotonic and can skip a waypoint that was already
+	-- passed, so high-speed animals never turn around to chase an old point.
 	local autoCircle = {
 		directionSign = 1,
 		waypointIndex = nil,
-		waypointCount = 24,
-		arrivalRadius = 6.5,
+		waypointCount = 48,
+		arrivalRadius = 3.25,
 		center = nil,
+	}
+
+	-- v130: choose a dry/open circle BEFORE farming TravelDistance.
+	-- This keeps obstacle/water avoidance as a fallback instead of making it the
+	-- normal steering source on every lap.
+	local autoArea = {
+		center = nil,
+		score = nil,
+		lastPlanAt = 0,
+		replanRequested = false,
+		replanAfter = 0,
 	}
 
 	-- v104: persistent high-hill intelligence for pure TravelDistance Auto Run.
@@ -24726,6 +25352,320 @@ task.spawn(function()
 		end
 
 		return false
+	end
+
+
+	-- v130: object raycasts for Auto Run must respect actual physics. Decorative
+	-- parts / foliage with CanCollide=false are invisible to this planner.
+	local function autoRunObjectRayParams(character)
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = {
+			character,
+			workspace.Terrain,
+		}
+		params.IgnoreWater = true
+		pcall(function()
+			params.RespectCanCollide = true
+		end)
+		return params
+	end
+
+	local function autoRunCircleAreaScore(
+		character,
+		root,
+		candidateCenter,
+		circleRadius
+	)
+		if not character
+			or not root
+			or typeof(candidateCenter) ~= "Vector3" then
+			return nil
+		end
+
+		local centerSurface =
+			autoRunTerrainSurfaceAt(
+				candidateCenter,
+				root.Position.Y
+			)
+
+		if not centerSurface
+			or centerSurface.Material == Enum.Material.Water then
+			return nil
+		end
+
+		local centerY = centerSurface.Position.Y
+		local sampleCount = 12
+		local ringPoints = {}
+		local ringGroundY = {}
+		local lowestY = centerY
+		local highestY = centerY
+		local score = 0
+
+		-- First reject water / cliffs. Water inside or close to the circle is a
+		-- hard failure; water farther out is only a large preference penalty.
+		for index = 0, sampleCount - 1 do
+			local theta =
+				index / sampleCount
+					* math.pi * 2
+
+			local radial =
+				Vector3.new(
+					math.cos(theta),
+					0,
+					math.sin(theta)
+				)
+
+			local ringPoint =
+				candidateCenter
+					+ radial * circleRadius
+
+			local surface =
+				autoRunTerrainSurfaceAt(
+					ringPoint,
+					centerY
+				)
+
+			if not surface
+				or surface.Material == Enum.Material.Water then
+				return nil
+			end
+
+			local y = surface.Position.Y
+			ringPoints[index + 1] =
+				Vector3.new(
+					ringPoint.X,
+					y,
+					ringPoint.Z
+				)
+
+			ringGroundY[index + 1] = y
+			lowestY = math.min(lowestY, y)
+			highestY = math.max(highestY, y)
+
+			if math.abs(y - centerY) > 11 then
+				return nil
+			end
+
+			local nearWater =
+				candidateCenter
+					+ radial
+						* (circleRadius + 42)
+
+			if autoRunWaterAt(
+				nearWater,
+				centerY
+			) then
+				return nil
+			end
+
+			local farWater =
+				candidateCenter
+					+ radial
+						* (circleRadius + 72)
+
+			if autoRunWaterAt(
+				farWater,
+				centerY
+			) then
+				score += 80
+			end
+		end
+
+		local verticalRange =
+			highestY - lowestY
+
+		if verticalRange > 13 then
+			return nil
+		end
+
+		score += verticalRange * 7
+
+		-- Verify the whole ring corridor, not only the center. Three parallel
+		-- lanes give large animals enough clearance from trees/rocks.
+		local params =
+			autoRunObjectRayParams(
+				character
+			)
+
+		local bodyHalf =
+			math.clamp(
+				state.movementFootprint(character)
+					* 0.58,
+				2.5,
+				8.5
+			)
+
+		local probeHeight =
+			math.clamp(
+				state.movementProbeHeight(character),
+				2.5,
+				8.5
+			)
+
+		for index = 1, sampleCount do
+			local nextIndex =
+				index % sampleCount + 1
+
+			local a = ringPoints[index]
+			local b = ringPoints[nextIndex]
+			local segment =
+				Vector3.new(
+					b.X - a.X,
+					0,
+					b.Z - a.Z
+				)
+
+			if segment.Magnitude > 0.05 then
+				local tangent =
+					segment.Unit
+
+				local side =
+					Vector3.new(
+						-tangent.Z,
+						0,
+						tangent.X
+					)
+
+				local y =
+					math.max(
+						ringGroundY[index],
+						ringGroundY[nextIndex]
+					)
+
+				for _, lateral in ipairs({
+					-bodyHalf,
+					0,
+					bodyHalf,
+				}) do
+					local origin =
+						Vector3.new(
+							a.X,
+							y + probeHeight,
+							a.Z
+						)
+						+ side * lateral
+
+					local hit =
+						workspace:Raycast(
+							origin,
+							segment,
+							params
+						)
+
+					if hit
+						and hit.Instance
+						and hit.Instance:IsA("BasePart")
+						and hit.Instance.CanCollide == false then
+						hit = nil
+					end
+
+					if hit then
+						return nil
+					end
+				end
+			end
+		end
+
+		-- Prefer the closest valid area only AFTER openness/dryness. Distance is
+		-- deliberately a weak cost so a clean field beats a nearby bad circle.
+		local travelDistance =
+			Vector3.new(
+				candidateCenter.X
+					- root.Position.X,
+				0,
+				candidateCenter.Z
+					- root.Position.Z
+			).Magnitude
+
+		score += travelDistance * 0.16
+
+		return score,
+			Vector3.new(
+				candidateCenter.X,
+				centerY,
+				candidateCenter.Z
+			)
+	end
+
+	local function autoRunFindBestCircleCenter(
+		character,
+		root,
+		circleRadius
+	)
+		if not character or not root then
+			return nil, nil, false
+		end
+
+		local bestCenter
+		local bestScore = math.huge
+
+		local seedAngle =
+			(player.UserId % 360)
+				/ 180 * math.pi
+
+		-- Search locally first, then farther away. The last 200-stud ring is only
+		-- accepted when it is genuinely cleaner/drier than the nearer candidates.
+		for _, searchRadius in ipairs({
+			0,
+			70,
+			130,
+			200,
+		}) do
+			local samples =
+				searchRadius == 0
+					and 1
+					or 8
+
+			for index = 0, samples - 1 do
+				local candidate
+
+				if searchRadius == 0 then
+					candidate =
+						root.Position
+				else
+					local theta =
+						seedAngle
+							+ index / samples
+								* math.pi * 2
+
+					candidate =
+						root.Position
+							+ Vector3.new(
+								math.cos(theta)
+									* searchRadius,
+								0,
+								math.sin(theta)
+									* searchRadius
+							)
+				end
+
+				local areaScore,
+					resolvedCenter =
+					autoRunCircleAreaScore(
+						character,
+						root,
+						candidate,
+						circleRadius
+					)
+
+				if areaScore
+					and areaScore < bestScore then
+					bestScore = areaScore
+					bestCenter = resolvedCenter
+				end
+			end
+		end
+
+		if bestCenter then
+			return bestCenter,
+				bestScore,
+				true
+		end
+
+		return root.Position,
+			math.huge,
+			false
 	end
 
 	local function autoRunDryCorridorScore(
@@ -24934,10 +25874,16 @@ task.spawn(function()
 				autoWater.anchor = nil
 				autoWater.bestProjection = 0
 
-				center = root.Position
+				-- The old code blindly centered the next circle exactly where the
+				-- water escape ended. Search a genuinely open/dry area instead.
+				center = nil
 				angle = 0
 				autoCircle.waypointIndex = nil
 				autoCircle.center = nil
+				autoArea.center = nil
+				autoArea.score = nil
+				autoArea.replanRequested = true
+				autoArea.replanAfter = tick()
 
 				if autoAvoidReason
 					== "water_buffer" then
@@ -24946,7 +25892,7 @@ task.spawn(function()
 				end
 
 				runtimeMessage =
-					"Auto Run: dry area confirmed; resuming circle"
+					"Auto Run: dry area confirmed; searching clean circle"
 
 				return direction
 			end
@@ -25135,6 +26081,9 @@ task.spawn(function()
 		}
 
 		params.IgnoreWater = true
+		pcall(function()
+			params.RespectCanCollide = true
+		end)
 
 		local obstacle =
 			workspace:Raycast(
@@ -25149,6 +26098,13 @@ task.spawn(function()
 				heading * 32,
 				params
 			)
+
+		if obstacle
+			and obstacle.Instance
+			and obstacle.Instance:IsA("BasePart")
+			and obstacle.Instance.CanCollide == false then
+			obstacle = nil
+		end
 
 		if obstacle
 			and math.abs(
@@ -25473,6 +26429,9 @@ task.spawn(function()
 		params.FilterType = Enum.RaycastFilterType.Exclude
 		params.FilterDescendantsInstances = { character }
 		params.IgnoreWater = true
+		pcall(function()
+			params.RespectCanCollide = true
+		end)
 
 		local leftDirection = rotatePlanar(direction, -55)
 		local rightDirection = rotatePlanar(direction, 55)
@@ -25506,6 +26465,20 @@ task.spawn(function()
 				params
 			)
 
+		if leftHit
+			and leftHit.Instance
+			and leftHit.Instance:IsA("BasePart")
+			and leftHit.Instance.CanCollide == false then
+			leftHit = nil
+		end
+
+		if rightHit
+			and rightHit.Instance
+			and rightHit.Instance:IsA("BasePart")
+			and rightHit.Instance.CanCollide == false then
+			rightHit = nil
+		end
+
 		if leftHit and not rightHit then return 1 end
 		if rightHit and not leftHit then return -1 end
 
@@ -25527,45 +26500,203 @@ task.spawn(function()
 			return nil, nil, nil
 		end
 
-		local count = math.max(8, tonumber(autoCircle.waypointCount) or 16)
-		local centerChanged = not autoCircle.center
-			or Vector3.new(autoCircle.center.X-circleCenter.X,0,autoCircle.center.Z-circleCenter.Z).Magnitude > 1
-		if centerChanged then
-			autoCircle.center = circleCenter
-			autoCircle.waypointIndex = nil
-		end
+		local count =
+			math.max(
+				16,
+				tonumber(autoCircle.waypointCount)
+					or 48
+			)
 
-		if autoCircle.waypointIndex == nil then
-			local offset = Vector3.new(root.Position.X-circleCenter.X,0,root.Position.Z-circleCenter.Z)
-			if offset.Magnitude >= 5 then
-				local nearestIndex, nearestDistance = 0, math.huge
-				for index = 0, count - 1 do
-					local angle = index / count * math.pi * 2
-					local point = Vector3.new(circleCenter.X+math.cos(angle)*circleRadius,root.Position.Y,circleCenter.Z+math.sin(angle)*circleRadius)
-					local d = Vector3.new(root.Position.X-point.X,0,root.Position.Z-point.Z).Magnitude
-					if d < nearestDistance then nearestDistance, nearestIndex = d, index end
-				end
-				autoCircle.waypointIndex = (nearestIndex + autoCircle.directionSign) % count
-			else
-				-- World-space deterministic start. No view/facing input.
-				autoCircle.waypointIndex = player.UserId % count
-			end
+		local centerChanged =
+			not autoCircle.center
+				or Vector3.new(
+					autoCircle.center.X
+						- circleCenter.X,
+					0,
+					autoCircle.center.Z
+						- circleCenter.Z
+				).Magnitude > 1
+
+		if centerChanged then
+			autoCircle.center =
+				circleCenter
+			autoCircle.waypointIndex =
+				nil
 		end
 
 		local function pointAt(index)
-			local angle = index / count * math.pi * 2
-			return Vector3.new(circleCenter.X+math.cos(angle)*circleRadius,root.Position.Y,circleCenter.Z+math.sin(angle)*circleRadius)
+			local theta =
+				(index % count)
+					/ count
+					* math.pi * 2
+
+			return Vector3.new(
+				circleCenter.X
+					+ math.cos(theta)
+						* circleRadius,
+				root.Position.Y,
+				circleCenter.Z
+					+ math.sin(theta)
+						* circleRadius
+			)
 		end
 
-		local target = pointAt(autoCircle.waypointIndex)
-		local delta = Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
-		if delta.Magnitude <= (autoCircle.arrivalRadius or 6) then
-			autoCircle.waypointIndex = (autoCircle.waypointIndex + autoCircle.directionSign) % count
-			target = pointAt(autoCircle.waypointIndex)
-			delta = Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
+		local offset =
+			Vector3.new(
+				root.Position.X
+					- circleCenter.X,
+				0,
+				root.Position.Z
+					- circleCenter.Z
+			)
+
+		local nearestIndex = 0
+
+		if offset.Magnitude > 0.05 then
+			local theta =
+				math.atan2(
+					offset.Z,
+					offset.X
+				)
+
+			if theta < 0 then
+				theta += math.pi * 2
+			end
+
+			nearestIndex =
+				math.floor(
+					theta
+						/ (math.pi * 2)
+						* count
+						+ 0.5
+				) % count
 		end
-		if delta.Magnitude <= 0.05 then return target,nil,0 end
-		return target,delta.Unit,delta.Magnitude
+
+		local sign =
+			autoCircle.directionSign >= 0
+				and 1
+				or -1
+
+		local radialError =
+			math.abs(
+				offset.Magnitude
+					- circleRadius
+			)
+
+		local lookAhead =
+			radialError > circleRadius * 0.55
+				and 1
+				or 2
+
+		local function forwardSteps(
+			fromIndex,
+			toIndex
+		)
+			if sign > 0 then
+				return (
+					toIndex - fromIndex
+				) % count
+			end
+
+			return (
+				fromIndex - toIndex
+			) % count
+		end
+
+		if autoCircle.waypointIndex == nil then
+			autoCircle.waypointIndex =
+				(
+					nearestIndex
+						+ sign * lookAhead
+				) % count
+		else
+			local ahead =
+				forwardSteps(
+					nearestIndex,
+					autoCircle.waypointIndex
+				)
+
+			-- If the stored checkpoint is now behind the animal, discard it.
+			-- This is the old high-speed "go back to the point I missed" bug.
+			if ahead == 0
+				or ahead > count * 0.45 then
+				autoCircle.waypointIndex =
+					(
+						nearestIndex
+							+ sign * lookAhead
+					) % count
+			end
+		end
+
+		local target =
+			pointAt(
+				autoCircle.waypointIndex
+			)
+
+		local delta =
+			Vector3.new(
+				target.X - root.Position.X,
+				0,
+				target.Z - root.Position.Z
+			)
+
+		-- Advance monotonically. If the following point is already closer, the
+		-- current one was passed between frames and must never be chased backward.
+		for _ = 1, 4 do
+			local nextIndex =
+				(
+					autoCircle.waypointIndex
+						+ sign
+				) % count
+
+			local nextTarget =
+				pointAt(
+					nextIndex
+				)
+
+			local nextDelta =
+				Vector3.new(
+					nextTarget.X
+						- root.Position.X,
+					0,
+					nextTarget.Z
+						- root.Position.Z
+				)
+
+			local arrived =
+				delta.Magnitude
+					<= (
+						autoCircle.arrivalRadius
+							or 3.25
+					)
+
+			local passed =
+				nextDelta.Magnitude
+					+ 0.65
+					< delta.Magnitude
+
+			if not arrived
+				and not passed then
+				break
+			end
+
+			autoCircle.waypointIndex =
+				nextIndex
+			target =
+				nextTarget
+			delta =
+				nextDelta
+		end
+
+		if delta.Magnitude <= 0.05 then
+			return target,
+				nil,
+				0
+		end
+
+		return target,
+			delta.Unit,
+			delta.Magnitude
 	end
 
 	local function autoRunAvoidDirection(
@@ -25682,6 +26813,9 @@ task.spawn(function()
 		params.FilterType = Enum.RaycastFilterType.Exclude
 		params.FilterDescendantsInstances = { character }
 		params.IgnoreWater = true
+		pcall(function()
+			params.RespectCanCollide = true
+		end)
 
 		local heavyMover =
 			state.isHeavyGroundMover(
@@ -25765,6 +26899,27 @@ task.spawn(function()
 
 			autoAvoidReason =
 				"object"
+
+			-- A real collidable object on the selected orbit means this was not a
+			-- clean farming area after all. Finish the immediate bypass, then choose
+			-- a different open circle instead of fighting the same object every lap.
+			if autoArea.center
+				and tick() - (autoArea.lastPlanAt or 0) >= 2.0 then
+				local radialDistance =
+					Vector3.new(
+						root.Position.X
+							- autoArea.center.X,
+						0,
+						root.Position.Z
+							- autoArea.center.Z
+					).Magnitude
+
+				if math.abs(radialDistance - radius) <= 18 then
+					autoArea.replanRequested = true
+					autoArea.replanAfter =
+						tick() + 0.9
+				end
+			end
 
 			local sideVector =
 				Vector3.new(
@@ -25895,6 +27050,25 @@ task.spawn(function()
 			and not buriedNow
 			and character and root
 
+		local moveInteract =
+			state.questMoveInteract
+
+		local grassMoveGrace =
+			moveInteract
+				and tick()
+					< (
+						moveInteract.grassGraceUntil
+							or 0
+					)
+
+		local drinkMoveGrace =
+			moveInteract
+				and tick()
+					< (
+						moveInteract.drinkGraceUntil
+							or 0
+					)
+
 		local canMove = commonSafe and (
 			(
 				swimMove
@@ -25907,21 +27081,29 @@ task.spawn(function()
 				and not eatingToFull
 				and (
 					travelGrassHerbivore
-						and food > 60
+						and (
+							food > 60
+								or grassMoveGrace
+						)
 					or (
 						not travelGrassHerbivore
-						and food > 68
+							and food > 68
 					)
 				)
 				and (
 					water > 75
-					or (
-						tick() < (state.drinkSearch.retryAfter or 0)
-						and water > 45
-					)
+						or (
+							drinkMoveGrace
+								and water > 45
+						)
+						or (
+							tick() < (state.drinkSearch.retryAfter or 0)
+								and water > 45
+						)
 				)
 			)
 		)
+
 
 		if canMove and swimMove then
 			-- Cheap watchdog: the known swim circle is entirely inside water.
@@ -25950,23 +27132,80 @@ task.spawn(function()
 				state.questSetW(true)
 
 			elseif landMove then
-				-- v128: no keyboard/camera-relative steering in Land AutoRun.
-				state.questSetW(false)
+				-- Steering stays 100% MoveTo/world-space. W is held only as the
+				-- game's movement-state signal required by TravelDistance quests.
+				state.questSetW(true)
 			else
 				state.questSetW(false)
 			end
 
-			if trackedCharacter ~= character
-				or not center
-				or wasSwimming ~= swimMove
-				or (not swimMove and (root.Position - center).Magnitude > 80) then
+			if landMove
+				and not swimMove
+				and state.questMovementOpportunisticInteract then
 
+				pcall(
+					state.questMovementOpportunisticInteract,
+					character,
+					root
+				)
+			end
+
+			local needsCirclePlan =
+				trackedCharacter ~= character
+					or not center
+					or wasSwimming ~= swimMove
+
+			if not swimMove
+				and autoArea.replanRequested
+				and tick() >= (autoArea.replanAfter or 0)
+				and not (
+					autoAvoidReason == "object"
+						and tick() < autoAvoidUntil
+				) then
+				needsCirclePlan = true
+			end
+
+			if needsCirclePlan then
 				trackedCharacter = character
 				wasSwimming = swimMove
-				center =
-					swimMove
-						and state.questSwimPosition
-						or root.Position
+
+				if swimMove then
+					center =
+						state.questSwimPosition
+					autoArea.center = nil
+					autoArea.score = nil
+					autoArea.replanRequested = false
+				else
+					local plannedCenter,
+						plannedScore,
+						foundCleanArea =
+							autoRunFindBestCircleCenter(
+								character,
+								root,
+								radius
+							)
+
+					center =
+						plannedCenter
+							or root.Position
+
+					autoArea.center = center
+					autoArea.score = plannedScore
+					autoArea.lastPlanAt = tick()
+					autoArea.replanRequested = false
+					autoArea.replanAfter = 0
+
+					if foundCleanArea then
+						runtimeMessage =
+							string.format(
+								"Auto Run: clean dry circle selected (score %.0f)",
+								plannedScore or 0
+							)
+					else
+						runtimeMessage =
+							"Auto Run: no fully clean circle found; using safest local fallback"
+					end
+				end
 
 				angle = 0
 				autoCircle.waypointIndex = nil
@@ -25985,13 +27224,10 @@ task.spawn(function()
 				autoWater.progressAt = 0
 				autoWater.bestProjection = 0
 				autoAvoidTarget = nil
-
-				if autoAvoidReason == "hill"
-					or autoAvoidReason
-						== "water_buffer" then
-					autoAvoidReason = nil
-					autoAvoidUntil = 0
-				end
+				autoAvoidReason = nil
+				autoAvoidUntil = 0
+				autoBlockingInstance = nil
+				autoBlockingSince = 0
 			end
 
 			if tick() - (state.questLastSubStateAt or 0) >= (swimMove and 1.25 or 0.75) then
@@ -26104,7 +27340,7 @@ task.spawn(function()
 									or "?"
 							),
 							autoCircle.waypointCount
-								or 24,
+								or 48,
 							circleTargetDistance
 								or 0
 						)
@@ -26324,6 +27560,10 @@ task.spawn(function()
 			wasMoving = false
 			wasSwimming = false
 			center = nil
+			autoArea.center = nil
+			autoArea.score = nil
+			autoArea.replanRequested = false
+			autoArea.replanAfter = 0
 			state.questMotionCal.key = nil
 			state.questMotionCal.targetSpeed = 0
 			state.questMotionCal.actualSpeed = 0
