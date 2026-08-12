@@ -131,6 +131,13 @@ local state = {
 		exclusiveSince = 0,
 		restoreAutoEat = nil,
 		restoreAutoDrink = nil,
+
+		-- v108: keep quest-reset Growth slots at the same safe slot-switch
+		-- location used by Grow Slots.
+		stagingBusy = false,
+		stagingRetryAt = 0,
+		debtStageCharacterName = nil,
+		debtStageDone = false,
 	},
 	safeMove = {
 		active = false,
@@ -881,6 +888,11 @@ state.drinkTest = state.drinkTest or {
 	lastResult = nil,
 	savedDamageCooldown = nil,
 	retryAfter = 0,
+
+	-- v107: one-shot emergency fallback used only when Surface Water search
+	-- fails below 70%. It never changes the player's selected mode.
+	emergencyFallback = false,
+
 	humanoidSnapshot = nil,
 	transitLastY = nil,
 	transitLastYAt = 0,
@@ -6482,9 +6494,26 @@ local function autoEatStep()
 	local giraffe = isGiraffeCharacter(character)
 	local baboon = not giraffe and isBaboonCharacter(character)
 	local carnivore = not giraffe and not baboon and isCarnivoreCharacter(character)
-	local questCarnivore = state.autoQuests and carnivore and not preSwitchFoodTarget
-	local questBaboon = state.autoQuests and baboon and not preSwitchFoodTarget
-	local questGiraffe = state.autoQuests and giraffe and not preSwitchFoodTarget
+
+	-- v108:
+	-- The "wait until <=70%, then feed to 100%" policy exists ONLY while an
+	-- actual Survive in Zone / ZoneTime cycle is being protected.
+	-- For TravelDistance, Growth debt, GroupTime, post-quest Growth, etc.,
+	-- Auto Eat behaves normally and does not wait for ~70%.
+	local zoneSurvivalFeeding =
+		state.autoQuests
+			and state.questZoneDrinkOverride
+			and state.questZoneDrinkOverride.active
+			and not preSwitchFoodTarget
+
+	local questCarnivore =
+		zoneSurvivalFeeding and carnivore
+
+	local questBaboon =
+		zoneSurvivalFeeding and baboon
+
+	local questGiraffe =
+		zoneSurvivalFeeding and giraffe
 
 	-- Baboon never competes with Auto Drink. If Water needs service, drop all
 	-- Baboon food ownership immediately and let autoDrinkStep take over.
@@ -6498,7 +6527,7 @@ local function autoEatStep()
 	end
 
 	-- Giraffe eats ONLY tree Leaves from workspace.MapAssets.MainAssets.
-	-- During Auto Quests it pauses the route at <=70% and feeds to 100%.
+	-- During an active ZoneTime it may delay feeding to <=70% to avoid leaving the zone.
 	if questGiraffe then
 		if not state.questGiraffeFeeding and food <= 70 then
 			state.questRememberZoneBeforeFeeding("Giraffe feeding")
@@ -6555,9 +6584,8 @@ local function autoEatStep()
 		BABOON.cancel()
 	end
 
-	-- Carnívoro durante Auto Quests:
-	-- só interrompe as quests quando Food chegar a 70% ou menos.
-	-- Depois que começa, continua procurando/comendo carcaça até 100%.
+	-- Carnivore during active ZoneTime:
+	-- only leaves the protected zone for food at <=70%; once started, feeds to 100%.
 	if questCarnivore then
 		if not state.questCarnivoreFeeding and food <= 70 then
 			state.questRememberZoneBeforeFeeding("Carnivore feeding")
@@ -6633,9 +6661,9 @@ local function autoEatStep()
 			return
 		end
 
-		if not eatingToFull and food > 68 then
-			return
-		end
+		-- v108: no suppression here. If there is no Eat prompt underfoot,
+		-- normal Auto Eat may route to food immediately; that physical movement
+		-- can still contribute to TravelDistance.
 	end
 
 	if not eatingToFull then
@@ -7356,7 +7384,11 @@ end
 
 local forcingPostDrinkMove = false
 
-local function ensureOnSolidGround(targetPosition, label)
+local function ensureOnSolidGround(
+	targetPosition,
+	label,
+	allowDuringGrowthReset
+)
 	label = label or "safe ground"
 	criticalRecoveryActive = true
 
@@ -7395,6 +7427,12 @@ local function ensureOnSolidGround(targetPosition, label)
 				-- is under the animal.
 				constantSpeed = not inVoid and not buried,
 				stopOnDryGround = not inVoid and not buried,
+
+				-- v108: quest Growth-reset staging is an intentional safety
+				-- movement performed while the exclusive reset lock is active.
+				allowDuringGrowthReset =
+					allowDuringGrowthReset == true,
+
 				maxDuration = 240,
 			}
 		)
@@ -9400,6 +9438,7 @@ function state.drinkTestRestoreEnvironment()
 	test.waterPart = nil
 	test.waterPartCanCollide = nil
 	test.savedDamageCooldown = nil
+	test.emergencyFallback = false
 end
 
 function state.drinkTestEmergencySurfaceExit(reason)
@@ -10633,6 +10672,7 @@ local function autoDrinkStep()
 		state.drinkSearch.upsideDownSince = nil
 		state.drinkSearch.waterHealth = nil
 		state.drinkSearch.waterHealthAt = 0
+		state.drinkTest.emergencyFallback = false
 
 		removeSwimBarrier()
 
@@ -10905,8 +10945,118 @@ local function autoDrinkStep()
 	end
 
 	if not spot then
+		-- v107 EMERGENCY RULE:
+		-- If Surface Water cannot find a usable puddle/river and Water is
+		-- already below 70%, temporarily use the protected underground backend.
+		-- This does NOT change autoDrinkMode or the player's saved preference.
+		local emergencyUnderground =
+			isSavannahLife
+				and water < 70
+				and state.autoDrinkMode == "surface"
+
+		if emergencyUnderground then
+			state.drinkSearch.failedCount = 0
+			state.drinkSearch.retryAfter = 0
+
+			drinkingToFull = true
+			eatingToFull = false
+			eatingSourcePosition = nil
+			activeCarcass = nil
+
+			state.questBaboonFeeding = false
+			state.questGiraffeFeeding = false
+			state.questTravelActive = false
+			state.questLandInputActive = false
+			state.questMotionMoving = false
+			state.questMotionMode = nil
+
+			BABOON.cancel()
+			GIRAFFE.cancel()
+
+			if state.questSetW then
+				pcall(
+					state.questSetW,
+					false
+				)
+			end
+
+			if state.safeMove
+				and state.safeMove.active then
+				state.safeMove.cancelToken += 1
+			end
+
+			if state.drinkTest.active
+				or state.drinkTest.emergencyFallback then
+
+				runtimeMessage =
+					string.format(
+						"Emergency Underground Drink active (Water %d%%)",
+						math.floor(water)
+					)
+
+				return
+			end
+
+			if tick()
+				< (
+					state.drinkTest.retryAfter or 0
+				) then
+
+				runtimeMessage =
+					string.format(
+						"Emergency Underground Drink cooling down (Water %d%%)",
+						math.floor(water)
+					)
+
+				return
+			end
+
+			state.drinkTest.emergencyFallback = true
+
+			runtimeMessage =
+				string.format(
+					"No safe surface water found at %d%%; emergency Underground Drink",
+					math.floor(water)
+				)
+
+			task.spawn(function()
+				local ok, err =
+					pcall(
+						state.runUndergroundDrinkTest
+					)
+
+				state.drinkTest.emergencyFallback = false
+				state.drinkSearch.failedCount = 0
+				state.drinkSearch.retryAfter = 0
+
+				if not ok then
+					state.drinkTest.lastResult = "failed"
+					state.drinkTest.lastError =
+						tostring(err)
+					state.drinkTest.retryAfter =
+						tick() + 4
+
+					runtimeMessage =
+						"Emergency Underground Drink error; retrying safely"
+
+					return
+				end
+
+				if state.drinkTest.lastResult == "failed" then
+					state.drinkTest.retryAfter =
+						tick() + 4
+				else
+					state.drinkTest.retryAfter = 0
+				end
+			end)
+
+			return
+		end
+
+		-- Above the emergency threshold, keep the normal surface retry behavior.
 		state.drinkSearch.failedCount =
 			(state.drinkSearch.failedCount or 0) + 1
+
 		runtimeMessage =
 			"No exposed water reachable with safe movement"
 
@@ -10914,8 +11064,10 @@ local function autoDrinkStep()
 			state.drinkSearch.failedCount = 0
 			state.drinkSearch.retryAfter = tick() + 10
 			drinkingToFull = false
-			runtimeMessage = "Busca de agua falhou; Auto Run liberado por 10s"
+			runtimeMessage =
+				"Water search failed; Auto Run released for 10s"
 		end
+
 		return
 	end
 
@@ -14822,6 +14974,101 @@ function state.questGrowthResetIsZero(value)
 	return value <= 1
 end
 
+function state.questGrowthResetStageDebt(reason)
+	local resetState =
+		state.questGrowthReset
+
+	local tracked =
+		resetState.active
+
+	if not tracked then
+		return false
+	end
+
+	if resetState.stagingBusy then
+		return true
+	end
+
+	if tick()
+		< (
+			resetState.stagingRetryAt
+				or 0
+		) then
+		return true
+	end
+
+	local character =
+		player.Character
+
+	if not character then
+		return true
+	end
+
+	local currentName =
+		character:GetAttribute(
+			"CharacterName"
+		)
+
+	if type(tracked.characterName) == "string"
+		and tracked.characterName ~= ""
+		and currentName ~= tracked.characterName then
+
+		-- Do not accidentally move another slot while replication/switching is
+		-- catching up. Keep the Growth debt alive and retry shortly.
+		resetState.stagingRetryAt =
+			tick() + 2
+
+		return true
+	end
+
+	if state.atSlotSwitchPoint
+		and state.atSlotSwitchPoint() then
+
+		resetState.debtStageCharacterName =
+			tracked.characterName
+
+		resetState.debtStageDone = true
+		return false
+	end
+
+	resetState.stagingBusy = true
+
+	runtimeMessage =
+		reason
+			or "Growth debt: moving slot to switch point"
+
+	task.spawn(function()
+		local moved =
+			state.moveBeforeSlotChange
+			and state.moveBeforeSlotChange()
+
+		resetState.stagingBusy = false
+
+		if moved then
+			resetState.debtStageCharacterName =
+				tracked.characterName
+
+			resetState.debtStageDone = true
+			resetState.stagingRetryAt = 0
+
+			runtimeMessage =
+				"Growth debt: slot staged at switch point"
+		else
+			resetState.debtStageDone = false
+			resetState.stagingRetryAt =
+				tick() + 3
+
+			runtimeMessage =
+				"Growth debt: staging failed; retrying"
+		end
+
+		state.questForceFastRecheckUntil =
+			tick() + 8
+	end)
+
+	return true
+end
+
 function state.questGrowthResetMaintain(records)
 	local tracked = state.questGrowthReset.active
 	if not tracked then return false end
@@ -14836,10 +15083,31 @@ function state.questGrowthResetMaintain(records)
 	end
 
 	if isGrowthComplete(entry.GrowthPercentage) then
+		-- v108: final handoff is forbidden while this quest-reset slot is still
+		-- scattered somewhere in the world. Bring it back to the SAME slot
+		-- switch location used by Grow Slots first.
+		if not state.atSlotSwitchPoint
+			or not state.atSlotSwitchPoint() then
+
+			state.questGrowthResetStageDebt(
+				"Growth debt 100%: returning slot to switch point before handoff"
+			)
+
+			return true
+		end
+
 		state.questGrowthReset.active = nil
 		state.questGrowthReset.busy = false
-		runtimeMessage = "Quest growth reset slot returned to 100%"
-		state.questForceFastRecheckUntil = tick() + 12
+		state.questGrowthReset.debtStageCharacterName = nil
+		state.questGrowthReset.debtStageDone = false
+		state.questGrowthReset.stagingRetryAt = 0
+
+		runtimeMessage =
+			"Quest growth reset slot returned to 100% at switch point"
+
+		state.questForceFastRecheckUntil =
+			tick() + 12
+
 		return false
 	end
 
@@ -15080,6 +15348,10 @@ function state.questGrowthResetCurrent(entry)
 	state.questGrowthReset.busy = true
 	state.questGrowthReset.pendingResetName = nil
 	state.questGrowthReset.lastAttemptAt = tick()
+	state.questGrowthReset.stagingBusy = false
+	state.questGrowthReset.stagingRetryAt = 0
+	state.questGrowthReset.debtStageCharacterName = nil
+	state.questGrowthReset.debtStageDone = false
 	questSwitchingAnimal = true
 	questTravelWanted = false
 	state.questTravelActive = false
@@ -15109,9 +15381,38 @@ function state.questGrowthResetCurrent(entry)
 			return
 		end
 
-		runtimeMessage = "Growth: exclusive reset ready; leaving current animal"
+		runtimeMessage =
+			"Growth: exclusive reset ready; staging slot before reset"
+
+		-- v108: use the exact same safe slot-switch location as Grow Slots
+		-- BEFORE clearing this mature quest slot. This prevents saved slots
+		-- from being left scattered at the last quest position.
+		if not state.moveBeforeSlotChange
+			or not state.moveBeforeSlotChange() then
+
+			state.questGrowthReset.failedUntil =
+				tick() + 6
+
+			state.questGrowthReset.busy = false
+			questSwitchingAnimal = false
+
+			questStatusText =
+				"Growth: could not stage slot before reset"
+
+			state.questGrowthResetEndExclusive(
+				"Growth reset postponed; slot-switch point was not confirmed"
+			)
+
+			return
+		end
+
+		task.wait(0.25)
+
+		runtimeMessage =
+			"Growth: slot staged; leaving current animal"
 
 		-- Correct order:
+		-- 0) stage at the shared slot-switch point;
 		-- 1) leave/restart the currently spawned animal;
 		-- 2) clear the SAVED slot growth;
 		-- 3) prove SavedCharacters says ~0%;
@@ -16239,6 +16540,10 @@ local function updateQuestAutomation()
 	end
 
 	if actionableQuestCount == 0 and growthDebtActive then
+		state.questZoneDrinkRelease(
+			"zone_complete"
+		)
+
 		state.questClearReturnZone()
 		questTargetZoneName = nil
 		questTravelWanted = false
@@ -16246,8 +16551,36 @@ local function updateQuestAutomation()
 		state.questLandInputActive = false
 		state.questSetW(false)
 		state.autoEat, state.autoDrink = true, true
-		questStatusText = "Quests done; returning reset Growth slot to 100%"
-		runtimeMessage = "Growth debt active: this slot must reach 100% before handoff"
+
+		local tracked =
+			state.questGrowthReset.active
+
+		local trackedName =
+			tracked
+				and tracked.characterName
+
+		local stagedThisDebt =
+			state.questGrowthReset.debtStageDone
+				and trackedName
+					== state.questGrowthReset.debtStageCharacterName
+
+		if not stagedThisDebt then
+			state.questGrowthResetStageDebt(
+				"Quests done: moving reset Growth slot to switch point"
+			)
+
+			questStatusText =
+				"Quests done; staging reset Growth slot"
+
+			return
+		end
+
+		questStatusText =
+			"Quests done; returning reset Growth slot to 100%"
+
+		runtimeMessage =
+			"Growth debt active: staged slot must reach 100% before handoff"
+
 		return
 	end
 
@@ -18335,24 +18668,84 @@ state.growthTopUp = state.growthTopUp or {
 	maxSlots = 40,
 }
 
-local function findNamedSpawnPart(name)
-	local spawns = workspace:FindFirstChild("Spawns")
-	if not spawns then return nil end
-	return spawns:FindFirstChild(name, true)
+function state.slotSwitchTarget()
+	-- Same staging point used by Grow Slots.
+	local spawnName =
+		isDinoLife
+			and "NestRock3"
+			or "PrideRockSpawn1"
+
+	local spawns =
+		workspace:FindFirstChild("Spawns")
+
+	local namedSpawn =
+		spawns
+			and spawns:FindFirstChild(
+				spawnName,
+				true
+			)
+
+	local target =
+		namedSpawn
+			and namedSpawn.Position
+			or (
+				selectedMoveToSpawn
+				and selectedMoveToSpawn.Parent
+				and selectedMoveToSpawn.Position
+			)
+			or getSafeFarmPosition()
+
+	local label =
+		namedSpawn
+			and spawnName
+			or "slot switch point"
+
+	return target, label
 end
 
-local function moveBeforeSlotChange()
-	-- Move fisicamente para o ponto de troca certo de cada jogo e só considera pronto
-	-- quando CONFIRMAR que o personagem está em terra firme (sem água, sem
-	-- void). Isso já desliga comer/beber durante toda a tentativa.
-	-- Savannah/Jungle usam PrideRockSpawn1; Dino Life usa NestRock3
-	-- (nomes diferentes por jogo — usar o nome errado faz cair no fallback
-	-- errado e o personagem nunca confirma terra firme).
-	local spawnName = isDinoLife and "NestRock3" or "PrideRockSpawn1"
-	local namedSpawn = findNamedSpawnPart(spawnName)
-	local target = namedSpawn and namedSpawn.Position or (selectedMoveToSpawn and selectedMoveToSpawn.Parent and selectedMoveToSpawn.Position) or getSafeFarmPosition()
-	local label = namedSpawn and spawnName or "ponto de troca"
-	return ensureOnSolidGround(target, label)
+function state.atSlotSwitchPoint()
+	local character, root =
+		characterParts()
+
+	if not character or not root then
+		return false
+	end
+
+	local target =
+		state.slotSwitchTarget()
+
+	if typeof(target) ~= "Vector3" then
+		return false
+	end
+
+	local flatDistance =
+		Vector3.new(
+			root.Position.X - target.X,
+			0,
+			root.Position.Z - target.Z
+		).Magnitude
+
+	if flatDistance > 28 then
+		return false
+	end
+
+	return state.normalizeDryLandState(
+		character,
+		root
+	)
+end
+
+function state.moveBeforeSlotChange()
+	-- Move physically to the shared slot-switch point and CONFIRM dry/safe
+	-- ground. allowDuringGrowthReset=true is required for quest reset staging.
+	local target, label =
+		state.slotSwitchTarget()
+
+	return ensureOnSolidGround(
+		target,
+		label,
+		true
+	)
 end
 
 local function growthStep()
@@ -18412,49 +18805,85 @@ local function growthStep()
 	local growth = character:GetAttribute("GrowthPercentage")
 	if type(growth) ~= "number" or not isGrowthComplete(growth) then return end
 
-	-- Antes de trocar de slot: comida e água precisam estar com boa margem.
-	-- Só dispara o "encher" se algum dos dois cair abaixo de 85% (histerese
-	-- — não fica reativando à toa). Quando dispara, enche os dois até perto
-	-- de 100% (15% de margem), NA ORDEM: primeiro toda a comida, só depois
-	-- a água — beber nunca interrompe o comer no meio. Depois de encher os
-	-- dois, para e não tenta de novo até algum cair abaixo de 85% de novo.
-	local food = character:GetAttribute("Food") or 100
-	local water = character:GetAttribute("Water") or 100
+	-- v106 slot-switch rule:
+	-- Carnivores only need Food + Water ABOVE 50%.
+	-- Herbivores/other animals only need Food + Water ABOVE 60%.
+	-- No more waiting for ~100% before changing slots.
+	local food =
+		tonumber(
+			character:GetAttribute("Food")
+		) or 100
 
-	if not state.growthTopUp.active and (food < 85 or water < 85) then
+	local water =
+		tonumber(
+			character:GetAttribute("Water")
+		) or 100
+
+	local slotSafeThreshold =
+		isCarnivoreCharacter(character)
+			and 50
+			or 60
+
+	-- "Above" means 51/61 is the first accepted integer target.
+	local slotSafeTarget =
+		slotSafeThreshold + 1
+
+	local foodSafe =
+		food > slotSafeThreshold
+
+	local waterSafe =
+		water > slotSafeThreshold
+
+	if not foodSafe then
 		state.growthTopUp.active = true
-		state.growthTopUp.startedAt = tick()
-	end
+		state.growthTopUp.startedAt =
+			state.growthTopUp.startedAt
+			or tick()
 
-	if state.growthTopUp.active then
-		local waitedTooLong = state.growthTopUp.startedAt and (tick() - state.growthTopUp.startedAt) >= state.growthTopUp.timeout
+		preSwitchFoodTarget =
+			slotSafeTarget
 
-		if waitedTooLong and food >= 50 and water >= 50 then
-			-- Desiste de esperar 100% (ex: carnívoro sem carcaça disponível
-			-- por perto — foi isso que travou o Rex pra sempre no Dino Life)
-			-- e troca de slot mesmo assim, já que está num nível seguro.
-			runtimeMessage = string.format("Não consegui encher 100%% a tempo (Food %d%%  Water %d%%); trocando mesmo assim", math.floor(food), math.floor(water))
-			preSwitchFoodTarget = nil
-			preSwitchWaterTarget = nil
-			state.growthTopUp.active = false
-			state.growthTopUp.startedAt = nil
-		elseif food < 99 then
-			preSwitchFoodTarget = 100
-			drinkingToFull = false -- beber não pode interromper o comer agora
-			runtimeMessage = string.format("Filling up before slot switch (Food %d%%  Water %d%%)", math.floor(food), math.floor(water))
-			return
-		elseif water < 99 then
-			preSwitchFoodTarget = nil
-			preSwitchWaterTarget = 100
-			drinkingToFull = true
-			runtimeMessage = string.format("Filling up before slot switch (Food %d%%  Water %d%%)", math.floor(food), math.floor(water))
-			return
-		else
-			preSwitchFoodTarget = nil
-			preSwitchWaterTarget = nil
-			state.growthTopUp.active = false
-			state.growthTopUp.startedAt = nil
-		end
+		preSwitchWaterTarget = nil
+
+		-- Food remains first so drinking cannot interrupt a feeding attempt.
+		drinkingToFull = false
+
+		runtimeMessage =
+			string.format(
+				"Slot switch safety: Food %d%% -> >%d%%",
+				math.floor(food),
+				slotSafeThreshold
+			)
+
+		return
+
+	elseif not waterSafe then
+		state.growthTopUp.active = true
+		state.growthTopUp.startedAt =
+			state.growthTopUp.startedAt
+			or tick()
+
+		preSwitchFoodTarget = nil
+		preSwitchWaterTarget =
+			slotSafeTarget
+
+		drinkingToFull = true
+
+		runtimeMessage =
+			string.format(
+				"Slot switch safety: Water %d%% -> >%d%%",
+				math.floor(water),
+				slotSafeThreshold
+			)
+
+		return
+
+	else
+		preSwitchFoodTarget = nil
+		preSwitchWaterTarget = nil
+
+		state.growthTopUp.active = false
+		state.growthTopUp.startedAt = nil
 	end
 
 	local completedName = character:GetAttribute("CharacterName")
@@ -18480,7 +18909,8 @@ local function growthStep()
 	-- Se não conseguir CONFIRMAR terra firme (sem void, sem água), aborta
 	-- essa tentativa e deixa o próximo ciclo do growthStep tentar de novo
 	-- — nunca troca de slot estando dentro do void ou da água.
-	local landedSafely = moveBeforeSlotChange()
+	local landedSafely =
+		state.moveBeforeSlotChange()
 	if not landedSafely then
 		runtimeMessage = "Não confirmei terra firme; adiando troca de slot"
 		state.autoEat, state.autoDrink = true, true
@@ -20087,7 +20517,7 @@ questInfoBody.Size = UDim2.new(1, -28, 0, 58)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Grow Existing stays on the current species; Grow All cycles every saved slot. GroupTime uses cooperative MMBx packs (MMB + one character), so Hub accounts in the same server can join each other instead of creating competing groups. AFK Coin can use a preselected owned animal."
+questInfoBody.Text = "Grow Existing: current species. Grow All: all saved slots. GroupTime: cooperative MMBx packs. AFK Coin can use your selected animal."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
@@ -20321,7 +20751,8 @@ local cornerHud = Instance.new("Frame")
 cornerHud.Size = UDim2.fromOffset(220, 94)
 cornerHud.Position = UDim2.new(1, -228, 0, 8)
 cornerHud.BackgroundColor3 = COLOR_BG
-cornerHud.BackgroundTransparency = 0.05
+-- v105: compact top-right HUD is intentionally more transparent.
+cornerHud.BackgroundTransparency = 0.38
 cornerHud.BorderSizePixel = 0
 cornerHud.Parent = gui
 corner(cornerHud, 10)
@@ -20359,6 +20790,7 @@ local cornerBarBg = Instance.new("Frame")
 cornerBarBg.Size = UDim2.new(1, -24, 0, 4)
 cornerBarBg.Position = UDim2.new(0, 12, 0, 53)
 cornerBarBg.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+cornerBarBg.BackgroundTransparency = 0.22
 cornerBarBg.BorderSizePixel = 0
 cornerBarBg.Parent = cornerHud
 corner(cornerBarBg, 4)
@@ -20849,6 +21281,30 @@ task.spawn(function()
 		failureRightPosition = nil,
 	}
 
+	-- v106: pure TravelDistance must NOT farm beside rivers/puddles.
+	-- Maintain a dry buffer and commit to an escape heading instead of letting
+	-- the 30-stud run circle repeatedly graze the shoreline.
+	local autoWater = {
+		active = false,
+		direction = nil,
+		anchor = nil,
+		progressAt = 0,
+		bestProjection = 0,
+		lastProbeAt = 0,
+	}
+
+	local autoWaterTerrainParams =
+		RaycastParams.new()
+
+	autoWaterTerrainParams.FilterType =
+		Enum.RaycastFilterType.Include
+
+	autoWaterTerrainParams.FilterDescendantsInstances = {
+		workspace.Terrain,
+	}
+
+	autoWaterTerrainParams.IgnoreWater = false
+
 	local function rotatePlanar(direction, degrees)
 		local angleRad = math.rad(degrees)
 		local c = math.cos(angleRad)
@@ -20883,6 +21339,383 @@ task.spawn(function()
 		end
 
 		return hit.Position.Y
+	end
+
+	local function autoRunTerrainSurfaceAt(
+		position,
+		referenceY
+	)
+		local topY =
+			math.max(
+				(referenceY or position.Y)
+					+ 260,
+				position.Y + 260
+			)
+
+		return workspace:Raycast(
+			Vector3.new(
+				position.X,
+				topY,
+				position.Z
+			),
+			Vector3.new(
+				0,
+				-620,
+				0
+			),
+			autoWaterTerrainParams
+		)
+	end
+
+	local function autoRunWaterAt(
+		position,
+		referenceY
+	)
+		local hit =
+			autoRunTerrainSurfaceAt(
+				position,
+				referenceY
+			)
+
+		return hit ~= nil
+			and hit.Material
+				== Enum.Material.Water
+	end
+
+	local function autoRunWaterNearby(root)
+		if not root then
+			return false
+		end
+
+		-- 16-38 stud buffer around the animal. This catches running parallel
+		-- to a river, not only heading directly into it.
+		for _, radiusProbe in ipairs({
+			16,
+			28,
+			38,
+		}) do
+			local samples =
+				radiusProbe == 16
+					and 4
+					or 8
+
+			for index = 0, samples - 1 do
+				local angleProbe =
+					index / samples
+						* math.pi * 2
+
+				local point =
+					root.Position
+					+ Vector3.new(
+						math.cos(angleProbe)
+							* radiusProbe,
+						0,
+						math.sin(angleProbe)
+							* radiusProbe
+					)
+
+				if autoRunWaterAt(
+					point,
+					root.Position.Y
+				) then
+					return true
+				end
+			end
+		end
+
+		return false
+	end
+
+	local function autoRunWaterAhead(
+		root,
+		direction
+	)
+		if not root
+			or direction.Magnitude <= 0.05 then
+			return false
+		end
+
+		for _, degrees in ipairs({
+			-24,
+			0,
+			24,
+		}) do
+			local heading =
+				rotatePlanar(
+					direction,
+					degrees
+				)
+
+			for _, distance in ipairs({
+				12,
+				22,
+				34,
+				46,
+			}) do
+				if autoRunWaterAt(
+					root.Position
+						+ heading
+							* distance,
+					root.Position.Y
+				) then
+					return true
+				end
+			end
+		end
+
+		return false
+	end
+
+	local function autoRunDryCorridorScore(
+		root,
+		direction,
+		currentGroundY
+	)
+		local score = 0
+		local side =
+			Vector3.new(
+				-direction.Z,
+				0,
+				direction.X
+			)
+
+		for _, distance in ipairs({
+			12,
+			24,
+			38,
+			54,
+			70,
+		}) do
+			for _, lateral in ipairs({
+				-8,
+				0,
+				8,
+			}) do
+				local point =
+					root.Position
+					+ direction * distance
+					+ side * lateral
+
+				local hit =
+					autoRunTerrainSurfaceAt(
+						point,
+						root.Position.Y
+					)
+
+				if not hit then
+					score += 30
+
+				elseif hit.Material
+					== Enum.Material.Water then
+
+					-- Water is a hard penalty for Land Distance farming.
+					score += 500
+
+				else
+					local rise =
+						hit.Position.Y
+							- currentGroundY
+
+					-- Avoid solving "river" by choosing a mountain wall.
+					if rise > 18 then
+						score +=
+							(rise - 18)
+								* 2.0
+					end
+
+					if rise > 34 then
+						score += 90
+					end
+
+					if rise < -38 then
+						score += 70
+					end
+				end
+			end
+		end
+
+		return score
+	end
+
+	local function autoRunChooseDryEscape(
+		root,
+		direction
+	)
+		local currentGroundY =
+			autoTerrainHeightAt(
+				root.Position,
+				root.Position.Y
+			)
+			or root.Position.Y
+
+		local bestDirection =
+			direction
+
+		local bestScore =
+			math.huge
+
+		-- Evaluate the full compass. A river can be beside the circle rather
+		-- than directly in front, so left/right alone is not always enough.
+		for _, degrees in ipairs({
+			0,
+			45,
+			-45,
+			90,
+			-90,
+			135,
+			-135,
+			180,
+		}) do
+			local candidate =
+				rotatePlanar(
+					direction,
+					degrees
+				)
+
+			local score =
+				autoRunDryCorridorScore(
+					root,
+					candidate,
+					currentGroundY
+				)
+
+			-- Small turning cost only breaks ties; staying dry dominates.
+			score +=
+				math.abs(degrees)
+					* 0.08
+
+			if score < bestScore then
+				bestScore = score
+				bestDirection =
+					candidate
+			end
+		end
+
+		return bestDirection,
+			bestScore
+	end
+
+	local function startAutoWaterEscape(
+		root,
+		direction
+	)
+		local escapeDirection,
+			escapeScore =
+			autoRunChooseDryEscape(
+				root,
+				direction
+			)
+
+		autoWater.active = true
+		autoWater.direction =
+			escapeDirection
+		autoWater.anchor =
+			root.Position
+		autoWater.progressAt =
+			tick()
+		autoWater.bestProjection = 0
+
+		autoAvoidReason = "water_buffer"
+		autoAvoidUntil =
+			tick() + 4.0
+
+		runtimeMessage =
+			string.format(
+				"Auto Run: leaving water buffer (dry score %.0f)",
+				escapeScore
+			)
+
+		return escapeDirection
+	end
+
+	local function autoRunWaterEscapeDirection(
+		root,
+		direction
+	)
+		if not autoWater.active
+			or not autoWater.direction
+			or not autoWater.anchor then
+			return nil
+		end
+
+		local delta =
+			Vector3.new(
+				root.Position.X
+					- autoWater.anchor.X,
+				0,
+				root.Position.Z
+					- autoWater.anchor.Z
+			)
+
+		local projection =
+			delta:Dot(
+				autoWater.direction
+			)
+
+		if projection
+			> autoWater.bestProjection
+				+ 2.0 then
+
+			autoWater.bestProjection =
+				projection
+
+			autoWater.progressAt =
+				tick()
+		end
+
+		-- After enough dry travel, verify that the river/puddle is no longer
+		-- within the buffer. Re-center the circle on the new dry area.
+		if autoWater.bestProjection >= 44 then
+			if not autoRunWaterNearby(root) then
+				autoWater.active = false
+				autoWater.direction = nil
+				autoWater.anchor = nil
+				autoWater.bestProjection = 0
+
+				center = root.Position
+				angle = 0
+
+				if autoAvoidReason
+					== "water_buffer" then
+					autoAvoidReason = nil
+					autoAvoidUntil = 0
+				end
+
+				runtimeMessage =
+					"Auto Run: dry area confirmed; resuming circle"
+
+				return direction
+			end
+
+			-- Still too close: choose another dry corridor from the new point.
+			return startAutoWaterEscape(
+				root,
+				direction
+			)
+		end
+
+		-- A dry escape direction that makes no progress gets recomputed, but
+		-- never falls into generic left/right + jump behavior toward the river.
+		if tick()
+			- autoWater.progressAt
+			>= 3.0 then
+
+			return startAutoWaterEscape(
+				root,
+				rotatePlanar(
+					direction,
+					90
+				)
+			)
+		end
+
+		local blended =
+			autoWater.direction * 0.90
+				+ direction * 0.10
+
+		return blended.Magnitude > 0.05
+			and blended.Unit
+			or autoWater.direction
 	end
 
 	local function autoRunPeakMetrics(
@@ -21411,6 +22244,20 @@ task.spawn(function()
 			return direction
 		end
 
+		-- Water buffer has the highest priority for Land Distance.
+		-- Never intentionally farm Run/Travel beside a river/puddle.
+		if autoWater.active then
+			local waterEscape =
+				autoRunWaterEscapeDirection(
+					root,
+					direction
+				)
+
+			if waterEscape then
+				return waterEscape
+			end
+		end
+
 		-- Persistent mountain controller owns the heading until it has
 		-- genuinely escaped or a side has really failed.
 		if autoAvoidReason == "hill"
@@ -21450,6 +22297,21 @@ task.spawn(function()
 			return direction
 		end
 		autoLastProbeAt = tick()
+
+		-- 0) Run quests stay away from exposed Terrain Water. We check both
+		-- the intended heading and a buffer around the animal, so running
+		-- parallel to a river also triggers an escape.
+		if autoRunWaterAhead(
+			root,
+			direction
+		)
+			or autoRunWaterNearby(root) then
+
+			return startAutoWaterEscape(
+				root,
+				direction
+			)
+		end
 
 		-- 1) Detect a genuinely high/steep Terrain peak ahead.
 		local currentGroundY =
@@ -21664,7 +22526,15 @@ task.spawn(function()
 				autoHill.bestProjection = 0
 				autoHill.switchCount = 0
 
-				if autoAvoidReason == "hill" then
+				autoWater.active = false
+				autoWater.direction = nil
+				autoWater.anchor = nil
+				autoWater.progressAt = 0
+				autoWater.bestProjection = 0
+
+				if autoAvoidReason == "hill"
+					or autoAvoidReason
+						== "water_buffer" then
 					autoAvoidReason = nil
 					autoAvoidUntil = 0
 				end
@@ -21801,7 +22671,11 @@ task.spawn(function()
 							autoProgressAt =
 								tick()
 
-							if autoAvoidReason == "hill"
+							if autoWater.active then
+								-- Water buffer controller owns re-routing.
+								-- Never generic-jump/flip while escaping a river.
+
+							elseif autoAvoidReason == "hill"
 								and autoHill.sign then
 
 								-- Hill controller owns side changes/jump policy.
@@ -21868,7 +22742,15 @@ task.spawn(function()
 			autoHill.bestProjection = 0
 			autoHill.switchCount = 0
 
-			if autoAvoidReason == "hill" then
+			autoWater.active = false
+			autoWater.direction = nil
+			autoWater.anchor = nil
+			autoWater.progressAt = 0
+			autoWater.bestProjection = 0
+
+			if autoAvoidReason == "hill"
+				or autoAvoidReason
+					== "water_buffer" then
 				autoAvoidReason = nil
 				autoAvoidUntil = 0
 			end
