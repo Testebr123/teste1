@@ -205,8 +205,13 @@ local state = {
 		autoRotate = nil,
 		platformStand = nil,
 
+		owner = nil,
+		ownerToken = nil,
+		lastInstructionAt = 0,
+
 		lastMoveToAt = 0,
 		lastMoveToPoint = nil,
+		lastHeading = nil,
 	},
 
 	questSlots = {
@@ -866,6 +871,48 @@ function state.movementProbeHeight(character)
 	return math.clamp(size.Y * 0.42, 3.8, 8.5)
 end
 
+function state.heavyObstacleProbe(
+	character,
+	root,
+	direction,
+	probeDistance
+)
+	if not character or not root or typeof(direction) ~= "Vector3" or direction.Magnitude <= 0.05 then return nil end
+	local forward = Vector3.new(direction.X,0,direction.Z)
+	if forward.Magnitude <= 0.05 then return nil end
+	forward = forward.Unit
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {character,workspace.Terrain}
+	params.IgnoreWater = true
+	local right = Vector3.new(-forward.Z,0,forward.X)
+	local halfWidth = math.clamp(state.movementFootprint(character)*0.42,2.6,8.5)
+	local verticalSpread = math.clamp(state.movementBodySize(character).Y*0.20,1.4,4.5)
+	local baseOrigin = root.Position + Vector3.new(0,math.clamp(state.movementProbeHeight(character)*0.55,1.5,4.5),0)
+	local nearest
+	-- 3 body-width lanes x 3 vertical layers = 9 rays.
+	for _, lateral in ipairs({-halfWidth,0,halfWidth}) do
+		for _, vertical in ipairs({-verticalSpread,0,verticalSpread}) do
+			local hit = workspace:Raycast(baseOrigin+right*lateral+Vector3.new(0,vertical,0),forward*probeDistance,params)
+			if hit and (not nearest or hit.Distance<nearest.Distance) then nearest=hit end
+		end
+	end
+	if not nearest then state.safeMove.heavyObstacleSign=nil; return nil end
+	local function corridorClearance(sign)
+		local a=math.rad(68*sign); local c,s=math.cos(a),math.sin(a)
+		local side=Vector3.new(forward.X*c-forward.Z*s,0,forward.X*s+forward.Z*c).Unit
+		local length=probeDistance*1.35; local nearestSide=length
+		for _, lateral in ipairs({-halfWidth*0.72,0,halfWidth*0.72}) do
+			local hit=workspace:Raycast(baseOrigin+right*lateral,side*length,params)
+			if hit then nearestSide=math.min(nearestSide,hit.Distance) end
+		end
+		return nearestSide
+	end
+	local leftClear,rightClear=corridorClearance(-1),corridorClearance(1)
+	state.safeMove.heavyObstacleSign=leftClear>=rightClear and -1 or 1
+	return nearest
+end
+
 function state.movementRootClearance(character)
 	if not character then return 3 end
 	local root = character:FindFirstChild("HumanoidRootPart")
@@ -960,29 +1007,67 @@ function state.heavyWalkStop(character)
 	walk.movementDisabled = nil
 	walk.autoRotate = nil
 	walk.platformStand = nil
+	walk.owner = nil
+	walk.ownerToken = nil
+	walk.lastInstructionAt = 0
 	walk.lastMoveToAt = 0
 	walk.lastMoveToPoint = nil
+	walk.lastHeading = nil
 end
 
 function state.heavyWalkPrepare(
 	character,
 	humanoid,
 	root,
-	targetWalkSpeed
+	targetWalkSpeed,
+	owner,
+	ownerToken
 )
 	if not character
 		or not humanoid
 		or not root
-		or not state.isHeavyGroundMover(character) then
+		or (
+			owner ~= "autoRun"
+				and owner ~= "manual"
+				and not state.isHeavyGroundMover(
+					character
+				)
+		) then
 
 		return false
 	end
 
 	local walk = state.heavyWalk
 
+	owner =
+		type(owner) == "string"
+			and owner
+			or "unknown"
+
+	local ownerChanged =
+		walk.character == character
+			and walk.owner ~= nil
+			and (
+				walk.owner ~= owner
+				or (
+					ownerToken ~= nil
+						and walk.ownerToken ~= ownerToken
+				)
+			)
+
+	if ownerChanged then
+		state.heavyWalkStop(
+			walk.character
+		)
+		walk = state.heavyWalk
+	end
+
 	if walk.character
 		and walk.character ~= character then
-		state.heavyWalkStop(walk.character)
+		state.heavyWalkStop(
+			walk.character
+		)
+		walk = state.heavyWalk
 	end
 
 	local newCharacter =
@@ -1018,6 +1103,7 @@ function state.heavyWalkPrepare(
 
 		walk.lastMoveToAt = 0
 		walk.lastMoveToPoint = nil
+		walk.lastHeading = nil
 
 		-- Same principle as IY loopspeed:
 		-- if the game changes WalkSpeed, restore the requested value.
@@ -1047,6 +1133,10 @@ function state.heavyWalkPrepare(
 			end)
 	end
 
+	walk.owner = owner
+	walk.ownerToken = ownerToken
+	walk.lastInstructionAt = tick()
+
 	walk.targetWalkSpeed =
 		math.max(
 			1,
@@ -1056,7 +1146,15 @@ function state.heavyWalkPrepare(
 
 	pcall(function()
 		humanoid.PlatformStand = false
-		humanoid.AutoRotate = true
+
+		local worldSteeringOwner =
+			owner == "autoRun"
+				or owner == "manual"
+				or owner == "safeMove"
+				or owner == "nudge"
+
+		humanoid.AutoRotate =
+			not worldSteeringOwner
 
 		if math.abs(
 			humanoid.WalkSpeed
@@ -1075,6 +1173,47 @@ function state.heavyWalkPrepare(
 	return true
 end
 
+function state.moveToWorldSteer(
+	character,
+	root,
+	direction
+)
+	if not character
+		or not root
+		or typeof(direction) ~= "Vector3" then
+		return false
+	end
+
+	local flat =
+		Vector3.new(
+			direction.X,
+			0,
+			direction.Z
+		)
+
+	if flat.Magnitude <= 0.05 then
+		return false
+	end
+
+	local heading =
+		flat.Unit
+
+	-- WORLD-SPACE steering only. Position is preserved exactly.
+	pcall(function()
+		root.CFrame =
+			CFrame.lookAt(
+				root.Position,
+				root.Position + heading,
+				Vector3.yAxis
+			)
+	end)
+
+	root.AssemblyAngularVelocity =
+		Vector3.zero
+
+	return true
+end
+
 function state.heavyWalkStep(
 	character,
 	root,
@@ -1082,7 +1221,9 @@ function state.heavyWalkStep(
 	direction,
 	walkSpeed,
 	remainingDistance,
-	finalTarget
+	finalTarget,
+	owner,
+	ownerToken
 )
 	if not character
 		or not root
@@ -1106,11 +1247,15 @@ function state.heavyWalkStep(
 		character,
 		humanoid,
 		root,
-		walkSpeed
+		walkSpeed,
+		owner,
+		ownerToken
 	) then
 		return false
 	end
 
+	-- v117: exact smooth v115 steering cadence.
+	-- Route/avoidance already selected the heading; never dilute it here.
 	local heading = flat.Unit
 	local remaining =
 		tonumber(remainingDistance)
@@ -1126,7 +1271,20 @@ function state.heavyWalkStep(
 
 	local movePoint
 
-	if typeof(finalTarget) == "Vector3"
+	if owner == "autoRun"
+		and typeof(finalTarget) == "Vector3" then
+
+		-- v121: AutoRun's circle/bypass point is already a FIXED world-space
+		-- target. Send that exact point to Humanoid:MoveTo instead of converting
+		-- it back into another moving point in front of the animal.
+		movePoint =
+			Vector3.new(
+				finalTarget.X,
+				root.Position.Y,
+				finalTarget.Z
+			)
+
+	elseif typeof(finalTarget) == "Vector3"
 		and remaining
 		and remaining <= 18 then
 
@@ -1142,7 +1300,32 @@ function state.heavyWalkStep(
 				+ heading * leadDistance
 	end
 
-	local walk = state.heavyWalk
+	local steerDelta =
+		Vector3.new(
+			movePoint.X - root.Position.X,
+			0,
+			movePoint.Z - root.Position.Z
+		)
+
+	if steerDelta.Magnitude > 0.05 then
+		state.moveToWorldSteer(
+			character,
+			root,
+			steerDelta
+		)
+	else
+		state.moveToWorldSteer(
+			character,
+			root,
+			heading
+		)
+	end
+
+	local walk =
+		state.heavyWalk
+
+	walk.lastInstructionAt =
+		tick()
 
 	local pointChanged =
 		not walk.lastMoveToPoint
@@ -1151,15 +1334,17 @@ function state.heavyWalkStep(
 					- movePoint
 			).Magnitude >= 1.25
 
-	-- IY walkto repeatedly calls Humanoid:MoveTo().
-	-- Refresh at 10 Hz or whenever avoidance meaningfully changes direction.
 	if pointChanged
 		or tick()
-			- (walk.lastMoveToAt or 0)
-			>= 0.10 then
+			- (
+				walk.lastMoveToAt or 0
+			) >= 0.10 then
 
-		walk.lastMoveToAt = tick()
-		walk.lastMoveToPoint = movePoint
+		walk.lastMoveToAt =
+			tick()
+
+		walk.lastMoveToPoint =
+			movePoint
 
 		pcall(
 			humanoid.MoveTo,
@@ -1172,6 +1357,16 @@ function state.heavyWalkStep(
 end
 
 function state.releaseMovementNow(character, zeroHorizontal)
+	if state.heavyWalk
+		and state.heavyWalk.character then
+
+		pcall(
+			state.heavyWalkStop,
+			character
+				or state.heavyWalk.character
+		)
+	end
+
 	pcall(function()
 		local env = (getgenv and getgenv()) or _G
 		local release = env and env.keyrelease
@@ -1304,7 +1499,9 @@ function state.safeNudgeToward(root, targetPosition, speedScale)
 					flatMove.Unit,
 					requestedSpeed,
 					flatMove.Magnitude,
-					targetPosition
+					targetPosition,
+					"nudge",
+					nil
 				)
 
 			if moved then
@@ -1399,6 +1596,48 @@ function state.drinkProgressConfirm(water)
 	data.confirmed = true
 	data.lastWater = tonumber(water) or 0
 	data.lastProgressAt = tick()
+end
+
+function state.drinkGamePromptAvailable(character)
+	if not character
+		or not GameUtils
+		or not AnimalConfig
+		or not character:FindFirstChild(
+			"Head"
+		) then
+
+		return false
+	end
+
+	local animalType =
+		character:GetAttribute(
+			"AnimalType"
+		)
+
+	local animalName =
+		character:GetAttribute(
+			"AnimalName"
+		)
+
+	local configForAnimal =
+		animalType
+			and animalName
+			and AnimalConfig[animalType]
+			and AnimalConfig[animalType][animalName]
+
+	if not configForAnimal then
+		return false
+	end
+
+	local ok, result =
+		pcall(
+			GameUtils.CanEatDrink.DetectMeatGrassWater,
+			character,
+			configForAnimal
+		)
+
+	return ok
+		and result == "Drink"
 end
 
 function state.drinkVisualPromptVisible()
@@ -2238,11 +2477,33 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			-- v84 HARD STOP:
 			-- Keep the full v81 navigation UNTIL Savannah itself shows the
 			-- real Drink prompt. At that exact frame, stop where we are.
-			if purpose == "water"
-				and state.drinkVisualPromptVisible
-				and state.drinkVisualPromptVisible() then
+			local waterGamePrompt =
+				purpose == "water"
+					and state.drinkGamePromptAvailable
+					and state.drinkGamePromptAvailable(
+						character
+					)
 
-				state.drinkLatchVisualPrompt()
+			local waterVisualPrompt =
+				purpose == "water"
+					and state.drinkVisualPromptVisible
+					and state.drinkVisualPromptVisible()
+
+			if purpose == "water"
+				and (
+					waterGamePrompt
+						or waterVisualPrompt
+				) then
+
+				if waterVisualPrompt then
+					state.drinkLatchVisualPrompt()
+				end
+
+				state.drinkSearch.promptStopAt =
+					root.Position
+
+				state.drinkSearch.promptStopTime =
+					tick()
 
 				local velocity =
 					root.AssemblyLinearVelocity
@@ -2335,7 +2596,29 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				position.Z - current.Z
 			)
 
-			local flatDistance = flatDelta.Magnitude
+			local flatDistance =
+				flatDelta.Magnitude
+
+			if purpose == "manual"
+				and tick()
+					- (
+						state.safeMove.manualStatusAt
+							or 0
+					) >= 0.75 then
+
+				state.safeMove.manualStatusAt =
+					tick()
+
+				runtimeMessage =
+					string.format(
+						"Move To WORLD: %s · %.0f studs restantes",
+						tostring(
+							state.safeMove.manualLabel
+								or "location"
+						),
+						flatDistance
+					)
+			end
 
 			-- High-hill progress is NOT the same as "distance to destination".
 			-- Going around a mountain may temporarily move sideways or even a
@@ -2417,6 +2700,15 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			local verticalMovement =
 				forceVertical or activeSwimApproach or flying
 
+			-- v127: manual Move To uses the reliable MoveTo motor on EVERY
+			-- terrestrial animal. Heavy automated routes keep using it too.
+			local moveToDrivenLand =
+				not verticalMovement
+					and (
+						state.safeMove.heavy
+							or purpose == "manual"
+					)
+
 			-- If a terrestrial TravelDistance/Run quest is pending, any normal
 			-- physical Move across land also holds virtual W. This lets routes to
 			-- Food/Water/Zone/Move To contribute distance in the background.
@@ -2429,10 +2721,12 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				and not flying
 				and purpose ~= "safety"
 				and purpose ~= "spawn"
+				and purpose ~= "manual"
 				and not calmRiverApproach
 				and flatDistance > math.max(tolerance * 2.5, 8)
 
-			state.safeMove.landQuestW = landQuestW == true
+			state.safeMove.landQuestW =
+				landQuestW == true
 
 			state.safeMove.nativeW = false
 
@@ -2714,6 +3008,10 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			-- Water routes are allowed to approach the shoreline only near the
 			-- selected drinking destination. Aquatic animals are not restricted.
 			if not calmRiverApproach
+				and not (
+					purpose == "water"
+						and riverApproach
+				)
 				and not verticalMovement
 				and flatDistance > tolerance * 1.5
 				and not isAquaticCharacter(character) then
@@ -2959,14 +3257,52 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				local probeDistance =
 					math.clamp(maximumSpeed * 0.20, 7, 22)
 
-				local obstacle = workspace:Raycast(
-					root.Position + Vector3.new(0, state.safeMove.probeHeight or 2.5, 0),
-					desired * probeDistance,
-					params
-				)
+				local volumeObjectProbe =
+					moveToDrivenLand
+
+				local obstacle =
+					volumeObjectProbe
+						and state.heavyObstacleProbe(
+							character,
+							root,
+							desired,
+							math.max(
+								probeDistance,
+								math.clamp(
+									maximumSpeed * 0.42
+										+ state.movementFootprint(
+											character
+										) * 0.85,
+									16,
+									46
+								)
+							)
+						)
+						or workspace:Raycast(
+							root.Position
+								+ Vector3.new(
+									0,
+									state.safeMove.probeHeight
+										or 2.5,
+									0
+								),
+							desired * probeDistance,
+							params
+						)
+
+				if volumeObjectProbe
+					and state.safeMove.heavyObstacleSign then
+					obstacleSign =
+						state.safeMove.heavyObstacleSign
+				end
 
 				if obstacle
-					and math.abs(obstacle.Normal.Y) < 0.72 then
+					and (
+						volumeObjectProbe
+							or math.abs(
+								obstacle.Normal.Y
+							) < 0.72
+					) then
 
 					if obstacle.Instance ~= lastBlockingInstance then
 						lastBlockingInstance = obstacle.Instance
@@ -3052,7 +3388,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 								)
 						end
 
-						if not state.safeMove.heavy
+						if not moveToDrivenLand
 							and tick() - blockingSince >= 0.45
 							and tick() - lastJumpAt >= 0.9 then
 
@@ -3086,7 +3422,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 									+ desired.Z * c
 							).Unit
 
-						if not state.safeMove.heavy
+						if not moveToDrivenLand
 							and not calmRiverApproach
 							and tick() >= hillAvoidUntil
 							and (
@@ -3151,11 +3487,23 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					Vector3.zero
 			end
 
-			if not (state.safeMove.heavy and not verticalMovement) then
+			if not moveToDrivenLand then
 				pcall(function()
-					local face = Vector3.new(desired.X, 0, desired.Z)
+					local face =
+						Vector3.new(
+							desired.X,
+							0,
+							desired.Z
+						)
+
 					if face.Magnitude > 0.1 then
-						root.CFrame = CFrame.lookAt(root.Position, root.Position + face.Unit, Vector3.yAxis)
+						root.CFrame =
+							CFrame.lookAt(
+								root.Position,
+								root.Position
+									+ face.Unit,
+								Vector3.yAxis
+							)
 					end
 				end)
 			end
@@ -3164,9 +3512,13 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				pcall(
 					humanoid.Move,
 					humanoid,
-					(state.safeMove.heavy and not verticalMovement)
+					moveToDrivenLand
 						and Vector3.zero
-						or Vector3.new(desired.X, 0, desired.Z),
+						or Vector3.new(
+							desired.X,
+							0,
+							desired.Z
+						),
 					false
 				)
 			else
@@ -3208,9 +3560,14 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					math.clamp(desired.Y * speed, -maximumSpeed, maximumSpeed),
 					desired.Z * speed
 				)
-			elseif state.safeMove.heavy then
-				-- Large-animal execution engine:
-				-- WalkSpeed follows live Acceleration; MoveTo performs movement.
+			elseif moveToDrivenLand then
+				-- v127 manual Move To and heavy land routes use the same reliable
+				-- WalkSpeed + Humanoid:MoveTo execution engine.
+				local moveOwner =
+					purpose == "manual"
+						and "manual"
+						or "safeMove"
+
 				local walked =
 					state.heavyWalkStep(
 						character,
@@ -3219,7 +3576,9 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 						desired,
 						speed,
 						progressDistance,
-						position
+						position,
+						moveOwner,
+						token
 					)
 
 				if not walked then
@@ -3749,8 +4108,32 @@ function state.drinkFindMainWaterBank(
 			castY
 		)
 
-	-- This function is for approaching a river FROM dry land.
+	-- Large bodies can have HRP X/Z slightly over MainWaterPart while standing
+	-- on the lip. In that case, use the nearest dry Terrain bank locally.
 	if originExposed or not originHit then
+		local localBank =
+			state.drinkFindBank(
+				waterPosition
+			)
+
+		if localBank then
+			local localDistance =
+				Vector3.new(
+					localBank.X - origin.X,
+					0,
+					localBank.Z - origin.Z
+				).Magnitude
+
+			if localDistance <= 72 then
+				return localBank,
+					Vector3.new(
+						waterPosition.X,
+						waterY,
+						waterPosition.Z
+					)
+			end
+		end
+
 		return nil
 	end
 
@@ -3941,7 +4324,9 @@ function state.drinkFindAccessibleSpot(origin, character)
 				)
 		end
 
-		if not bank then return nil end
+		if not bank then
+			return nil
+		end
 
 		local _, _, humanoid = characterParts()
 		local lift =
@@ -4015,6 +4400,93 @@ function state.drinkFindAccessibleSpot(origin, character)
 		end
 	end
 
+	-- v125: dense LOCAL exposed-water pass.
+	-- This runs before the wide 0-900 scan so a nearby puddle/river wins.
+	for radius = 0, 420, 12 do
+		local samples =
+			radius == 0
+				and 1
+				or 32
+
+		for index = 0, samples - 1 do
+			local angle =
+				angleOffset
+					+ index / samples
+						* math.pi * 2
+
+			local x =
+				origin.X
+					+ math.cos(angle)
+						* radius
+
+			local z =
+				origin.Z
+					+ math.sin(angle)
+						* radius
+
+			local castY =
+				math.max(
+					origin.Y + 500,
+					900
+				)
+
+			local terrainHit =
+				workspace:Raycast(
+					Vector3.new(
+						x,
+						castY,
+						z
+					),
+					Vector3.new(
+						0,
+						-(castY + 350),
+						0
+					),
+					terrainParams
+				)
+
+			if terrainHit
+				and terrainHit.Material
+					== Enum.Material.Water then
+
+				local found =
+					considerWaterPoint(
+						terrainHit.Position,
+						"Terrain"
+					)
+
+				if found then
+					return found
+				end
+			end
+
+			if waterPart
+				and waterPart:IsA(
+					"BasePart"
+				) then
+
+				local mainPoint =
+					state.drinkMainWaterSurface(
+						waterPart,
+						x,
+						z
+					)
+
+				if mainPoint then
+					local found =
+						considerWaterPoint(
+							mainPoint,
+							"MainWaterPart"
+						)
+
+					if found then
+						return found
+					end
+				end
+			end
+		end
+	end
+
 	-- Existing v92 scanner remains intact below.
 	-- Expanded exposed-water scan. A terrain ray must hit Water as the FIRST
 	-- terrain surface, so buried MainWaterPart is still rejected.
@@ -4051,38 +4523,110 @@ function state.drinkFindAccessibleSpot(origin, character)
 		end
 	end
 
-	-- Wider sparse scan after nearby bad puddles were blacklisted.
-	-- v65: physical movement allows us to use exposed sources much farther away.
-	for radius = 960, 1800, 60 do
-		for index = 0, 15 do
-			local angle = angleOffset + index / 16 * math.pi * 2
-			local x = origin.X + math.cos(angle) * radius
-			local z = origin.Z + math.sin(angle) * radius
-
-			local castY = math.max(origin.Y + 700, 1200)
-			local terrainHit = workspace:Raycast(
-				Vector3.new(x, castY, z),
-				Vector3.new(0, -(castY + 500), 0),
-				terrainParams
+	-- v125: far search is emergency-only for normal land animals.
+	local currentWater =
+		character
+			and tonumber(
+				character:GetAttribute(
+					"Water"
+				)
 			)
+			or 100
 
-			if terrainHit and terrainHit.Material == Enum.Material.Water then
-				local found = considerWaterPoint(terrainHit.Position, "Terrain")
-				if found then return found end
-			end
+	local allowFarSurfaceSearch =
+		isCroc
+			or currentWater <= 45
 
-			if waterPart and waterPart:IsA("BasePart") then
-				local mainPoint = state.drinkMainWaterSurface(waterPart, x, z)
-				if mainPoint then
-					local found = considerWaterPoint(mainPoint, "MainWaterPart")
-					if found then return found end
+	if allowFarSurfaceSearch then
+		for radius = 960, 1500, 60 do
+			for index = 0, 15 do
+				local angle =
+					angleOffset
+						+ index / 16
+							* math.pi * 2
+
+				local x =
+					origin.X
+						+ math.cos(angle)
+							* radius
+
+				local z =
+					origin.Z
+						+ math.sin(angle)
+							* radius
+
+				local castY =
+					math.max(
+						origin.Y + 700,
+						1200
+					)
+
+				local terrainHit =
+					workspace:Raycast(
+						Vector3.new(
+							x,
+							castY,
+							z
+						),
+						Vector3.new(
+							0,
+							-(castY + 500),
+							0
+						),
+						terrainParams
+					)
+
+				if terrainHit
+					and terrainHit.Material
+						== Enum.Material.Water then
+
+					local found =
+						considerWaterPoint(
+							terrainHit.Position,
+							"Terrain"
+						)
+
+					if found then
+						return found
+					end
+				end
+
+				if waterPart
+					and waterPart:IsA(
+						"BasePart"
+					) then
+
+					local mainPoint =
+						state.drinkMainWaterSurface(
+							waterPart,
+							x,
+							z
+						)
+
+					if mainPoint then
+						local found =
+							considerWaterPoint(
+								mainPoint,
+								"MainWaterPart"
+							)
+
+						if found then
+							return found
+						end
+					end
 				end
 			end
 		end
 	end
 	-- Savannah fallback: use the known Swim water region if local scanning
 	-- cannot find a usable source.
-	if isSavannahLife and state.questSwimPosition then
+	if isSavannahLife
+		and state.questSwimPosition
+		and (
+			state.questSwimActive
+				or currentWater <= 35
+		) then
+
 		local center = state.questSwimPosition
 
 		for radius = 0, 520, 20 do
@@ -4119,6 +4663,8 @@ function state.drinkAbandonCurrent(reason)
 	end
 
 	state.drinkSearch.currentWaterPoint = nil
+	state.drinkSearch.promptStopAt = nil
+	state.drinkSearch.promptStopTime = nil
 	state.drinkSearch.failedCount = (state.drinkSearch.failedCount or 0) + 1
 	state.drinkClearUndergroundMode()
 	drinkingSourcePosition = nil
@@ -4158,6 +4704,7 @@ end
 
 local grassRetryIgnorePosition
 local grassRetryIgnoreUntil = 0
+local grassRetryIgnoreRadius = 7
 
 local function grassCandidateTemporarilyIgnored(position)
 	return grassRetryIgnorePosition ~= nil
@@ -4167,123 +4714,528 @@ local function grassCandidateTemporarilyIgnored(position)
 				position.X - grassRetryIgnorePosition.X,
 				0,
 				position.Z - grassRetryIgnorePosition.Z
-			).Magnitude <= 7
+			).Magnitude
+				<= (
+					grassRetryIgnoreRadius
+						or 7
+				)
 		)
 end
 
-local function temporarilyIgnoreGrass(position, seconds)
-	grassRetryIgnorePosition = position
-	grassRetryIgnoreUntil = tick() + (seconds or 3)
+local function temporarilyIgnoreGrass(
+	position,
+	seconds,
+	radius
+)
+	grassRetryIgnorePosition =
+		position
+
+	grassRetryIgnoreUntil =
+		tick() + (seconds or 3)
+
+	grassRetryIgnoreRadius =
+		math.max(
+			4,
+			tonumber(radius) or 7
+		)
+end
+
+function state.grassTerrainHitAt(
+	position,
+	castHeight
+)
+	if typeof(position) ~= "Vector3" then
+		return nil
+	end
+
+	local height =
+		tonumber(castHeight) or 70
+
+	local hit =
+		workspace:Raycast(
+			Vector3.new(
+				position.X,
+				math.max(
+					position.Y + height,
+					height
+				),
+				position.Z
+			),
+			Vector3.new(
+				0,
+				-(height * 2.4),
+				0
+			),
+			terrainParams
+		)
+
+	if hit
+		and hit.Material
+			== Enum.Material.Grass
+		and hit.Normal.Y >= 0.42 then
+
+		return hit
+	end
+
+	return nil
+end
+
+function state.grassCandidateVerified(
+	origin,
+	position
+)
+	if typeof(origin) ~= "Vector3"
+		or typeof(position) ~= "Vector3" then
+
+		return false,
+			nil,
+			0
+	end
+
+	if grassCandidateTemporarilyIgnored(
+		position
+	) then
+		return false,
+			nil,
+			0
+	end
+
+	if not state.growthPrideFoodPositionAllowed(
+		position
+	) then
+		return false,
+			nil,
+			0
+	end
+
+	local centerHit =
+		state.grassTerrainHitAt(
+			position,
+			80
+		)
+
+	if not centerHit then
+		return false,
+			nil,
+			0
+	end
+
+	-- Validate the PATCH around the point. One Grass voxel on the dirt/grass
+	-- border is not enough to justify a route.
+	local offsets = {
+		Vector3.new(0, 0, 0),
+		Vector3.new(3.5, 0, 0),
+		Vector3.new(-3.5, 0, 0),
+		Vector3.new(0, 0, 3.5),
+		Vector3.new(0, 0, -3.5),
+		Vector3.new(5.5, 0, 0),
+		Vector3.new(-5.5, 0, 0),
+		Vector3.new(0, 0, 5.5),
+		Vector3.new(0, 0, -5.5),
+	}
+
+	local grassSamples = 0
+	local accumulated =
+		Vector3.zero
+
+	for _, offset in ipairs(
+		offsets
+	) do
+		local sampleHit =
+			state.grassTerrainHitAt(
+				centerHit.Position
+					+ offset,
+				70
+			)
+
+		if sampleHit then
+			grassSamples += 1
+			accumulated +=
+				sampleHit.Position
+		end
+	end
+
+	-- A real local feeding patch needs at least 5/9 Grass samples.
+	if grassSamples < 5 then
+		return false,
+			nil,
+			grassSamples
+	end
+
+	local verifiedCenter =
+		accumulated
+			/ grassSamples
+
+	return true,
+		verifiedCenter,
+		grassSamples
 end
 
 local function findNearestGrass(origin)
-	-- v66: dense close-range scan. v65 used only 4 directions on the nearest
-	-- rings, so grass visibly beside the animal could be missed if it was
-	-- diagonal. Rings remain distance-ordered so the first valid result is near.
 	local rings = {
-		{ 4, 12 },
-		{ 7, 16 },
-		{ 10, 16 },
-		{ 14, 20 },
-		{ 20, 20 },
-		{ 28, 20 },
-		{ 40, 20 },
-		{ 56, 20 },
-		{ 80, 20 },
-		{ 120, 20 },
-		{ 180, 20 },
-		{ 260, 20 },
-		{ 380, 24 },
-		{ 520, 24 },
+		{ 4, 20 },
+		{ 7, 24 },
+		{ 10, 24 },
+		{ 14, 28 },
+		{ 20, 28 },
+		{ 28, 28 },
+		{ 40, 32 },
+		{ 56, 32 },
+		{ 76, 32 },
+		{ 96, 36 },
+		{ 118, 36 },
 	}
 
-	-- Rotate the rays per account so repeated scans do not always hit the exact
-	-- same terrain boundaries.
 	local angleOffset =
-		((player.UserId % 17) / 17) * (math.pi * 2 / 24)
+		((player.UserId % 31) / 31)
+			* (
+				math.pi * 2 / 36
+			)
 
+	-- Rings are distance ordered. Within the first ring that contains usable
+	-- grass, select the strongest patch instead of the first random ray hit.
 	for _, ring in ipairs(rings) do
 		local radius = ring[1]
 		local samples = ring[2]
-		local castHeight = radius <= 80 and 55 or 130
+
+		local bestPoint
+		local bestSamples = -1
+		local bestDistance =
+			math.huge
 
 		for index = 0, samples - 1 do
 			local angle =
-				angleOffset + index / samples * math.pi * 2
+				angleOffset
+					+ index / samples
+						* math.pi * 2
 
-			local probe = origin + Vector3.new(
-				math.cos(angle) * radius,
-				castHeight,
-				math.sin(angle) * radius
-			)
+			local probe =
+				origin
+					+ Vector3.new(
+						math.cos(angle)
+							* radius,
+						0,
+						math.sin(angle)
+							* radius
+					)
 
-			local hit = workspace:Raycast(
-				probe,
-				Vector3.new(0, -(castHeight * 2), 0),
-				terrainParams
-			)
+			local valid,
+				verifiedPoint,
+				patchSamples =
+					state.grassCandidateVerified(
+						origin,
+						probe
+					)
 
-			if hit
-				and hit.Material == Enum.Material.Grass
-				and state.growthPrideFoodPositionAllowed(
-					hit.Position
-				)
-				and not grassCandidateTemporarilyIgnored(hit.Position) then
-				return hit.Position
+			if valid and verifiedPoint then
+				local distance =
+					Vector3.new(
+						verifiedPoint.X
+							- origin.X,
+						0,
+						verifiedPoint.Z
+							- origin.Z
+					).Magnitude
+
+				if patchSamples > bestSamples
+					or (
+						patchSamples == bestSamples
+						and distance < bestDistance
+					) then
+
+					bestPoint =
+						verifiedPoint
+
+					bestSamples =
+						patchSamples
+
+					bestDistance =
+						distance
+				end
 			end
 		end
+
+		if bestPoint then
+			return bestPoint,
+				bestDistance,
+				bestSamples
+		end
 	end
+
+	return nil
 end
 
 local function findDistantGrass(origin)
-	local angleOffset = (player.UserId % 360) * math.pi / 180
+	local angleOffset =
+		(player.UserId % 360)
+			* math.pi / 180
 
-	-- Emergency/secondary grass search now reaches ~1.6k studs.
-	for radius = 576, 1600, 64 do
-		for index = 0, 15 do
-			local angle = angleOffset + index / 16 * math.pi * 2
-			local probe = origin + Vector3.new(
-				math.cos(angle) * radius,
-				180,
-				math.sin(angle) * radius
-			)
-			local hit = workspace:Raycast(
-				probe,
-				Vector3.new(0, -360, 0),
-				terrainParams
-			)
-			if hit
-				and hit.Material == Enum.Material.Grass
-				and state.growthPrideFoodPositionAllowed(
-					hit.Position
-				) then
-				return hit.Position
+	for _, radius in ipairs({
+		150,
+		190,
+		240,
+		300,
+		370,
+		440,
+	}) do
+		local bestPoint
+		local bestSamples = -1
+
+		for index = 0, 23 do
+			local angle =
+				angleOffset
+					+ index / 24
+						* math.pi * 2
+
+			local probe =
+				origin
+					+ Vector3.new(
+						math.cos(angle)
+							* radius,
+						0,
+						math.sin(angle)
+							* radius
+					)
+
+			local valid,
+				verifiedPoint,
+				patchSamples =
+					state.grassCandidateVerified(
+						origin,
+						probe
+					)
+
+			if valid
+				and verifiedPoint
+				and patchSamples > bestSamples then
+
+				bestPoint =
+					verifiedPoint
+
+				bestSamples =
+					patchSamples
 			end
 		end
+
+		if bestPoint then
+			return bestPoint
+		end
 	end
+
+	return nil
 end
 
-local function moveToGrass(grassPosition, speedOverride)
-	local character = player.Character
-	local heavy = state.isHeavyGroundMover(character)
-	local options = {
-		purpose = "food",
-		tolerance = heavy and math.clamp(state.movementFootprint(character) * 0.42, 4.5, 8) or 2.75,
-		speedScale = 1,
-		constantSpeed = not heavy,
-		maxDuration = 220,
-	}
+local function moveToGrass(
+	grassPosition,
+	speedOverride
+)
+	local character,
+		root =
+		characterParts()
 
-	if tonumber(speedOverride) and speedOverride > 0 then
-		options.maxSpeed = speedOverride
+	if not character or not root then
+		return false,
+			"no_character"
 	end
 
-	return safeMoveToPosition(
-		grassPosition,
-		8,
-		grassPosition,
-		options
-	)
+	local valid,
+		verifiedPoint =
+			state.grassCandidateVerified(
+				root.Position,
+				grassPosition
+			)
+
+	if not valid
+		or not verifiedPoint then
+
+		return false,
+			"invalid_grass"
+	end
+
+	grassPosition =
+		verifiedPoint
+
+	local routeStart =
+		root.Position
+
+	local startDistance =
+		Vector3.new(
+			grassPosition.X
+				- routeStart.X,
+			0,
+			grassPosition.Z
+				- routeStart.Z
+		).Magnitude
+
+	-- Normal Auto Eat never accepts a "local" route that is hundreds of studs
+	-- away. Distant emergency search is handled separately.
+	local emergencyRoute =
+		startDistance > 125
+
+	if emergencyRoute
+		and (
+			tonumber(
+				character:GetAttribute(
+					"Food"
+				)
+			) or 100
+		) > 35 then
+
+		return false,
+			"too_far"
+	end
+
+	local lastTerrainCheckAt = 0
+
+	local options = {
+		purpose = "food",
+		tolerance = 3.0,
+		speedScale = 1,
+		constantSpeed = true,
+
+		maxDuration =
+			math.clamp(
+				startDistance
+					/ math.max(
+						state.safeMovementSpeed(
+							character
+						),
+						8
+					)
+					* 3
+					+ 7,
+				8,
+				emergencyRoute
+					and 55
+					or 28
+			),
+
+		routeCheckInterval = 0.07,
+
+		routeCheck = function(
+			liveCharacter,
+			liveRoot
+		)
+			if not liveCharacter
+				or not liveRoot then
+
+				return true,
+					"grass_character_lost"
+			end
+
+			-- Savannah itself is the final authority.
+			if state.grassEatAvailable(
+				liveCharacter
+			) then
+				return true,
+					"grass_prompt"
+			end
+
+			local now =
+				tick()
+
+			if now - lastTerrainCheckAt
+				>= 0.30 then
+
+				lastTerrainCheckAt =
+					now
+
+				local stillValid =
+					state.grassCandidateVerified(
+						liveRoot.Position,
+						grassPosition
+					)
+
+				if not stillValid then
+					return true,
+						"grass_invalid"
+				end
+			end
+
+			local currentToTarget =
+				Vector3.new(
+					grassPosition.X
+						- liveRoot.Position.X,
+					0,
+					grassPosition.Z
+						- liveRoot.Position.Z
+				).Magnitude
+
+			local movedFromStart =
+				Vector3.new(
+					liveRoot.Position.X
+						- routeStart.X,
+					0,
+					liveRoot.Position.Z
+						- routeStart.Z
+				).Magnitude
+
+			-- Hard anti-tour guard. A 20-stud grass target may require a small
+			-- obstacle detour; it may NOT turn into a 300-stud sightseeing trip.
+			local maximumDetour =
+				startDistance
+					+ math.max(
+						28,
+						startDistance * 0.45
+					)
+
+			local maximumTravel =
+				math.max(
+					55,
+					startDistance * 1.75
+						+ 25
+				)
+
+			if currentToTarget
+					> maximumDetour
+				or movedFromStart
+					> maximumTravel then
+
+				return true,
+					"grass_detour"
+			end
+
+			return false
+		end,
+	}
+
+	if tonumber(speedOverride)
+		and speedOverride > 0 then
+
+		options.maxSpeed =
+			speedOverride
+	end
+
+	local moved =
+		safeMoveToPosition(
+			grassPosition,
+			8,
+			grassPosition,
+			options
+		)
+
+	local reason =
+		state.safeMove.routeInterruptReason
+
+	if reason == "grass_prompt" then
+		return true,
+			"prompt"
+	end
+
+	if reason == "grass_invalid"
+		or reason == "grass_detour" then
+
+		return false,
+			reason
+	end
+
+	return moved,
+		moved
+			and "position"
+			or (
+				reason
+					or "blocked"
+			)
 end
 
 local ignoredCarcasses = {} -- [carcaça] = tick() em que o bloqueio expira
@@ -4328,24 +5280,454 @@ local function detectAvailableFood(character)
 	return ok and result or nil
 end
 
-local function faceGrassPoint(root, grassPosition)
-	if not root or typeof(grassPosition) ~= "Vector3" then return end
+function state.drinkAcquirePromptAfterMove(
+	spot,
+	character,
+	root,
+	humanoid,
+	waterBefore
+)
+	if not spot
+		or not character
+		or not root
+		or not humanoid then
 
-	local flat = Vector3.new(
-		grassPosition.X - root.Position.X,
-		0,
-		grassPosition.Z - root.Position.Z
+		return false,
+			root
+	end
+
+	local previousBusy =
+		state.busy
+
+	state.busy = true
+
+	-- MoveTo remains authoritative until it is explicitly cancelled.
+	-- Kill it before prompt acquisition so the animal cannot turn around and
+	-- start following another target during this handshake.
+	state.releaseMovementNow(
+		character,
+		true
 	)
 
-	if flat.Magnitude <= 0.15 then return end
+	if state.questSetW then
+		pcall(
+			state.questSetW,
+			false
+		)
+	end
+
+	-- Orientation only. NO shoreline movement/refinement.
+	if spot.water then
+		local face =
+			Vector3.new(
+				spot.water.X
+					- root.Position.X,
+				0,
+				spot.water.Z
+					- root.Position.Z
+			)
+
+		if face.Magnitude > 0.20 then
+			pcall(function()
+				root.CFrame =
+					CFrame.lookAt(
+						root.Position,
+						root.Position
+							+ face.Unit,
+						Vector3.yAxis
+					)
+			end)
+		end
+	end
+
+	root.AssemblyLinearVelocity =
+		Vector3.new(
+			0,
+			root.AssemblyLinearVelocity.Y,
+			0
+		)
+
+	root.AssemblyAngularVelocity =
+		Vector3.zero
+
+	local promptLatched =
+		state.drinkSearch.promptStopAt
+			and state.drinkSearch.promptStopTime
+			and tick()
+				- state.drinkSearch.promptStopTime
+				<= 2.5
+			and (
+				Vector3.new(
+					root.Position.X
+						- state.drinkSearch.promptStopAt.X,
+					0,
+					root.Position.Z
+						- state.drinkSearch.promptStopAt.Z
+				).Magnitude <= 18
+			)
+
+	local deadline =
+		tick() + 2.40
+
+	local kicked = false
+	local acquired = false
+
+	repeat
+		character,
+			root,
+			humanoid =
+				characterParts()
+
+		if not character
+			or not root
+			or not humanoid then
+
+			break
+		end
+
+		local currentWater =
+			tonumber(
+				character:GetAttribute(
+					"Water"
+				)
+			) or waterBefore or 0
+
+		if currentWater
+			> (
+				tonumber(
+					waterBefore
+				) or currentWater
+			) + 0.01 then
+
+			state.drinkProgressConfirm(
+				currentWater
+			)
+
+			acquired = true
+			break
+		end
+
+		local gamePrompt =
+			detectAvailableFood(
+				character
+			) == "Drink"
+				or (
+					state.drinkGamePromptAvailable
+					and state.drinkGamePromptAvailable(
+						character
+					)
+				)
+
+		local visualPrompt =
+			state.drinkVisualPromptVisible
+			and state.drinkVisualPromptVisible()
+
+		if gamePrompt
+			or visualPrompt
+			or promptLatched then
+
+			if visualPrompt then
+				state.drinkLatchVisualPrompt()
+			end
+
+			drinkingSourcePosition =
+				root.Position
+
+			setSubState(
+				"Drinking"
+			)
+
+			if not kicked then
+				kicked = true
+
+				pcall(function()
+					local vim =
+						game:GetService(
+							"VirtualInputManager"
+						)
+
+					vim:SendKeyEvent(
+						true,
+						Enum.KeyCode.E,
+						false,
+						game
+					)
+
+					task.wait(0.045)
+
+					vim:SendKeyEvent(
+						false,
+						Enum.KeyCode.E,
+						false,
+						game
+					)
+				end)
+			end
+
+			-- Prompt itself is sufficient to hand control to the sustain loop.
+			acquired = true
+			break
+		end
+
+		task.wait(0.10)
+	until tick() >= deadline
+
+	state.busy =
+		previousBusy == true
+
+	return acquired,
+		root
+end
+
+function state.waitForGrassEatPrompt(
+	character,
+	timeout
+)
+	local deadline =
+		tick() + (timeout or 0.45)
+
+	while state.alive
+		and tick() <= deadline do
+
+		if character ~= player.Character
+			or not character
+			or not character.Parent then
+
+			return false
+		end
+
+		if detectAvailableFood(character)
+			== "Eat" then
+
+			return true
+		end
+
+		task.wait(0.055)
+	end
+
+	return false
+end
+
+function state.eatVisualPromptVisible()
+	local playerGui =
+		player:FindFirstChildOfClass(
+			"PlayerGui"
+		)
+
+	if not playerGui then
+		return false
+	end
+
+	local camera =
+		workspace.CurrentCamera
+
+	local viewport =
+		camera
+			and camera.ViewportSize
+			or Vector2.new(
+				1280,
+				720
+			)
+
+	for _, object in ipairs(
+		playerGui:GetDescendants()
+	) do
+		if (
+			object:IsA("TextLabel")
+			or object:IsA("TextButton")
+			or object:IsA("TextBox")
+		)
+			and object.Visible
+			and object.TextTransparency < 0.95 then
+
+			local lower =
+				tostring(
+					object.Text or ""
+				):lower()
+
+			local eatText =
+				lower:find(
+					"para comer",
+					1,
+					true
+				)
+				or lower:find(
+					"to eat",
+					1,
+					true
+				)
+
+			if eatText then
+				local centerX =
+					object.AbsolutePosition.X
+					+ object.AbsoluteSize.X
+						* 0.5
+
+				local centerY =
+					object.AbsolutePosition.Y
+					+ object.AbsoluteSize.Y
+						* 0.5
+
+				if centerY
+						>= viewport.Y * 0.66
+					and centerX
+						>= viewport.X * 0.18
+					and centerX
+						<= viewport.X * 0.82 then
+
+					return true
+				end
+			end
+		end
+	end
+
+	return false
+end
+
+function state.grassEatAvailable(
+	character
+)
+	if not character then
+		return false
+	end
+
+	return detectAvailableFood(
+		character
+	) == "Eat"
+		or state.eatVisualPromptVisible()
+end
+
+local function faceGrassPoint(root, grassPosition)
+	if not root
+		or typeof(grassPosition) ~= "Vector3" then
+		return
+	end
+
+	local character =
+		player.Character
+
+	if not character
+		or not root:IsDescendantOf(character) then
+		return
+	end
+
+	-- v126:
+	-- If Savannah already says Eat is available, the CURRENT facing is already
+	-- accepted by the game's interaction detector. Rotating AFTER that detection
+	-- can turn the animal away from the grass that produced the prompt.
+	local eatAlreadyAvailable =
+		detectAvailableFood(character)
+			== "Eat"
+		or (
+			state.eatVisualPromptVisible
+				and state.eatVisualPromptVisible()
+		)
+
+	if eatAlreadyAvailable then
+		root.AssemblyAngularVelocity =
+			Vector3.zero
+
+		return
+	end
+
+	local flat =
+		Vector3.new(
+			grassPosition.X
+				- root.Position.X,
+			0,
+			grassPosition.Z
+				- root.Position.Z
+		)
+
+	if flat.Magnitude <= 0.15 then
+		return
+	end
+
+	local desired =
+		flat.Unit
+
+	local currentForward =
+		Vector3.new(
+			root.CFrame.LookVector.X,
+			0,
+			root.CFrame.LookVector.Z
+		)
+
+	if currentForward.Magnitude <= 0.05 then
+		return
+	end
+
+	currentForward =
+		currentForward.Unit
+
+	local alignment =
+		currentForward:Dot(
+			desired
+		)
+
+	-- MoveTo/AutoRotate already faced the animal while approaching the patch.
+	-- If the stored grass point is now far to the side/behind, it is stale.
+	-- Never perform the old 90-180 degree snap toward that stale coordinate.
+	if alignment < 0.26 then
+		root.AssemblyAngularVelocity =
+			Vector3.zero
+
+		return
+	end
+
+	-- Only a small final correction is allowed inside the same forward sector.
+	local crossY =
+		currentForward.X * desired.Z
+			- currentForward.Z * desired.X
+
+	local angle =
+		math.atan2(
+			crossY,
+			alignment
+		)
+
+	local clampedAngle =
+		math.clamp(
+			angle,
+			-math.rad(28),
+			math.rad(28)
+		)
+
+	local c =
+		math.cos(
+			clampedAngle
+		)
+
+	local s =
+		math.sin(
+			clampedAngle
+		)
+
+	local corrected =
+		Vector3.new(
+			currentForward.X * c
+				- currentForward.Z * s,
+			0,
+			currentForward.X * s
+				+ currentForward.Z * c
+		)
+
+	if corrected.Magnitude <= 0.05 then
+		return
+	end
 
 	pcall(function()
-		root.CFrame = CFrame.lookAt(
-			root.Position,
-			root.Position + flat.Unit,
-			Vector3.yAxis
-		)
+		root.CFrame =
+			CFrame.lookAt(
+				root.Position,
+				root.Position
+					+ corrected.Unit,
+				Vector3.yAxis
+			)
 	end)
+
+	root.AssemblyAngularVelocity =
+		Vector3.zero
 end
 
 local function startGrassEatingIfAvailable(character, root, grassPosition)
@@ -4367,6 +5749,10 @@ local function startGrassEatingIfAvailable(character, root, grassPosition)
 		velocity.Y,
 		0
 	)
+
+	-- Prevent residual physics rotation between confirmed Eat and the E press.
+	root.AssemblyAngularVelocity =
+		Vector3.zero
 
 	-- Only press E while the game explicitly offers Eat. Once eating starts,
 	-- DetectMeatGrassWater stops returning the start-Eat condition, avoiding
@@ -6922,12 +8308,32 @@ local function virtualEatKick()
 	runtimeMessage =
 		"Eat travou; procurando uma grama realmente utilizavel"
 
+	local food =
+		tonumber(
+			character:GetAttribute(
+				"Food"
+			)
+		) or 100
+
 	local grass =
-		findNearestGrass(root.Position)
-		or findDistantGrass(root.Position)
+		findNearestGrass(
+			root.Position
+		)
+
+	if not grass
+		and food <= 35 then
+
+		grass =
+			findDistantGrass(
+				root.Position
+			)
+	end
 
 	if grass then
-		local moved = moveToGrass(grass)
+		local moved =
+			moveToGrass(
+				grass
+			)
 
 		if moved then
 			task.wait(0.15)
@@ -7342,128 +8748,218 @@ local function autoEatStep()
 		return
 	end
 
-	if food <= 55 and tick() >= nextEmergencyGrassCheck then
-		nextEmergencyGrassCheck = tick() + 120
-		local distantGrass = findDistantGrass(root.Position)
-		if distantGrass then
-			runtimeMessage =
-				"Fome critica; indo para outra area com grama"
-			resetEatingSearch(food)
+	-- v124: verified grass controller.
+	if eatingSourcePosition
+		and eatingTargetReachedAt then
 
-			local moved = moveToGrass(distantGrass)
-
-			if moved then
-				task.wait(0.15)
-				local liveCharacter, liveRoot = characterParts()
-
-				if liveCharacter and liveRoot then
-					eatingSourcePosition = distantGrass
-					eatingTargetReachedAt = tick()
-					startGrassEatingIfAvailable(
-						liveCharacter,
-						liveRoot,
-						distantGrass
-					)
-				end
-			end
-
-			task.wait(0.25)
-			return
-		else
-			runtimeMessage = "Fome critica; nenhuma area distante encontrada"
-		end
-	end
-
-	-- v66: a cached grass point is valid only while the Eat prompt really
-	-- exists. v65 blindly called Eating for 5 seconds even with no prompt,
-	-- producing the alternating "Trying current grass / Moving nearby grass".
-	if eatingSourcePosition and eatingTargetReachedAt then
-		local horizontalDistance = Vector3.new(
-			root.Position.X - eatingSourcePosition.X,
-			0,
-			root.Position.Z - eatingSourcePosition.Z
-		).Magnitude
-
-		if horizontalDistance <= 7
-			and tick() - eatingTargetReachedAt < 1.4 then
-
+		if state.grassEatAvailable(
+			character
+		) then
 			if startGrassEatingIfAvailable(
 				character,
 				root,
 				eatingSourcePosition
 			) then
-				runtimeMessage = "Comendo a grama atual"
+
+				runtimeMessage =
+					"Eat confirmado na grama atual"
+
 				return
 			end
-
-			-- Give the game a very short prompt-appearance grace while nudging
-			-- physically closer. Do not wait the old 5 seconds.
-			if not state.isHeavyGroundMover(character) then
-				state.safeNudgeToward(root, eatingSourcePosition, 1)
-			end
-			faceGrassPoint(root, eatingSourcePosition)
-			runtimeMessage =
-				"Ajustando posicao na grama proxima"
-			return
 		end
 
-		-- This patch did not produce a usable Eat prompt. Skip it briefly so
-		-- the next scan chooses another nearby grass sample instead of looping.
-		temporarilyIgnoreGrass(eatingSourcePosition, 3.5)
-		eatingSourcePosition = nil
-		eatingTargetReachedAt = nil
+		-- Do not remain stuck claiming a non-working grass point.
+		if tick()
+				- eatingTargetReachedAt
+				> 0.85 then
+
+			temporarilyIgnoreGrass(
+				eatingSourcePosition,
+				7,
+				14
+			)
+
+			eatingSourcePosition = nil
+			eatingTargetReachedAt = nil
+		else
+			faceGrassPoint(
+				root,
+				eatingSourcePosition
+			)
+
+			runtimeMessage =
+				"Aguardando confirmacao Eat na grama"
+
+			return
+		end
 	end
 
-	local grass = findNearestGrass(root.Position)
+	local grass,
+		grassDistance,
+		grassSamples =
+			findNearestGrass(
+				root.Position
+			)
+
+	-- Do not run across the map at 55-60% Food. A distant emergency route is
+	-- allowed only when hunger is genuinely critical.
+	if not grass
+		and food <= 35
+		and tick()
+			>= nextEmergencyGrassCheck then
+
+		nextEmergencyGrassCheck =
+			tick() + 90
+
+		local distantGrass =
+			findDistantGrass(
+				root.Position
+			)
+
+		if distantGrass then
+			runtimeMessage =
+				"Fome critica; nenhuma grama verificada em 120 studs, usando fallback"
+
+			local moved,
+				moveReason =
+					moveToGrass(
+						distantGrass
+					)
+
+			if moved then
+				task.wait(0.12)
+
+				local liveCharacter,
+					liveRoot =
+					characterParts()
+
+				if liveCharacter
+					and liveRoot
+					and state.grassEatAvailable(
+						liveCharacter
+					) then
+
+					eatingSourcePosition =
+						liveRoot.Position
+
+					eatingTargetReachedAt =
+						tick()
+
+					startGrassEatingIfAvailable(
+						liveCharacter,
+						liveRoot,
+						distantGrass
+					)
+				else
+					temporarilyIgnoreGrass(
+						distantGrass,
+						10,
+						18
+					)
+				end
+			else
+				temporarilyIgnoreGrass(
+					distantGrass,
+					8,
+					18
+				)
+
+				runtimeMessage =
+					"Fallback de grama cancelado: "
+					.. tostring(
+						moveReason
+					)
+			end
+
+			return
+		end
+	end
+
 	if not grass then
-		runtimeMessage = "Nenhuma grama detectada por perto"
+		runtimeMessage =
+			food <= 35
+				and "Nenhuma grama verificada localmente; fallback tambem falhou"
+				or "Nenhuma grama utilizavel verificada em ate 120 studs"
+
 		return
 	end
 
-	local grassDistance = Vector3.new(
-		root.Position.X - grass.X,
-		0,
-		root.Position.Z - grass.Z
-	).Magnitude
+	runtimeMessage =
+		string.format(
+			"Grama verificada: %.0f studs (%d/9 Terrain Grass)",
+			grassDistance or 0,
+			grassSamples or 0
+		)
 
-	runtimeMessage = string.format(
-		"Indo para grama proxima (%.0f studs)",
-		grassDistance
-	)
-
-	local moved = moveToGrass(grass)
+	local moved,
+		moveReason =
+			moveToGrass(
+				grass
+			)
 
 	if not moved then
-		temporarilyIgnoreGrass(grass, 3.5)
+		temporarilyIgnoreGrass(
+			grass,
+			8,
+			14
+		)
+
 		eatingSourcePosition = nil
 		eatingTargetReachedAt = nil
+
 		runtimeMessage =
-			"Grama proxima bloqueada; procurando outro ponto"
+			"Rota da grama rejeitada: "
+			.. tostring(
+				moveReason
+			)
+
 		return
 	end
 
-	task.wait(0.15)
+	task.wait(0.10)
 
-	character, root = characterParts()
-	if not character or not root then return end
+	character, root =
+		characterParts()
 
-	eatingSourcePosition = grass
-	eatingTargetReachedAt = tick()
-
-	-- Immediately start eating if the game offers the prompt after arrival.
-	if startGrassEatingIfAvailable(character, root, grass) then
-		runtimeMessage = "Chegou na grama; comecando a comer"
+	if not character or not root then
 		return
 	end
 
-	-- Prompt can appear a few frames after movement stops. Keep a very short
-	-- physical settle window; autoEatStep will retry this target on the next tick.
-	if not state.isHeavyGroundMover(character) then
-		state.safeNudgeToward(root, grass, 1)
+	if state.grassEatAvailable(
+		character
+	) then
+		eatingSourcePosition =
+			root.Position
+
+		eatingTargetReachedAt =
+			tick()
+
+		if startGrassEatingIfAvailable(
+			character,
+			root,
+			grass
+		) then
+
+			runtimeMessage =
+				"Eat confirmado; comecando a comer"
+
+			return
+		end
 	end
-	faceGrassPoint(root, grass)
+
+	-- Reaching a Terrain coordinate without Eat is NOT success.
+	temporarilyIgnoreGrass(
+		grass,
+		8,
+		14
+	)
+
+	eatingSourcePosition = nil
+	eatingTargetReachedAt = nil
+
 	runtimeMessage =
-		"Chegou na grama; ajustando para aparecer Eat"
+		"Terrain Grass confirmado, mas sem prompt Eat; tentando outro ponto"
+
 end
 
 local function isPositionInWaterTerrain(position, radiusXZ, radiusY)
@@ -11967,6 +13463,8 @@ local function autoDrinkStep()
 	end
 
 	state.drinkSearch.currentWaterPoint = spot.water
+	state.drinkSearch.promptStopAt = nil
+	state.drinkSearch.promptStopTime = nil
 
 	if spot.underground then
 		state.drinkSearch.undergroundMode = true
@@ -11978,7 +13476,22 @@ local function autoDrinkStep()
 		runtimeMessage = "Descendo para MainWaterPart subterranea com watchdog anti-afogamento"
 	else
 		state.drinkClearUndergroundMode()
-		runtimeMessage = "Indo para agua exposta (" .. tostring(spot.source) .. ")"
+
+		local routeDistance =
+			Vector3.new(
+				spot.stand.X - root.Position.X,
+				0,
+				spot.stand.Z - root.Position.Z
+			).Magnitude
+
+		runtimeMessage =
+			string.format(
+				"Indo para agua exposta (%s, %.0f studs)",
+				tostring(
+					spot.source
+				),
+				routeDistance
+			)
 	end
 
 	local landed
@@ -12078,6 +13591,63 @@ local function autoDrinkStep()
 			newRoot,
 			"BUG DE AGUA: animal afundou abaixo da fonte; escapando"
 		)
+		return
+	end
+
+	-- v125: exposed-water arrival handshake for the MoveTo engine.
+	-- Once navigation succeeded, interaction gets a stationary transaction.
+	if not spot.underground then
+		local acquired,
+			heldRoot =
+				state.drinkAcquirePromptAfterMove(
+					spot,
+					character,
+					newRoot,
+					humanoid,
+					water
+				)
+
+		newRoot =
+			heldRoot or newRoot
+
+		if not acquired then
+			state.drinkAbandonCurrent(
+				"Chegou na agua, mas Drink nao confirmou apos parada controlada"
+			)
+
+			return
+		end
+
+		drinkingSourcePosition =
+			newRoot.Position
+
+		drinkingStuckSince =
+			tick()
+
+		lastDrinkWatchdogWater =
+			water
+
+		state.drinkSearch.failedCount =
+			0
+
+		if isAquatic then
+			setAquaticWaterCollision(
+				character,
+				true
+			)
+		end
+
+		runtimeMessage =
+			"Fonte confirmada; iniciando bebida sem sair da margem"
+
+		setSubState(
+			"Drinking"
+		)
+
+		task.spawn(
+			sustainDrinkAtCurrentPrompt
+		)
+
 		return
 	end
 
@@ -15212,6 +16782,92 @@ function state.questSetW(active, forceReassert)
 	state.questLandKeyDown = pressed or state.questLandKeyDown
 end
 
+function state.questPulseWForAutoRun()
+	if state.questAutoRunWPulseBusy
+		or not state.alive then
+		return false
+	end
+
+	state.questAutoRunWPulseBusy = true
+
+	task.spawn(function()
+		-- Kill any old held-W state first. Pure AutoRun steering is MoveTo.
+		state.questSetW(false)
+
+		if not state.alive
+			or not state.autoQuests
+			or not state.autoRunMoveOwnsInput
+			or state.busy
+			or drinkingToFull
+			or eatingToFull
+			or criticalRecoveryActive
+			or DAMAGE.active then
+
+			state.questAutoRunWPulseBusy = false
+			return
+		end
+
+		local pressed = false
+
+		pcall(function()
+			local env =
+				(getgenv and getgenv())
+				or _G
+
+			local press =
+				env and env.keypress
+
+			if type(press) == "function" then
+				press(0x57)
+				pressed = true
+			end
+		end)
+
+		if not pressed then
+			pcall(function()
+				VirtualInputManager:SendKeyEvent(
+					true,
+					Enum.KeyCode.W,
+					false,
+					game
+				)
+				pressed = true
+			end)
+		end
+
+		-- Only a short state pulse. It must never become the steering source.
+		task.wait(0.045)
+
+		pcall(function()
+			local env =
+				(getgenv and getgenv())
+				or _G
+
+			local release =
+				env and env.keyrelease
+
+			if type(release) == "function" then
+				release(0x57)
+			end
+		end)
+
+		pcall(function()
+			VirtualInputManager:SendKeyEvent(
+				false,
+				Enum.KeyCode.W,
+				false,
+				game
+			)
+		end)
+
+		state.questLandKeyDown = false
+		state.questLandLastPulseAt = tick()
+		state.questAutoRunWPulseBusy = false
+	end)
+
+	return true
+end
+
 function state.questHardRefreshW(reason, silent)
 	if state.questLandRefreshingW then
 		return false
@@ -17918,6 +19574,7 @@ function state.questReturnToZoneAfterFeeding(quests)
 	questTravelWanted = false
 	state.questTravelActive = false
 	state.questLandInputActive = false
+	state.autoRunMoveOwnsInput = false
 	state.questMotionMoving = false
 	state.questMotionMode = nil
 	state.questSetW(false)
@@ -19304,13 +20961,21 @@ function state.questLandWWatchStep()
 			watch.lastProgressAt = now
 			watch.hardRefreshCount += 1
 
-			state.questHardRefreshW(
-				string.format(
-					"Land quest stalled for %.0fs; virtual W refreshed automatically",
-					stalledFor
-				),
-				false
-			)
+			if state.autoRunMoveOwnsInput then
+				runtimeMessage =
+					string.format(
+						"Land movement stalled for %.0fs; route controller recovering",
+						stalledFor
+					)
+			else
+				state.questHardRefreshW(
+					string.format(
+						"Land quest stalled for %.0fs; virtual W refreshed automatically",
+						stalledFor
+					),
+					false
+				)
+			end
 		end
 	else
 		-- Rare fallback: if this server does not expose readable quest progress,
@@ -19318,10 +20983,14 @@ function state.questLandWWatchStep()
 		if now - (watch.lastHardRefreshAt or 0) >= 12 then
 			watch.lastHardRefreshAt = now
 
-			state.questHardRefreshW(
-				"Land quest progress unreadable; virtual W refreshed as a safeguard",
-				true
-			)
+			if state.autoRunMoveOwnsInput then
+				-- No keyboard pulse while world-space AutoRun owns movement.
+			else
+				state.questHardRefreshW(
+					"Land quest progress unreadable; virtual W refreshed as a safeguard",
+					true
+				)
+			end
 		end
 	end
 
@@ -22210,9 +23879,28 @@ local function rebuildMoveToList()
 				return
 			end
 			selectedMoveToSpawn = destination
-			runtimeMessage = "Moving safely to " .. completionSpawnLabel(destination)
-			local currentCharacter = player.Character
-			resetEatingSearch(currentCharacter and currentCharacter:GetAttribute("Food") or nil)
+			runtimeMessage =
+				"Moving safely to "
+				.. completionSpawnLabel(
+					destination
+				)
+
+			local currentCharacter =
+				player.Character
+
+			state.releaseMovementNow(
+				currentCharacter,
+				true
+			)
+
+			resetEatingSearch(
+				currentCharacter
+					and currentCharacter:GetAttribute(
+						"Food"
+					)
+					or nil
+			)
+
 			task.spawn(function()
 				safeMoveToPosition(
 					destination.Position,
@@ -22222,8 +23910,8 @@ local function rebuildMoveToList()
 						purpose = "manual",
 						manualLabel =
 							completionSpawnLabel(destination),
-						tolerance = 18,
-						maxDuration = 360,
+						tolerance = 8,
+						maxDuration = 420,
 					}
 				)
 			end)
@@ -22608,6 +24296,7 @@ end)
 local function questLandInputShouldStayHeld()
 	return state.alive
 		and state.autoQuests
+		and not state.autoRunMoveOwnsInput
 		and not state.questGrowthReset.exclusive
 		and (state.questLandInputActive or state.questSwimActive)
 		and not questSwitchingAnimal
@@ -22821,12 +24510,22 @@ task.spawn(function()
 	local autoAvoidUntil = 0
 	local autoAvoidSign = 1
 	local autoAvoidReason
+	local autoAvoidTarget
 	local autoLastProbeAt = 0
 	local autoLastJumpAt = 0
 	local autoBlockingInstance
 	local autoBlockingSince = 0
 	local autoProgressPosition
 	local autoProgressAt = 0
+
+	-- v118: stable MoveTo-compatible orbit state.
+	local autoCircle = {
+		directionSign = 1,
+		waypointIndex = nil,
+		waypointCount = 24,
+		arrivalRadius = 6.5,
+		center = nil,
+	}
 
 	-- v104: persistent high-hill intelligence for pure TravelDistance Auto Run.
 	local autoHill = {
@@ -23237,6 +24936,8 @@ task.spawn(function()
 
 				center = root.Position
 				angle = 0
+				autoCircle.waypointIndex = nil
+				autoCircle.center = nil
 
 				if autoAvoidReason
 					== "water_buffer" then
@@ -23683,6 +25384,8 @@ task.spawn(function()
 
 				center = root.Position
 				angle += math.pi * 0.75
+				autoCircle.waypointIndex = nil
+				autoCircle.center = nil
 
 				autoAvoidSign =
 					escapeSign
@@ -23815,6 +25518,56 @@ task.spawn(function()
 		return -autoAvoidSign
 	end
 
+	local function autoRunCircleWaypoint(
+		root,
+		circleCenter,
+		circleRadius
+	)
+		if not root or typeof(circleCenter) ~= "Vector3" then
+			return nil, nil, nil
+		end
+
+		local count = math.max(8, tonumber(autoCircle.waypointCount) or 16)
+		local centerChanged = not autoCircle.center
+			or Vector3.new(autoCircle.center.X-circleCenter.X,0,autoCircle.center.Z-circleCenter.Z).Magnitude > 1
+		if centerChanged then
+			autoCircle.center = circleCenter
+			autoCircle.waypointIndex = nil
+		end
+
+		if autoCircle.waypointIndex == nil then
+			local offset = Vector3.new(root.Position.X-circleCenter.X,0,root.Position.Z-circleCenter.Z)
+			if offset.Magnitude >= 5 then
+				local nearestIndex, nearestDistance = 0, math.huge
+				for index = 0, count - 1 do
+					local angle = index / count * math.pi * 2
+					local point = Vector3.new(circleCenter.X+math.cos(angle)*circleRadius,root.Position.Y,circleCenter.Z+math.sin(angle)*circleRadius)
+					local d = Vector3.new(root.Position.X-point.X,0,root.Position.Z-point.Z).Magnitude
+					if d < nearestDistance then nearestDistance, nearestIndex = d, index end
+				end
+				autoCircle.waypointIndex = (nearestIndex + autoCircle.directionSign) % count
+			else
+				-- World-space deterministic start. No view/facing input.
+				autoCircle.waypointIndex = player.UserId % count
+			end
+		end
+
+		local function pointAt(index)
+			local angle = index / count * math.pi * 2
+			return Vector3.new(circleCenter.X+math.cos(angle)*circleRadius,root.Position.Y,circleCenter.Z+math.sin(angle)*circleRadius)
+		end
+
+		local target = pointAt(autoCircle.waypointIndex)
+		local delta = Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
+		if delta.Magnitude <= (autoCircle.arrivalRadius or 6) then
+			autoCircle.waypointIndex = (autoCircle.waypointIndex + autoCircle.directionSign) % count
+			target = pointAt(autoCircle.waypointIndex)
+			delta = Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
+		end
+		if delta.Magnitude <= 0.05 then return target,nil,0 end
+		return target,delta.Unit,delta.Magnitude
+	end
+
 	local function autoRunAvoidDirection(
 		character,
 		root,
@@ -23857,22 +25610,15 @@ task.spawn(function()
 			end
 		end
 
-		-- Objects/stuck/recenter keep short commitments.
+		-- Object avoidance uses a fixed world-space bypass point.
+		if autoAvoidReason == "object" and autoAvoidTarget and tick() < autoAvoidUntil then
+			local toBypass=Vector3.new(autoAvoidTarget.X-root.Position.X,0,autoAvoidTarget.Z-root.Position.Z)
+			if toBypass.Magnitude>5 then return toBypass.Unit end
+			autoAvoidTarget,autoAvoidReason,autoAvoidUntil=nil,nil,0
+		end
 		if tick() < autoAvoidUntil then
-			local degrees =
-				autoAvoidReason == "stuck"
-					and 68
-					or (
-						autoAvoidReason
-							== "hill_recenter"
-						and 88
-						or 55
-					)
-
-			return rotatePlanar(
-				direction,
-				degrees * autoAvoidSign
-			)
+			local degrees=autoAvoidReason=="stuck" and 68 or (autoAvoidReason=="hill_recenter" and 88 or 55)
+			return rotatePlanar(direction,degrees*autoAvoidSign)
 		end
 
 		if tick() - autoLastProbeAt < 0.16 then
@@ -23937,17 +25683,42 @@ task.spawn(function()
 		params.FilterDescendantsInstances = { character }
 		params.IgnoreWater = true
 
-		local probeDistance =
-			math.clamp((speed or 30) * 0.24, 8, 20)
+		local heavyMover =
+			state.isHeavyGroundMover(
+				character
+			)
 
-		local obstacle = workspace:Raycast(
-			root.Position + Vector3.new(0, state.movementProbeHeight(character), 0),
-			direction * probeDistance,
-			params
-		)
+		local probeDistance =
+			heavyMover
+				and math.clamp(
+					(speed or 30) * 0.42
+						+ state.movementFootprint(
+							character
+						) * 0.85,
+					16,
+					46
+				)
+				or math.clamp(
+					(speed or 30) * 0.24,
+					8,
+					20
+				)
+
+		local obstacle =
+			state.heavyObstacleProbe(
+				character,
+				root,
+				direction,
+				probeDistance
+			)
 
 		if obstacle
-			and math.abs(obstacle.Normal.Y) < 0.72 then
+			and (
+				heavyMover
+					or math.abs(
+						obstacle.Normal.Y
+					) < 0.72
+			) then
 
 			if obstacle.Instance ~= autoBlockingInstance then
 				autoBlockingInstance = obstacle.Instance
@@ -23976,16 +25747,79 @@ task.spawn(function()
 				return direction
 			end
 
-			autoAvoidSign =
-				chooseAutoAvoidSide(
-					character,
-					root,
-					direction,
-					math.max(14, probeDistance)
+			if state.safeMove.heavyObstacleSign then
+				autoAvoidSign =
+					state.safeMove.heavyObstacleSign
+			else
+				autoAvoidSign =
+					chooseAutoAvoidSide(
+						character,
+						root,
+						direction,
+						math.max(
+							14,
+							probeDistance
+						)
+					)
+			end
+
+			autoAvoidReason =
+				"object"
+
+			local sideVector =
+				Vector3.new(
+					-direction.Z,
+					0,
+					direction.X
+				) * autoAvoidSign
+
+			local objectDistance =
+				tonumber(
+					obstacle.Distance
+				) or (
+					probeDistance * 0.5
 				)
 
-			autoAvoidReason = "object"
-			autoAvoidUntil = tick() + 1.35
+			local bodyClearance =
+				heavyMover
+					and math.clamp(
+						state.movementFootprint(
+							character
+						) * 1.35,
+						12,
+						26
+					)
+					or 10
+
+			local forwardClearance =
+				math.clamp(
+					objectDistance
+						+ bodyClearance * 0.70,
+					10,
+					probeDistance + 18
+				)
+
+			autoAvoidTarget =
+				root.Position
+					+ direction * forwardClearance
+					+ sideVector * bodyClearance
+
+			autoAvoidUntil =
+				tick()
+					+ (
+						heavyMover
+							and 3.0
+							or 1.8
+					)
+
+			local bypassDirection =
+				Vector3.new(
+					autoAvoidTarget.X
+						- root.Position.X,
+					0,
+					autoAvoidTarget.Z
+						- root.Position.Z
+				).Unit
 
 			-- Give lateral avoidance time to work first. If the same object is
 			-- still blocking after ~0.7s, virtualize Space as a second escape tool.
@@ -24003,10 +25837,11 @@ task.spawn(function()
 				)
 			end
 
-			return rotatePlanar(
-				direction,
-				55 * autoAvoidSign
-			)
+			if autoAvoidTarget then
+				local toBypass=Vector3.new(autoAvoidTarget.X-root.Position.X,0,autoAvoidTarget.Z-root.Position.Z)
+				if toBypass.Magnitude>0.05 then return toBypass.Unit end
+			end
+			return bypassDirection
 		end
 
 		autoAvoidReason = nil
@@ -24042,6 +25877,10 @@ task.spawn(function()
 
 		local commonSafe = not questSwitchingAnimal
 			and not state.busy
+			and not (
+				state.safeMove
+					and state.safeMove.active
+			)
 			and not criticalRecoveryActive
 			and not DAMAGE.active
 			and not carcassEatBusy
@@ -24103,9 +25942,19 @@ task.spawn(function()
 			state.questMotionMoving = true
 			state.questMotionMode = swimMove and "Swimming" or "Land"
 
-			-- Land and Swim now use the same forward-input model.
-			local wantsMoveW = (landMove and state.questLandInputActive) or swimMove
-			state.questSetW(wantsMoveW)
+			state.autoRunMoveOwnsInput =
+				landMove
+					and not swimMove
+
+			if swimMove then
+				state.questSetW(true)
+
+			elseif landMove then
+				-- v128: no keyboard/camera-relative steering in Land AutoRun.
+				state.questSetW(false)
+			else
+				state.questSetW(false)
+			end
 
 			if trackedCharacter ~= character
 				or not center
@@ -24114,8 +25963,14 @@ task.spawn(function()
 
 				trackedCharacter = character
 				wasSwimming = swimMove
-				center = swimMove and state.questSwimPosition or root.Position
+				center =
+					swimMove
+						and state.questSwimPosition
+						or root.Position
+
 				angle = 0
+				autoCircle.waypointIndex = nil
+				autoCircle.center = nil
 
 				autoHill.sign = nil
 				autoHill.progressAt = 0
@@ -24129,6 +25984,7 @@ task.spawn(function()
 				autoWater.anchor = nil
 				autoWater.progressAt = 0
 				autoWater.bestProjection = 0
+				autoAvoidTarget = nil
 
 				if autoAvoidReason == "hill"
 					or autoAvoidReason
@@ -24213,25 +26069,52 @@ task.spawn(function()
 					wasMoving = true
 				end
 			else
-				local speed = getQuestMoveSpeed(character)
-				local moveRadius = radius
-				angle += (speed / moveRadius) * 0.05
+				local speed =
+					getQuestMoveSpeed(
+						character
+					)
 
-				local target = Vector3.new(
-					center.X + math.cos(angle) * moveRadius,
-					root.Position.Y,
-					center.Z + math.sin(angle) * moveRadius
-				)
+				local moveRadius =
+					radius
 
-				local flat = Vector3.new(
-					target.X - root.Position.X,
-					0,
-					target.Z - root.Position.Z
-				)
+				-- Fixed WORLD-SPACE circle points.
+				local circleTarget,
+					direction,
+					circleTargetDistance =
+						autoRunCircleWaypoint(
+							root,
+							center,
+							moveRadius
+						)
 
-				if flat.Magnitude > 0.1 then
-					local direction = flat.Unit
-					local velocity = root.AssemblyLinearVelocity
+				if tick()
+					- (
+						state.autoRunCircleStatusAt
+							or 0
+					) >= 1.0 then
+
+					state.autoRunCircleStatusAt =
+						tick()
+
+					runtimeMessage =
+						string.format(
+							"Auto Run circle · point %s/%d · %.0f studs",
+							tostring(
+								autoCircle.waypointIndex
+									or "?"
+							),
+							autoCircle.waypointCount
+								or 24,
+							circleTargetDistance
+								or 0
+						)
+				end
+
+				if direction
+					and direction.Magnitude > 0.1 then
+
+					local velocity =
+						root.AssemblyLinearVelocity
 
 					-- Independent stuck verification: if the animal has barely moved
 					-- for ~1 second even after avoidance, use virtual Space and force a
@@ -24309,33 +26192,70 @@ task.spawn(function()
 						speed
 					)
 
-					if state.isHeavyGroundMover(character) then
+					local exactRunTarget
+
+					if autoAvoidReason == "object"
+						and autoAvoidTarget
+						and tick() < autoAvoidUntil then
+
+						exactRunTarget =
+							autoAvoidTarget
+
+					elseif not autoWater.active
+						and autoAvoidReason ~= "hill"
+						and autoAvoidReason ~= "stuck"
+						and autoAvoidReason ~= "hill_recenter"
+						and tick() >= autoAvoidUntil then
+
+						exactRunTarget =
+							circleTarget
+					end
+
+					local runTargetDistance =
+						exactRunTarget
+							and Vector3.new(
+								exactRunTarget.X
+									- root.Position.X,
+								0,
+								exactRunTarget.Z
+									- root.Position.Z
+							).Magnitude
+							or circleTargetDistance
+
+					if humanoid then
 						state.heavyWalkStep(
 							character,
 							root,
 							humanoid,
 							direction,
 							speed,
-							nil,
-							nil
+							runTargetDistance,
+							exactRunTarget,
+							"autoRun",
+							trackedCharacter
 						)
-					else
-						if landMove and state.questLandInputActive then
-							pcall(function()
-								root.CFrame = CFrame.lookAt(root.Position, root.Position + direction, Vector3.yAxis)
-							end)
-						end
-						root.AssemblyLinearVelocity = Vector3.new(direction.X * speed, velocity.Y, direction.Z * speed)
 					end
 					wasMoving = true
 				end
 			end
 		else
-			state.heavyWalkStop(player.Character)
+			state.autoRunMoveOwnsInput = false
+
+			-- Stop only pure AutoRun ownership. A SafeMove route may be active.
+			if state.heavyWalk
+				and state.heavyWalk.owner
+					== "autoRun" then
+
+				state.heavyWalkStop(
+					player.Character
+				)
+			end
+
 			autoProgressPosition = nil
 			autoProgressAt = 0
 			autoBlockingInstance = nil
 			autoBlockingSince = 0
+			state.safeMove.heavyObstacleSign = nil
 
 			autoHill.sign = nil
 			autoHill.progressAt = 0
@@ -24349,6 +26269,7 @@ task.spawn(function()
 			autoWater.anchor = nil
 			autoWater.progressAt = 0
 			autoWater.bestProjection = 0
+			autoAvoidTarget = nil
 
 			if autoAvoidReason == "hill"
 				or autoAvoidReason
@@ -24357,30 +26278,49 @@ task.spawn(function()
 				autoAvoidUntil = 0
 			end
 
-			-- A physical Safe Move may be travelling across land for another
-			-- purpose (Food/Water/Zone) while a Land Distance quest is pending.
-			-- In that case Safe Move owns virtual W and quest-motion bookkeeping.
-			local moveOwnsLandQuestW =
+			-- Do not touch a physical SafeMove from the pure AutoRun loop.
+			local physicalMoveOwnsMovement =
 				state.safeMove
-				and state.safeMove.active
-				and state.safeMove.landQuestW
+					and state.safeMove.active
 
-			if not moveOwnsLandQuestW then
+			local moveOwnsLandQuestW =
+				physicalMoveOwnsMovement
+					and state.safeMove.landQuestW
+
+			if not physicalMoveOwnsMovement then
 				state.questMotionMoving = false
 				state.questMotionMode = nil
 				state.questSetW(false)
-				if state.questLandKeyDown then state.releaseMovementNow(player.Character, true) end
-			end
 
-			if root and not moveOwnsLandQuestW then
-				local stopCharacter = player.Character
-				local stopHumanoid = stopCharacter
-					and stopCharacter:FindFirstChildOfClass("Humanoid")
-				if stopHumanoid then
-					pcall(stopHumanoid.Move, stopHumanoid, Vector3.zero, false)
+				if state.questLandKeyDown then
+					state.releaseMovementNow(
+						player.Character,
+						true
+					)
 				end
-			end
 
+				if root then
+					local stopCharacter =
+						player.Character
+
+					local stopHumanoid =
+						stopCharacter
+						and stopCharacter:FindFirstChildOfClass(
+							"Humanoid"
+						)
+
+					if stopHumanoid then
+						pcall(
+							stopHumanoid.Move,
+							stopHumanoid,
+							Vector3.zero,
+							false
+						)
+					end
+				end
+			elseif moveOwnsLandQuestW then
+				-- SafeMove owns W; leave it untouched.
+			end
 			wasMoving = false
 			wasSwimming = false
 			center = nil
