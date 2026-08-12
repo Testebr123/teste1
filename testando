@@ -604,9 +604,19 @@ local function isCarnivoreCharacter(character)
 	return false
 end
 function state.growthModeActive()
+	-- Growth can be owned either by the manual Growth tab or temporarily by
+	-- Auto Quests while it finishes/resets a growing slot. Pride Rock must
+	-- remain enforced in both cases.
 	return state.growExisting
 		or state.growAllSlots
 		or state.growNew
+		or state.growExistingAutomaticAll
+		or state.questPostGrowAll
+		or state.questGrowthOwnsCurrent
+		or (
+			state.questGrowthReset
+			and state.questGrowthReset.active ~= nil
+		)
 end
 
 function state.isGrowthHerbivore(character)
@@ -662,24 +672,82 @@ function state.growthPrideHorizontalDistance(position)
 	).Magnitude
 end
 
+function state.growthPridePositionInsideZone(position)
+	if typeof(position) ~= "Vector3" then
+		return nil
+	end
+
+	local mapZones = workspace:FindFirstChild("MapZones")
+	local prideZone = mapZones and mapZones:FindFirstChild("Pride Rock")
+	if not prideZone then
+		return nil
+	end
+
+	local foundVolume = false
+
+	for _, object in ipairs(prideZone:GetDescendants()) do
+		if object:IsA("BasePart") then
+			foundVolume = true
+
+			local localPoint =
+				object.CFrame:PointToObjectSpace(
+					position
+				)
+
+			-- Zone parts are trigger volumes. X/Z is what matters for keeping
+			-- the animal and grass target inside the actual Pride Rock territory.
+			if math.abs(localPoint.X)
+				<= object.Size.X * 0.5 + 3
+				and math.abs(localPoint.Z)
+					<= object.Size.Z * 0.5 + 3 then
+
+				return true
+			end
+		end
+	end
+
+	if foundVolume then
+		return false
+	end
+
+	return nil
+end
+
 function state.growthPrideInside(character, root)
 	if not state.growthPrideRestrictionActive(character)
 		or not root then
 		return true
 	end
 
-	-- Replicated zone name is the strongest signal when available.
+	-- ZoneName is authoritative. The old 650-stud fallback was large enough
+	-- to classify animals outside Pride Rock as already inside, so the return
+	-- controller never started. If Roblox reports ANY zone, trust it.
 	local zone = state.questCurrentZoneName()
 
-	if type(zone) == "string"
-		and zone:lower() == "pride rock" then
-		return true
+	if type(zone) == "string" and zone ~= "" then
+		return zone:lower() == "pride rock"
 	end
 
-	-- Physical fallback while ZoneName replication catches up.
-	return state.growthPrideHorizontalDistance(
-		root.Position
-	) <= state.growthPride.radius
+	-- If ZoneName has not replicated yet, use the real MapZones volume.
+	local geometricInside =
+		state.growthPridePositionInsideZone(
+			root.Position
+		)
+
+	if geometricInside ~= nil then
+		return geometricInside
+	end
+
+	-- Last-resort replication fallback: accept only the dedicated safe HOME
+	-- point, never the old 650-stud approximate radius.
+	local home = state.growthPride.home
+	local distanceToHome = Vector3.new(
+		root.Position.X - home.X,
+		0,
+		root.Position.Z - home.Z
+	).Magnitude
+
+	return distanceToHome <= 110
 end
 
 function state.growthPrideFoodPositionAllowed(position)
@@ -687,6 +755,17 @@ function state.growthPrideFoodPositionAllowed(position)
 
 	if not state.growthPrideRestrictionActive(character) then
 		return true
+	end
+
+	-- Prefer the real Pride Rock MapZones volume so grass routing cannot pull
+	-- a growing herbivore just outside the territory.
+	local geometricInside =
+		state.growthPridePositionInsideZone(
+			position
+		)
+
+	if geometricInside ~= nil then
+		return geometricInside
 	end
 
 	return state.growthPrideHorizontalDistance(
@@ -2732,13 +2811,16 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			local verticalMovement =
 				forceVertical or activeSwimApproach or flying
 
-			-- v127: manual Move To uses the reliable MoveTo motor on EVERY
-			-- terrestrial animal. Heavy automated routes keep using it too.
+			-- Manual Move To and selected automatic routes use the same reliable
+			-- WalkSpeed + Humanoid:MoveTo motor on EVERY terrestrial animal.
+			-- forceMoveToLand is opt-in so unrelated food/water controllers keep
+			-- their existing behavior. ZoneTime uses it to match Move To Locations.
 			local moveToDrivenLand =
 				not verticalMovement
 					and (
 						state.safeMove.heavy
 							or purpose == "manual"
+							or options.forceMoveToLand == true
 					)
 
 			-- If a terrestrial TravelDistance/Run quest is pending, any normal
@@ -14243,18 +14325,21 @@ local function spawnSlot(
 			and state.growthPride.home
 			or getSafeFarmPosition()
 
+		local prideGrowthSpawn =
+			state.growthPrideRestrictionActive(
+				matched
+			)
+
 		safeMoveToPosition(
 			postSpawnTarget,
 			8,
 			nil,
 			{
 				purpose = "spawn",
-				tolerance =
-					state.growthPrideRestrictionActive(
-						matched
-					)
-					and 55
-					or 18,
+				-- Small herbivores must use the same reliable world-space MoveTo
+				-- motor as Move To Locations when being staged into Pride Rock.
+				forceMoveToLand = prideGrowthSpawn,
+				tolerance = prideGrowthSpawn and 55 or 18,
 				maxDuration = 300,
 			}
 		)
@@ -20178,16 +20263,13 @@ function state.questReturnToZoneAfterFeeding(quests)
 	end
 
 	local currentZone = getPlayerZoneName()
-	local physicallyNear = Vector3.new(
-		root.Position.X - position.X,
-		0,
-		root.Position.Z - position.Z
-	).Magnitude <= 150
 
 	local zoneMatches = type(currentZone) == "string"
 		and currentZone:lower() == returnZone:lower()
 
-	if zoneMatches or physicallyNear then
+	-- Distance to the saved coordinate is NOT proof that Savannah registered the
+	-- zone. Only the live zone name can finish a Survive-in-Zone return.
+	if zoneMatches then
 		state.questClearReturnZone()
 		state.questForceFastRecheckUntil = tick() + 20
 		runtimeMessage = "Returned to " .. returnZone .. " after feeding; quest resumed"
@@ -20208,16 +20290,33 @@ function state.questReturnToZoneAfterFeeding(quests)
 	if tick() - (state.questReturnZone.lastMoveAt or 0) >= 3 then
 		state.questReturnZone.lastMoveAt = tick()
 		runtimeMessage = "Feeding complete; returning to quest zone: " .. returnZone
-		safeMoveToPosition(
+		local targetReturnZone = returnZone
+		local moved = safeMoveToPosition(
 			position,
 			10,
 			nil,
 			{
 				purpose = "quest",
-				tolerance = 45,
+				forceMoveToLand = true,
+				tolerance = 18,
 				maxDuration = 360,
+				routeCheckInterval = 0.20,
+				routeCheck = function()
+					local liveZone = getPlayerZoneName()
+					if type(liveZone) == "string"
+						and liveZone:lower() == targetReturnZone:lower() then
+						return true, "zone_entered"
+					end
+					return false
+				end,
 			}
 		)
+
+		if state.safeMove.routeInterruptReason == "zone_entered" then
+			runtimeMessage = "Entered " .. targetReturnZone .. "; quest resumed"
+		elseif not moved then
+			runtimeMessage = "Could not enter " .. targetReturnZone .. "; retrying route"
+		end
 	end
 
 	return true
@@ -21271,28 +21370,18 @@ local function updateQuestAutomation()
 	if questTargetZoneName then
 		local currentZone = getPlayerZoneName()
 		local position = getZonePosition(questTargetZoneName)
-		local _, zoneRoot = characterParts()
-
-		local physicallyNearZone = position
-			and zoneRoot
-			and Vector3.new(
-				zoneRoot.Position.X - position.X,
-				0,
-				zoneRoot.Position.Z - position.Z
-			).Magnitude <= 150
 
 		local zoneNameMatches = type(currentZone) == "string"
 			and currentZone:lower() == questTargetZoneName:lower()
 
-		local zoneActuallyProgressing =
-			zoneNameMatches or physicallyNearZone
-
+		-- Never substitute coordinate proximity for the game's actual zone state.
+		-- Being 100-150 studs from a center point may still be outside ZoneTime.
 		state.questZoneDrinkUpdate(
 			questTargetZoneName,
-			zoneActuallyProgressing
+			zoneNameMatches
 		)
 
-		if not zoneNameMatches and not physicallyNearZone then
+		if not zoneNameMatches then
 			local sameTarget = state.questZoneLastTarget == questTargetZoneName
 			local canMoveAgain = not sameTarget
 				or tick() - (state.questZoneLastMoveAt or 0) >= 8
@@ -21309,16 +21398,34 @@ local function updateQuestAutomation()
 				state.questZoneLastMoveAt = tick()
 				questStatusText = "Going to " .. questTargetZoneName
 				runtimeMessage = "Quest zone: " .. questTargetZoneName
-				safeMoveToPosition(
+				local targetZoneName = questTargetZoneName
+				local moved = safeMoveToPosition(
 					position,
 					10,
 					nil,
 					{
 						purpose = "quest",
-						tolerance = 45,
+						forceMoveToLand = true,
+						tolerance = 18,
 						maxDuration = 360,
+						routeCheckInterval = 0.20,
+						routeCheck = function()
+							local liveZone = getPlayerZoneName()
+							if type(liveZone) == "string"
+								and liveZone:lower() == targetZoneName:lower() then
+								return true, "zone_entered"
+							end
+							return false
+						end,
 					}
 				)
+
+				if state.safeMove.routeInterruptReason == "zone_entered" then
+					questStatusText = "Entered " .. targetZoneName
+					runtimeMessage = "Quest zone confirmed: " .. targetZoneName
+				elseif not moved then
+					runtimeMessage = "Quest zone route interrupted; retrying " .. targetZoneName
+				end
 			else
 				questStatusText = "Waiting to enter " .. questTargetZoneName
 			end
@@ -22439,6 +22546,7 @@ function state.growthPrideReturnStep()
 			nil,
 			{
 				purpose = "growth_home",
+				forceMoveToLand = true,
 				tolerance = 55,
 				speedScale = 1,
 				maxDuration = 360,
@@ -23106,7 +23214,7 @@ INFO.update0Text.Size = UDim2.new(1, -52, 1, 0)
 INFO.update0Text.Position = UDim2.fromOffset(46, 0)
 INFO.update0Text.BackgroundTransparency = 1
 INFO.update0Text.Font = FONT_BUTTON
-INFO.update0Text.Text = "Sorry for the key-related issues, the HWID was not being saved."
+INFO.update0Text.Text = "Movement system changes: teleports were replaced by natural movement."
 INFO.update0Text.TextColor3 = COLOR_TEXT
 INFO.update0Text.TextSize = 12
 INFO.update0Text.TextXAlignment = Enum.TextXAlignment.Left
@@ -23141,7 +23249,7 @@ INFO.update1Text.Size = UDim2.new(1, -52, 1, 0)
 INFO.update1Text.Position = UDim2.fromOffset(46, 0)
 INFO.update1Text.BackgroundTransparency = 1
 INFO.update1Text.Font = FONT_BUTTON
-INFO.update1Text.Text = "Savannah Life aquatic support"
+INFO.update1Text.Text = "Auto Quests system."
 INFO.update1Text.TextColor3 = COLOR_TEXT
 INFO.update1Text.TextSize = 12
 INFO.update1Text.TextXAlignment = Enum.TextXAlignment.Left
@@ -23176,7 +23284,7 @@ INFO.update2Text.Size = UDim2.new(1, -52, 1, 0)
 INFO.update2Text.Position = UDim2.fromOffset(46, 0)
 INFO.update2Text.BackgroundTransparency = 1
 INFO.update2Text.Font = FONT_BUTTON
-INFO.update2Text.Text = "SL / DL bug fixes"
+INFO.update2Text.Text = "New safer water-drinking system."
 INFO.update2Text.TextColor3 = COLOR_TEXT
 INFO.update2Text.TextSize = 12
 INFO.update2Text.TextXAlignment = Enum.TextXAlignment.Left
@@ -23218,6 +23326,112 @@ end)
 
 INFO.close.Activated:Connect(function()
 	INFO.overlay.Visible = false
+end)
+
+-- ============================================================
+-- One-time startup warning
+-- ============================================================
+local START_NOTICE = {}
+
+START_NOTICE.overlay = Instance.new("Frame")
+START_NOTICE.overlay.Size = UDim2.new(1, 0, 1, 0)
+START_NOTICE.overlay.Position = UDim2.fromOffset(0, 0)
+START_NOTICE.overlay.BackgroundColor3 = Color3.fromRGB(3, 2, 4)
+START_NOTICE.overlay.BackgroundTransparency = 0.08
+START_NOTICE.overlay.BorderSizePixel = 0
+START_NOTICE.overlay.Visible = true
+START_NOTICE.overlay.Active = true
+START_NOTICE.overlay.ZIndex = 70
+START_NOTICE.overlay.Parent = window
+
+START_NOTICE.panel = Instance.new("Frame")
+START_NOTICE.panel.Size = UDim2.new(1, -24, 0, 292)
+START_NOTICE.panel.Position = UDim2.new(0, 12, 0.5, -146)
+START_NOTICE.panel.BackgroundColor3 = COLOR_HEADER
+START_NOTICE.panel.BorderSizePixel = 0
+START_NOTICE.panel.ZIndex = 71
+START_NOTICE.panel.Parent = START_NOTICE.overlay
+corner(START_NOTICE.panel, 13)
+stroke(START_NOTICE.panel, COLOR_ACCENT, 1).Transparency = 0.18
+
+START_NOTICE.accent = Instance.new("Frame")
+START_NOTICE.accent.Size = UDim2.new(0, 4, 1, -28)
+START_NOTICE.accent.Position = UDim2.fromOffset(0, 14)
+START_NOTICE.accent.BackgroundColor3 = COLOR_ACCENT
+START_NOTICE.accent.BorderSizePixel = 0
+START_NOTICE.accent.ZIndex = 72
+START_NOTICE.accent.Parent = START_NOTICE.panel
+corner(START_NOTICE.accent, 2)
+
+START_NOTICE.title = Instance.new("TextLabel")
+START_NOTICE.title.Size = UDim2.new(1, -82, 0, 34)
+START_NOTICE.title.Position = UDim2.fromOffset(20, 16)
+START_NOTICE.title.BackgroundTransparency = 1
+START_NOTICE.title.Font = Enum.Font.GothamBlack
+START_NOTICE.title.Text = "IMPORTANT UPDATE NOTICE"
+START_NOTICE.title.TextColor3 = COLOR_ACCENT
+START_NOTICE.title.TextSize = 18
+START_NOTICE.title.TextXAlignment = Enum.TextXAlignment.Left
+START_NOTICE.title.ZIndex = 72
+START_NOTICE.title.Parent = START_NOTICE.panel
+
+START_NOTICE.close = Instance.new("TextButton")
+START_NOTICE.close.Size = UDim2.fromOffset(38, 38)
+START_NOTICE.close.Position = UDim2.new(1, -52, 0, 12)
+START_NOTICE.close.BackgroundColor3 = COLOR_CARD_ON
+START_NOTICE.close.BorderSizePixel = 0
+START_NOTICE.close.Font = Enum.Font.GothamBlack
+START_NOTICE.close.Text = "×"
+START_NOTICE.close.TextColor3 = COLOR_TEXT
+START_NOTICE.close.TextSize = 24
+START_NOTICE.close.AutoButtonColor = false
+START_NOTICE.close.ZIndex = 73
+START_NOTICE.close.Parent = START_NOTICE.panel
+corner(START_NOTICE.close, 10)
+
+START_NOTICE.divider = Instance.new("Frame")
+START_NOTICE.divider.Size = UDim2.new(1, -40, 0, 1)
+START_NOTICE.divider.Position = UDim2.fromOffset(20, 62)
+START_NOTICE.divider.BackgroundColor3 = Color3.fromRGB(78, 35, 63)
+START_NOTICE.divider.BorderSizePixel = 0
+START_NOTICE.divider.ZIndex = 72
+START_NOTICE.divider.Parent = START_NOTICE.panel
+
+START_NOTICE.body = Instance.new("TextLabel")
+START_NOTICE.body.Size = UDim2.new(1, -40, 0, 132)
+START_NOTICE.body.Position = UDim2.fromOffset(20, 82)
+START_NOTICE.body.BackgroundTransparency = 1
+START_NOTICE.body.Font = FONT_BUTTON
+START_NOTICE.body.Text = "This script has received many changes, so bugs may happen. Please report any problems to me on Discord.\n\nAquatic animal farming is currently broken."
+START_NOTICE.body.TextColor3 = COLOR_TEXT
+START_NOTICE.body.TextSize = 15
+START_NOTICE.body.TextWrapped = true
+START_NOTICE.body.TextXAlignment = Enum.TextXAlignment.Left
+START_NOTICE.body.TextYAlignment = Enum.TextYAlignment.Top
+START_NOTICE.body.LineHeight = 1.15
+START_NOTICE.body.ZIndex = 72
+START_NOTICE.body.Parent = START_NOTICE.panel
+
+START_NOTICE.discord = Instance.new("TextLabel")
+START_NOTICE.discord.Size = UDim2.new(1, -40, 0, 48)
+START_NOTICE.discord.Position = UDim2.new(0, 20, 1, -62)
+START_NOTICE.discord.BackgroundColor3 = COLOR_CARD
+START_NOTICE.discord.BorderSizePixel = 0
+START_NOTICE.discord.Font = Enum.Font.GothamBold
+START_NOTICE.discord.Text = "Discord: martusmmb"
+START_NOTICE.discord.TextColor3 = COLOR_ACCENT
+START_NOTICE.discord.TextSize = 14
+START_NOTICE.discord.ZIndex = 72
+START_NOTICE.discord.Parent = START_NOTICE.panel
+corner(START_NOTICE.discord, 9)
+
+START_NOTICE.close.Activated:Connect(function()
+	-- Destroy instead of merely hiding it: this warning is intentionally
+	-- shown only once per script execution and has no reopen button.
+	if START_NOTICE.overlay then
+		START_NOTICE.overlay:Destroy()
+		START_NOTICE.overlay = nil
+	end
 end)
 
 -- Drag da janela pelo header
@@ -24329,7 +24543,7 @@ toggle(tabContents.Quests, "Auto Complete Quests", "autoQuests", 1)
 toggle(tabContents.Quests, "Auto Claim Rewards", "autoClaimQuests", 2)
 
 local questInfoCard = Instance.new("Frame")
-questInfoCard.Size = UDim2.new(1, 0, 0, 92)
+questInfoCard.Size = UDim2.new(1, 0, 0, 122)
 questInfoCard.LayoutOrder = 3
 questInfoCard.BackgroundColor3 = Color3.fromRGB(20, 10, 18)
 questInfoCard.BorderSizePixel = 0
@@ -24357,11 +24571,11 @@ questInfoTitle.TextXAlignment = Enum.TextXAlignment.Left
 questInfoTitle.Parent = questInfoCard
 
 local questInfoBody = Instance.new("TextLabel")
-questInfoBody.Size = UDim2.new(1, -28, 0, 58)
+questInfoBody.Size = UDim2.new(1, -28, 0, 88)
 questInfoBody.Position = UDim2.fromOffset(14, 27)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
-questInfoBody.Text = "Grow Existing: current species. Grow All: all saved slots. GroupTime: cooperative MMBx packs. AFK Coin can use your selected animal."
+questInfoBody.Text = "Zone quests: moves to the required territory and stays there. Travel quests: Auto Run completes the required distance. Group quests: creates or joins MMB groups with compatible animals. Food, water and required animal changes are handled automatically when needed."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
 questInfoBody.TextSize = 12
