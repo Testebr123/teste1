@@ -192,17 +192,21 @@ local state = {
 		manualLabel = nil,
 		manualCancelledAt = 0,
 	},
-	heavyGlide = {
+	heavyWalk = {
 		character = nil,
-		collisionSnapshot = nil,
+		humanoid = nil,
+		root = nil,
+
+		originalWalkSpeed = nil,
+		targetWalkSpeed = nil,
+		walkSpeedConnection = nil,
+
 		movementDisabled = nil,
 		autoRotate = nil,
 		platformStand = nil,
-		bodyVelocity = nil,
-		bodyGyro = nil,
-		hoverY = nil,
-		lastGroundY = nil,
-		lastAt = 0,
+
+		lastMoveToAt = 0,
+		lastMoveToPoint = nil,
 	},
 
 	questSlots = {
@@ -885,214 +889,182 @@ function state.aquaticWaterStandOffset(character)
 	return math.clamp(clearance + 0.20, 2.5, 8)
 end
 
-function state.heavyGlideStop(character)
-	local fly = state.heavyGlide
-	if not fly then return end
+function state.heavyWalkStop(character)
+	local walk = state.heavyWalk
+	if not walk then return end
 
-	local activeCharacter =
-		character or fly.character
-
-	if fly.bodyVelocity then
+	if walk.walkSpeedConnection then
 		pcall(
-			fly.bodyVelocity.Destroy,
-			fly.bodyVelocity
+			walk.walkSpeedConnection.Disconnect,
+			walk.walkSpeedConnection
 		)
-		fly.bodyVelocity = nil
+		walk.walkSpeedConnection = nil
 	end
 
-	if fly.bodyGyro then
+	local activeCharacter =
+		character or walk.character
+
+	local humanoid =
+		activeCharacter
+			and activeCharacter:FindFirstChildOfClass("Humanoid")
+			or walk.humanoid
+
+	local root =
+		activeCharacter
+			and activeCharacter:FindFirstChild("HumanoidRootPart")
+			or walk.root
+
+	if humanoid then
+		if root then
+			pcall(
+				humanoid.MoveTo,
+				humanoid,
+				root.Position
+			)
+		end
+
 		pcall(
-			fly.bodyGyro.Destroy,
-			fly.bodyGyro
+			humanoid.Move,
+			humanoid,
+			Vector3.zero,
+			false
 		)
-		fly.bodyGyro = nil
+
+		pcall(function()
+			if walk.originalWalkSpeed then
+				humanoid.WalkSpeed =
+					walk.originalWalkSpeed
+			end
+
+			humanoid.PlatformStand =
+				walk.platformStand == true
+
+			humanoid.AutoRotate =
+				walk.autoRotate ~= false
+		end)
 	end
 
 	if activeCharacter
 		and activeCharacter.Parent then
-
-		if type(fly.collisionSnapshot)
-			== "table" then
-
-			for part, canCollide in pairs(
-				fly.collisionSnapshot
-			) do
-				if part and part.Parent then
-					pcall(function()
-						part.CanCollide =
-							canCollide == true
-					end)
-				end
-			end
-		end
-
-		local humanoid =
-			activeCharacter:FindFirstChildOfClass(
-				"Humanoid"
-			)
-
-		local root =
-			activeCharacter:FindFirstChild(
-				"HumanoidRootPart"
-			)
-
-		if humanoid then
-			pcall(function()
-				humanoid.PlatformStand =
-					fly.platformStand == true
-				humanoid.AutoRotate =
-					fly.autoRotate ~= false
-				humanoid:Move(
-					Vector3.zero,
-					false
-				)
-			end)
-		end
-
 		activeCharacter:SetAttribute(
 			"MovementDisabled",
-			fly.movementDisabled == true
+			walk.movementDisabled == true
 		)
-
-		if root then
-			root.AssemblyLinearVelocity =
-				Vector3.zero
-			root.AssemblyAngularVelocity =
-				Vector3.zero
-		end
 	end
 
-	fly.character = nil
-	fly.collisionSnapshot = nil
-	fly.movementDisabled = nil
-	fly.autoRotate = nil
-	fly.platformStand = nil
-	fly.hoverY = nil
-	fly.lastGroundY = nil
-	fly.lastAt = 0
+	walk.character = nil
+	walk.humanoid = nil
+	walk.root = nil
+	walk.originalWalkSpeed = nil
+	walk.targetWalkSpeed = nil
+	walk.movementDisabled = nil
+	walk.autoRotate = nil
+	walk.platformStand = nil
+	walk.lastMoveToAt = 0
+	walk.lastMoveToPoint = nil
 end
 
-function state.heavyGlidePrepare(character)
+function state.heavyWalkPrepare(
+	character,
+	humanoid,
+	root,
+	targetWalkSpeed
+)
 	if not character
-		or not state.isHeavyGroundMover(
-			character
-		) then
+		or not humanoid
+		or not root
+		or not state.isHeavyGroundMover(character) then
+
 		return false
 	end
 
-	local root =
-		character:FindFirstChild(
-			"HumanoidRootPart"
-		)
+	local walk = state.heavyWalk
 
-	local humanoid =
-		character:FindFirstChildOfClass(
-			"Humanoid"
-		)
-
-	if not root or not humanoid then
-		return false
+	if walk.character
+		and walk.character ~= character then
+		state.heavyWalkStop(walk.character)
 	end
 
-	local fly = state.heavyGlide
+	local newCharacter =
+		walk.character ~= character
+			or walk.humanoid ~= humanoid
 
-	if fly.character
-		and fly.character ~= character then
-		state.heavyGlideStop(
-			fly.character
-		)
-	end
+	if newCharacter then
+		if walk.walkSpeedConnection then
+			pcall(
+				walk.walkSpeedConnection.Disconnect,
+				walk.walkSpeedConnection
+			)
+			walk.walkSpeedConnection = nil
+		end
 
-	if fly.character ~= character
-		or type(fly.collisionSnapshot)
-			~= "table" then
+		walk.character = character
+		walk.humanoid = humanoid
+		walk.root = root
 
-		fly.character = character
-		fly.collisionSnapshot = {}
-		fly.movementDisabled =
+		walk.originalWalkSpeed =
+			humanoid.WalkSpeed
+
+		walk.movementDisabled =
 			character:GetAttribute(
 				"MovementDisabled"
 			)
-		fly.autoRotate =
+
+		walk.autoRotate =
 			humanoid.AutoRotate
-		fly.platformStand =
+
+		walk.platformStand =
 			humanoid.PlatformStand
 
-		for _, object in ipairs(
-			character:GetDescendants()
-		) do
-			if object:IsA("BasePart") then
-				fly.collisionSnapshot[
-					object
-				] = object.CanCollide
-			end
-		end
+		walk.lastMoveToAt = 0
+		walk.lastMoveToPoint = nil
+
+		-- Same principle as IY loopspeed:
+		-- if the game changes WalkSpeed, restore the requested value.
+		walk.walkSpeedConnection =
+			humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+				if not state.alive
+					or state.heavyWalk.character ~= character
+					or state.heavyWalk.humanoid ~= humanoid then
+					return
+				end
+
+				local wanted =
+					tonumber(
+						state.heavyWalk.targetWalkSpeed
+					)
+
+				if wanted
+					and wanted > 0
+					and math.abs(
+						humanoid.WalkSpeed - wanted
+					) > 0.05 then
+
+					pcall(function()
+						humanoid.WalkSpeed = wanted
+					end)
+				end
+			end)
 	end
 
-	-- While flying, the large body cannot snag on Terrain/rocks.
-	for part in pairs(
-		fly.collisionSnapshot
-	) do
-		if part and part.Parent then
-			part.CanCollide = false
-		end
-	end
-
-	if not fly.bodyVelocity
-		or not fly.bodyVelocity.Parent then
-
-		local mover =
-			Instance.new(
-				"BodyVelocity"
-			)
-
-		mover.Name =
-			"MMB_HeavyFlyVelocity"
-		mover.MaxForce =
-			Vector3.new(
-				1e9,
-				1e9,
-				1e9
-			)
-		mover.P = 25000
-		mover.Velocity =
-			Vector3.zero
-		mover.Parent = root
-
-		fly.bodyVelocity = mover
-	end
-
-	if not fly.bodyGyro
-		or not fly.bodyGyro.Parent then
-
-		local gyro =
-			Instance.new(
-				"BodyGyro"
-			)
-
-		gyro.Name =
-			"MMB_HeavyFlyGyro"
-		gyro.MaxTorque =
-			Vector3.new(
-				1e9,
-				1e9,
-				1e9
-			)
-		gyro.P = 30000
-		gyro.D = 900
-		gyro.CFrame = root.CFrame
-		gyro.Parent = root
-
-		fly.bodyGyro = gyro
-	end
+	walk.targetWalkSpeed =
+		math.max(
+			1,
+			tonumber(targetWalkSpeed)
+				or state.safeMovementSpeed(character)
+		)
 
 	pcall(function()
 		humanoid.PlatformStand = false
-		humanoid.AutoRotate = false
-		humanoid:Move(
-			Vector3.zero,
-			false
-		)
+		humanoid.AutoRotate = true
+
+		if math.abs(
+			humanoid.WalkSpeed
+				- walk.targetWalkSpeed
+		) > 0.05 then
+			humanoid.WalkSpeed =
+				walk.targetWalkSpeed
+		end
 	end)
 
 	character:SetAttribute(
@@ -1103,249 +1075,20 @@ function state.heavyGlidePrepare(character)
 	return true
 end
 
-function state.heavyGlideGroundSample(
-	character,
-	root,
-	worldPosition,
-	purpose
-)
-	if not character
-		or not root
-		or typeof(worldPosition)
-			~= "Vector3" then
-		return nil, "invalid"
-	end
-
-	local params =
-		RaycastParams.new()
-
-	params.FilterType =
-		Enum.RaycastFilterType.Include
-	params.FilterDescendantsInstances = {
-		workspace.Terrain,
-	}
-	params.IgnoreWater = false
-
-	local castTop =
-		math.max(
-			root.Position.Y + 220,
-			worldPosition.Y + 220,
-			420
-		)
-
-	local hit =
-		workspace:Raycast(
-			Vector3.new(
-				worldPosition.X,
-				castTop,
-				worldPosition.Z
-			),
-			Vector3.new(
-				0,
-				-700,
-				0
-			),
-			params
-		)
-
-	if not hit then
-		return nil, "no_ground"
-	end
-
-	if hit.Material
-		== Enum.Material.Water then
-
-		local aquatic =
-			isAquaticCharacter(
-				character
-			)
-
-		local allowed =
-			aquatic
-				and (
-					purpose == "safety"
-					or (
-						purpose == "water"
-						and not CROC.isCharacter(
-							character
-						)
-					)
-				)
-
-		if not allowed then
-			return nil, "water"
-		end
-	end
-
-	return hit.Position.Y,
-		hit.Material
-			== Enum.Material.Water
-			and "water"
-			or "terrain"
-end
-
-function state.heavyGlideHoverHeight(
-	character,
-	root,
-	direction,
-	speed,
-	purpose
-)
-	local footprint =
-		state.movementFootprint(
-			character
-		)
-
-	local bodySize =
-		state.movementBodySize(
-			character
-		)
-
-	local rootClearance =
-		state.movementRootClearance(
-			character
-		)
-
-	-- Actual hover: FEET stay around 3-6 studs above the sampled surface.
-	local footHover =
-		math.clamp(
-			math.max(
-				footprint * 0.26,
-				bodySize.Y * 0.075
-			),
-			3.0,
-			6.0
-		)
-
-	local heading =
-		Vector3.new(
-			direction.X,
-			0,
-			direction.Z
-		)
-
-	if heading.Magnitude <= 0.05 then
-		heading =
-			Vector3.new(
-				root.CFrame.LookVector.X,
-				0,
-				root.CFrame.LookVector.Z
-			)
-	end
-
-	if heading.Magnitude <= 0.05 then
-		heading =
-			Vector3.new(0, 0, -1)
-	else
-		heading = heading.Unit
-	end
-
-	local lookAhead =
-		math.clamp(
-			(tonumber(speed) or 20)
-				* 0.45,
-			10,
-			30
-		)
-
-	local highestGround =
-		-math.huge
-	local supportKind
-
-	-- Rise BEFORE reaching slopes/ledges.
-	for _, distance in ipairs({
-		0,
-		lookAhead * 0.35,
-		lookAhead * 0.70,
-		lookAhead,
-	}) do
-		local groundY, kind =
-			state.heavyGlideGroundSample(
-				character,
-				root,
-				root.Position
-					+ heading * distance,
-				purpose
-			)
-
-		if not groundY then
-			if distance <= 0.01 then
-				return nil, kind
-			end
-		else
-			highestGround =
-				math.max(
-					highestGround,
-					groundY
-				)
-			supportKind =
-				supportKind or kind
-		end
-	end
-
-	if highestGround == -math.huge then
-		return nil, "no_ground"
-	end
-
-	local wantedY =
-		highestGround
-			+ rootClearance
-			+ footHover
-
-	local fly = state.heavyGlide
-
-	if not fly.hoverY then
-		fly.hoverY =
-			math.max(
-				root.Position.Y,
-				wantedY
-			)
-	end
-
-	if wantedY > fly.hoverY then
-		-- Climb immediately.
-		fly.hoverY = wantedY
-	else
-		-- Descend slowly so Terrain voxels/edges do not make the body bounce.
-		local now = tick()
-		local dt =
-			fly.lastAt > 0
-				and math.clamp(
-					now - fly.lastAt,
-					1 / 240,
-					0.08
-				)
-				or 1 / 60
-
-		fly.hoverY =
-			math.max(
-				wantedY,
-				fly.hoverY
-					- 8.0 * dt
-			)
-	end
-
-	fly.lastGroundY =
-		highestGround
-
-	return fly.hoverY,
-		supportKind
-end
-
-function state.heavyGlideStep(
+function state.heavyWalkStep(
 	character,
 	root,
 	humanoid,
 	direction,
-	speed,
-	purpose
+	walkSpeed,
+	remainingDistance,
+	finalTarget
 )
 	if not character
 		or not root
 		or not humanoid
-		or typeof(direction)
-			~= "Vector3" then
-		return false, "invalid"
+		or typeof(direction) ~= "Vector3" then
+		return false
 	end
 
 	local flat =
@@ -1356,75 +1099,76 @@ function state.heavyGlideStep(
 		)
 
 	if flat.Magnitude <= 0.05 then
-		return true, "idle"
+		return true
 	end
 
-	if not state.heavyGlidePrepare(
-		character
+	if not state.heavyWalkPrepare(
+		character,
+		humanoid,
+		root,
+		walkSpeed
 	) then
-		return false, "prepare"
+		return false
 	end
 
 	local heading = flat.Unit
-	local flySpeed =
-		math.clamp(
-			tonumber(speed) or 18,
-			6,
-			70
-		)
+	local remaining =
+		tonumber(remainingDistance)
 
-	local targetY, supportKind =
-		state.heavyGlideHoverHeight(
-			character,
-			root,
-			heading,
-			flySpeed,
-			purpose
-		)
+	local leadDistance =
+		remaining
+			and math.clamp(
+				remaining,
+				2.5,
+				18
+			)
+			or 18
 
-	if not targetY then
-		state.heavyGlide.bodyVelocity.Velocity =
-			Vector3.zero
-		return false, supportKind
+	local movePoint
+
+	if typeof(finalTarget) == "Vector3"
+		and remaining
+		and remaining <= 18 then
+
+		movePoint =
+			Vector3.new(
+				finalTarget.X,
+				root.Position.Y,
+				finalTarget.Z
+			)
+	else
+		movePoint =
+			root.Position
+				+ heading * leadDistance
 	end
 
-	local verticalSpeed =
-		math.clamp(
-			(targetY - root.Position.Y)
-				* 5.5,
-			-24,
-			34
+	local walk = state.heavyWalk
+
+	local pointChanged =
+		not walk.lastMoveToPoint
+			or (
+				walk.lastMoveToPoint
+					- movePoint
+			).Magnitude >= 1.25
+
+	-- IY walkto repeatedly calls Humanoid:MoveTo().
+	-- Refresh at 10 Hz or whenever avoidance meaningfully changes direction.
+	if pointChanged
+		or tick()
+			- (walk.lastMoveToAt or 0)
+			>= 0.10 then
+
+		walk.lastMoveToAt = tick()
+		walk.lastMoveToPoint = movePoint
+
+		pcall(
+			humanoid.MoveTo,
+			humanoid,
+			movePoint
 		)
+	end
 
-	-- TRUE FLY: BodyVelocity performs all displacement.
-	state.heavyGlide.bodyVelocity.Velocity =
-		Vector3.new(
-			heading.X * flySpeed,
-			verticalSpeed,
-			heading.Z * flySpeed
-		)
-
-	state.heavyGlide.bodyGyro.CFrame =
-		CFrame.lookAt(
-			root.Position,
-			root.Position + heading,
-			Vector3.yAxis
-		)
-
-	root.AssemblyAngularVelocity =
-		Vector3.zero
-
-	pcall(
-		humanoid.Move,
-		humanoid,
-		Vector3.zero,
-		false
-	)
-
-	state.heavyGlide.lastAt =
-		tick()
-
-	return true, supportKind
+	return true
 end
 
 function state.releaseMovementNow(character, zeroHorizontal)
@@ -1526,20 +1270,47 @@ function state.safeNudgeToward(root, targetPosition, speedScale)
 	if not root or typeof(targetPosition) ~= "Vector3" then return false end
 
 	local character = player.Character
+
 	if state.isHeavyGroundMover(character) then
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local flatGlide = Vector3.new(targetPosition.X - root.Position.X, 0, targetPosition.Z - root.Position.Z)
-		if flatGlide.Magnitude <= 0.15 then return true end
-		if humanoid then
-			local moved = state.heavyGlideStep(
-				character,
-				root,
-				humanoid,
-				flatGlide.Unit,
-				state.safeMovementSpeed(character) * math.clamp(tonumber(speedScale) or 0.35, 0.05, 1),
-				"food"
+		local humanoid =
+			character
+			and character:FindFirstChildOfClass("Humanoid")
+
+		local flatMove =
+			Vector3.new(
+				targetPosition.X - root.Position.X,
+				0,
+				targetPosition.Z - root.Position.Z
 			)
-			if moved then setSubState("Walking"); return true end
+
+		if flatMove.Magnitude <= 0.15 then
+			return true
+		end
+
+		if humanoid then
+			local requestedSpeed =
+				state.safeMovementSpeed(character)
+				* math.clamp(
+					tonumber(speedScale) or 0.35,
+					0.05,
+					1
+				)
+
+			local moved =
+				state.heavyWalkStep(
+					character,
+					root,
+					humanoid,
+					flatMove.Unit,
+					requestedSpeed,
+					flatMove.Magnitude,
+					targetPosition
+				)
+
+			if moved then
+				setSubState("Walking")
+				return true
+			end
 		end
 	end
 
@@ -2354,7 +2125,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 	end
 
 	local function cleanup()
-		state.heavyGlideStop(character)
+		state.heavyWalkStop(character)
 		local _, liveRoot, liveHumanoid = characterParts()
 
 		if liveHumanoid then
@@ -3438,10 +3209,25 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					desired.Z * speed
 				)
 			elseif state.safeMove.heavy then
-				local glideOk = state.heavyGlideStep(character, root, humanoid, desired, speed, purpose)
-				if not glideOk then
-					root.AssemblyLinearVelocity = Vector3.zero
-					root.AssemblyAngularVelocity = Vector3.zero
+				-- Large-animal execution engine:
+				-- WalkSpeed follows live Acceleration; MoveTo performs movement.
+				local walked =
+					state.heavyWalkStep(
+						character,
+						root,
+						humanoid,
+						desired,
+						speed,
+						progressDistance,
+						position
+					)
+
+				if not walked then
+					pcall(
+						humanoid.MoveTo,
+						humanoid,
+						root.Position
+					)
 				end
 			else
 				root.AssemblyLinearVelocity = Vector3.new(
@@ -24524,7 +24310,15 @@ task.spawn(function()
 					)
 
 					if state.isHeavyGroundMover(character) then
-						state.heavyGlideStep(character, root, humanoid, direction, speed, "autorun")
+						state.heavyWalkStep(
+							character,
+							root,
+							humanoid,
+							direction,
+							speed,
+							nil,
+							nil
+						)
 					else
 						if landMove and state.questLandInputActive then
 							pcall(function()
@@ -24537,7 +24331,7 @@ task.spawn(function()
 				end
 			end
 		else
-			state.heavyGlideStop(player.Character)
+			state.heavyWalkStop(player.Character)
 			autoProgressPosition = nil
 			autoProgressAt = 0
 			autoBlockingInstance = nil
@@ -24666,7 +24460,7 @@ shared.__uiRootCleanup = function()
 		player.Character
 
 	if cleanupCharacter then
-		pcall(state.heavyGlideStop, cleanupCharacter)
+		pcall(state.heavyWalkStop, cleanupCharacter)
 		pcall(state.releaseMovementNow, cleanupCharacter, true)
 		pcall(state.questSlotsNormalizeControl, cleanupCharacter)
 	end
