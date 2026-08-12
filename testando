@@ -805,111 +805,111 @@ function state.safeMovementAnimalKey(character)
 end
 
 function state.movementBodySize(character)
-\tif not character then
-\t\treturn Vector3.new(4, 4, 4)
-\tend
+	if not character then
+		return Vector3.new(4, 4, 4)
+	end
 
-\tlocal ok, size = pcall(character.GetExtentsSize, character)
-\tif ok and typeof(size) == "Vector3" then
-\t\treturn size
-\tend
-\treturn Vector3.new(4, 4, 4)
+	local ok, size = pcall(character.GetExtentsSize, character)
+	if ok and typeof(size) == "Vector3" then
+		return size
+	end
+	return Vector3.new(4, 4, 4)
 end
 
 function state.movementFootprint(character)
-\tlocal size = state.movementBodySize(character)
-\treturn math.max(size.X, size.Z)
+	local size = state.movementBodySize(character)
+	return math.max(size.X, size.Z)
 end
 
 function state.isHeavyGroundMover(character)
-\tif not character or state.isFlyingMovementCharacter(character) then
-\t\treturn false
-\tend
+	if not character or state.isFlyingMovementCharacter(character) then
+		return false
+	end
 
-\tlocal key = state.safeMovementAnimalKey(character)
-\tlocal namedHeavy =
-\t\tkey == "elephant"
-\t\tor key == "giraffe"
-\t\tor key == "hippo"
-\t\tor key == "lion"
-\t\tor key == "tiger"
-\t\tor key == "buffalo"
-\t\tor key == "wildebeest"
-\t\tor key:find("rhino", 1, true) ~= nil
-\t\tor key:find("croc", 1, true) ~= nil
+	local key = state.safeMovementAnimalKey(character)
+	local namedHeavy =
+		key == "elephant"
+		or key == "giraffe"
+		or key == "hippo"
+		or key == "lion"
+		or key == "tiger"
+		or key == "buffalo"
+		or key == "wildebeest"
+		or key:find("rhino", 1, true) ~= nil
+		or key:find("croc", 1, true) ~= nil
 
-\tif namedHeavy then return true end
-\tlocal size = state.movementBodySize(character)
-\treturn math.max(size.X, size.Z) >= 7.25 or size.Y >= 7.75
+	if namedHeavy then return true end
+	local size = state.movementBodySize(character)
+	return math.max(size.X, size.Z) >= 7.25 or size.Y >= 7.75
 end
 
 function state.movementProbeHeight(character)
-\tif not state.isHeavyGroundMover(character) then return 2.5 end
-\tlocal size = state.movementBodySize(character)
-\treturn math.clamp(size.Y * 0.42, 3.8, 8.5)
+	if not state.isHeavyGroundMover(character) then return 2.5 end
+	local size = state.movementBodySize(character)
+	return math.clamp(size.Y * 0.42, 3.8, 8.5)
 end
 
 function state.movementRootClearance(character)
-\tif not character then return 3 end
-\tlocal root = character:FindFirstChild("HumanoidRootPart")
-\tif not root then return 3 end
-\tlocal lowest = math.huge
-\tfor _, object in ipairs(character:GetDescendants()) do
-\t\tif object:IsA("BasePart") then
-\t\t\tlowest = math.min(lowest, object.Position.Y - object.Size.Y * 0.5)
-\t\tend
-\tend
-\tif lowest == math.huge then return 3 end
-\treturn math.clamp(root.Position.Y - lowest, 2.2, 10)
+	if not character then return 3 end
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return 3 end
+	local lowest = math.huge
+	for _, object in ipairs(character:GetDescendants()) do
+		if object:IsA("BasePart") then
+			lowest = math.min(lowest, object.Position.Y - object.Size.Y * 0.5)
+		end
+	end
+	if lowest == math.huge then return 3 end
+	return math.clamp(root.Position.Y - lowest, 2.2, 10)
 end
 
 function state.aquaticWaterStandOffset(character)
-\tlocal clearance = state.movementRootClearance(character)
-\tlocal key = state.safeMovementAnimalKey(character)
-\tif key == "hippo" then
-\t\treturn math.clamp(clearance + 0.35, 2.8, 7.5)
-\tend
-\treturn math.clamp(clearance + 0.20, 2.5, 8)
+	local clearance = state.movementRootClearance(character)
+	local key = state.safeMovementAnimalKey(character)
+	if key == "hippo" then
+		return math.clamp(clearance + 0.35, 2.8, 7.5)
+	end
+	return math.clamp(clearance + 0.20, 2.5, 8)
 end
 
 function state.releaseMovementNow(character, zeroHorizontal)
-\tpcall(function()
-\t\tlocal env = (getgenv and getgenv()) or _G
-\t\tlocal release = env and env.keyrelease
-\t\tif type(release) == "function" then release(0x57) end
-\tend)
-\tpcall(function()
-\t\tgame:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.W, false, game)
-\tend)
-\tstate.questLandKeyDown = false
-\tstate.questLandLastPulseAt = 0
-\tstate.questLandLastRefreshAt = 0
-\tstate.questLandRefreshingW = false
-\tcharacter = character or player.Character
-\tif not character then return end
-\tlocal humanoid = character:FindFirstChildOfClass("Humanoid")
-\tlocal root = character:FindFirstChild("HumanoidRootPart")
-\tif humanoid then
-\t\tpcall(humanoid.Move, humanoid, Vector3.zero, false)
-\t\tpcall(function()
-\t\t\thumanoid.PlatformStand = false
-\t\t\thumanoid.AutoRotate = true
-\t\tend)
-\tend
-\tif root and zeroHorizontal ~= false then
-\t\tlocal velocity = root.AssemblyLinearVelocity
-\t\troot.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
-\t\troot.AssemblyAngularVelocity = Vector3.zero
-\tend
+	pcall(function()
+		local env = (getgenv and getgenv()) or _G
+		local release = env and env.keyrelease
+		if type(release) == "function" then release(0x57) end
+	end)
+	pcall(function()
+		game:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.W, false, game)
+	end)
+	state.questLandKeyDown = false
+	state.questLandLastPulseAt = 0
+	state.questLandLastRefreshAt = 0
+	state.questLandRefreshingW = false
+	character = character or player.Character
+	if not character then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if humanoid then
+		pcall(humanoid.Move, humanoid, Vector3.zero, false)
+		pcall(function()
+			humanoid.PlatformStand = false
+			humanoid.AutoRotate = true
+		end)
+	end
+	if root and zeroHorizontal ~= false then
+		local velocity = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
 end
 
 function state.applySurvivalDefaults(forceEnable)
-\tif forceEnable then
-\t\tstate.autoEatManualDisabled = false
-\t\tstate.autoDrinkManualDisabled = false
-\tend
-\tif not state.autoEatManualDisabled then state.autoEat = true end
-\tif not state.autoDrinkManualDisabled then state.autoDrink = true end
+	if forceEnable then
+		state.autoEatManualDisabled = false
+		state.autoDrinkManualDisabled = false
+	end
+	if not state.autoEatManualDisabled then state.autoEat = true end
+	if not state.autoDrinkManualDisabled then state.autoDrink = true end
 end
 
 function state.isFlyingMovementCharacter(character)
@@ -7434,99 +7434,99 @@ function state.findNearestDryWaterExit(root)
 end
 
 function state.findAquaticDryTerrainExit(character, root)
-\tif not character or not root then return nil end
-\tlocal origin = root.Position
-\tlocal bodyRadius = math.clamp(state.movementFootprint(character) * 0.38, 4, 9)
-\tlocal waterPart = workspace:FindFirstChild("MainWaterPart")
-\tlocal waterY = waterPart and waterPart:IsA("BasePart")
-\t\tand (waterPart.Position.Y + waterPart.Size.Y * 0.5) or origin.Y
-\tlocal best, bestScore = nil, math.huge
-\tlocal angleOffset = (player.UserId % 360) * math.pi / 180
+	if not character or not root then return nil end
+	local origin = root.Position
+	local bodyRadius = math.clamp(state.movementFootprint(character) * 0.38, 4, 9)
+	local waterPart = workspace:FindFirstChild("MainWaterPart")
+	local waterY = waterPart and waterPart:IsA("BasePart")
+		and (waterPart.Position.Y + waterPart.Size.Y * 0.5) or origin.Y
+	local best, bestScore = nil, math.huge
+	local angleOffset = (player.UserId % 360) * math.pi / 180
 
-\tfor _, radius in ipairs({18,26,36,48,64,84,108,138}) do
-\t\tlocal samples = radius <= 48 and 20 or 24
-\t\tfor index = 0, samples - 1 do
-\t\t\tlocal angle = angleOffset + index / samples * math.pi * 2
-\t\t\tlocal x = origin.X + math.cos(angle) * radius
-\t\t\tlocal z = origin.Z + math.sin(angle) * radius
-\t\t\tlocal hit = workspace:Raycast(
-\t\t\t\tVector3.new(x, math.max(origin.Y, waterY) + 180, z),
-\t\t\t\tVector3.new(0, -420, 0),
-\t\t\t\tterrainParams
-\t\t\t)
-\t\t\tif hit and hit.Material ~= Enum.Material.Water
-\t\t\t\tand hit.Normal.Y >= 0.52 and hit.Position.Y >= waterY - 1.5 then
-\t\t\t\tlocal clearPatch = true
-\t\t\t\tfor _, offset in ipairs({
-\t\t\t\t\tVector3.new(bodyRadius,0,0), Vector3.new(-bodyRadius,0,0),
-\t\t\t\t\tVector3.new(0,0,bodyRadius), Vector3.new(0,0,-bodyRadius),
-\t\t\t\t}) do
-\t\t\t\t\tlocal neighbor = workspace:Raycast(
-\t\t\t\t\t\tVector3.new(x + offset.X, hit.Position.Y + 80, z + offset.Z),
-\t\t\t\t\t\tVector3.new(0, -180, 0), terrainParams)
-\t\t\t\t\tif not neighbor or neighbor.Material == Enum.Material.Water
-\t\t\t\t\t\tor neighbor.Normal.Y < 0.42
-\t\t\t\t\t\tor math.abs(neighbor.Position.Y - hit.Position.Y) > 9 then
-\t\t\t\t\t\tclearPatch = false
-\t\t\t\t\t\tbreak
-\t\t\t\t\tend
-\t\t\t\tend
-\t\t\t\tif clearPatch then
-\t\t\t\t\tlocal candidate = hit.Position + Vector3.new(0, math.max(2.5, state.movementRootClearance(character) * 0.35), 0)
-\t\t\t\t\tif not isPositionInWaterTerrain(candidate, bodyRadius * 0.65, 5) then
-\t\t\t\t\t\tlocal score = radius + math.abs(hit.Position.Y - origin.Y) * 0.25
-\t\t\t\t\t\tif score < bestScore then bestScore, best = score, candidate end
-\t\t\t\t\tend
-\t\t\t\tend
-\t\t\tend
-\t\tend
-\t\tif best and radius >= 48 then break end
-\tend
-\treturn best
+	for _, radius in ipairs({18,26,36,48,64,84,108,138}) do
+		local samples = radius <= 48 and 20 or 24
+		for index = 0, samples - 1 do
+			local angle = angleOffset + index / samples * math.pi * 2
+			local x = origin.X + math.cos(angle) * radius
+			local z = origin.Z + math.sin(angle) * radius
+			local hit = workspace:Raycast(
+				Vector3.new(x, math.max(origin.Y, waterY) + 180, z),
+				Vector3.new(0, -420, 0),
+				terrainParams
+			)
+			if hit and hit.Material ~= Enum.Material.Water
+				and hit.Normal.Y >= 0.52 and hit.Position.Y >= waterY - 1.5 then
+				local clearPatch = true
+				for _, offset in ipairs({
+					Vector3.new(bodyRadius,0,0), Vector3.new(-bodyRadius,0,0),
+					Vector3.new(0,0,bodyRadius), Vector3.new(0,0,-bodyRadius),
+				}) do
+					local neighbor = workspace:Raycast(
+						Vector3.new(x + offset.X, hit.Position.Y + 80, z + offset.Z),
+						Vector3.new(0, -180, 0), terrainParams)
+					if not neighbor or neighbor.Material == Enum.Material.Water
+						or neighbor.Normal.Y < 0.42
+						or math.abs(neighbor.Position.Y - hit.Position.Y) > 9 then
+						clearPatch = false
+						break
+					end
+				end
+				if clearPatch then
+					local candidate = hit.Position + Vector3.new(0, math.max(2.5, state.movementRootClearance(character) * 0.35), 0)
+					if not isPositionInWaterTerrain(candidate, bodyRadius * 0.65, 5) then
+						local score = radius + math.abs(hit.Position.Y - origin.Y) * 0.25
+						if score < bestScore then bestScore, best = score, candidate end
+					end
+				end
+			end
+		end
+		if best and radius >= 48 then break end
+	end
+	return best
 end
 
 function state.moveAquaticToDryTerrain(character, root)
-\tif not character or not root then return false end
-\tsetAquaticWaterCollision(character, true)
-\tstate.releaseMovementNow(character, true)
-\tlocal target = state.findAquaticDryTerrainExit(character, root)
-\tif not target then return false end
+	if not character or not root then return false end
+	setAquaticWaterCollision(character, true)
+	state.releaseMovementNow(character, true)
+	local target = state.findAquaticDryTerrainExit(character, root)
+	if not target then return false end
 
-\tlocal waterPart = workspace:FindFirstChild("MainWaterPart")
-\tlocal waterY = waterPart and waterPart:IsA("BasePart")
-\t\tand (waterPart.Position.Y + waterPart.Size.Y * 0.5) or nil
-\tlocal deeplySubmerged = waterY and root.Position.Y < waterY - 2.5
+	local waterPart = workspace:FindFirstChild("MainWaterPart")
+	local waterY = waterPart and waterPart:IsA("BasePart")
+		and (waterPart.Position.Y + waterPart.Size.Y * 0.5) or nil
+	local deeplySubmerged = waterY and root.Position.Y < waterY - 2.5
 
-\tif deeplySubmerged and waterPart and waterPart:IsA("BasePart") then
-\t\t-- Only recovery for an already-bugged animal below the collision plane.
-\t\twaterPart.CanCollide = false
-\tend
+	if deeplySubmerged and waterPart and waterPart:IsA("BasePart") then
+		-- Only recovery for an already-bugged animal below the collision plane.
+		waterPart.CanCollide = false
+	end
 
-\tlocal moved = safeMoveToPosition(target, 10, nil, {
-\t\tpurpose = "safety",
-\t\ttolerance = math.clamp(state.movementFootprint(character) * 0.65, 8, 15),
-\t\tvertical = deeplySubmerged == true,
-\t\tconstantSpeed = not deeplySubmerged,
-\t\tstopOnDryGround = true,
-\t\tmaxDuration = 260,
-\t\trouteCheckInterval = 0.10,
-\t\trouteCheck = function(liveCharacter, liveRoot)
-\t\t\tif waterPart and waterPart.Parent and waterY and liveRoot
-\t\t\t\tand liveRoot.Position.Y >= waterY - 0.5 then
-\t\t\t\twaterPart.CanCollide = true
-\t\t\tend
-\t\t\treturn false
-\t\tend,
-\t})
+	local moved = safeMoveToPosition(target, 10, nil, {
+		purpose = "safety",
+		tolerance = math.clamp(state.movementFootprint(character) * 0.65, 8, 15),
+		vertical = deeplySubmerged == true,
+		constantSpeed = not deeplySubmerged,
+		stopOnDryGround = true,
+		maxDuration = 260,
+		routeCheckInterval = 0.10,
+		routeCheck = function(liveCharacter, liveRoot)
+			if waterPart and waterPart.Parent and waterY and liveRoot
+				and liveRoot.Position.Y >= waterY - 0.5 then
+				waterPart.CanCollide = true
+			end
+			return false
+		end,
+	})
 
-\tcharacter, root = characterParts()
-\tif character then setAquaticWaterCollision(character, true) end
-\tif moved and character and root and state.normalizeDryLandState(character, root) then
-\t\tsetAquaticWaterCollision(character, false)
-\t\tstate.releaseMovementNow(character, true)
-\t\treturn true
-\tend
-\treturn false
+	character, root = characterParts()
+	if character then setAquaticWaterCollision(character, true) end
+	if moved and character and root and state.normalizeDryLandState(character, root) then
+		setAquaticWaterCollision(character, false)
+		state.releaseMovementNow(character, true)
+		return true
+	end
+	return false
 end
 
 local function isNearSavedSwimLocation(root, radius)
