@@ -29,12 +29,16 @@ local isDinoLife = game.PlaceId == 75541741887441
 local DINO_DRINK_POSITION = Vector3.new(-552.27, 41.46, -520.35)
 local state = {
 	autoEat =
-		resumeState.autoQuests == true
-			or resumeState.autoEat == true,
+		resumeState.autoEat == true,
 
 	autoDrink =
-		resumeState.autoQuests == true
-			or resumeState.autoDrink == true,
+		resumeState.autoDrink == true,
+
+	autoEatManualDisabled =
+		resumeState.autoEatManualDisabled == true,
+
+	autoDrinkManualDisabled =
+		resumeState.autoDrinkManualDisabled == true,
 
 	-- v103 Auto Drink mode:
 	-- "surface" = puddles/rivers (safer default)
@@ -800,6 +804,114 @@ function state.safeMovementAnimalKey(character)
 	return animal:lower():gsub("[^%w]", "")
 end
 
+function state.movementBodySize(character)
+\tif not character then
+\t\treturn Vector3.new(4, 4, 4)
+\tend
+
+\tlocal ok, size = pcall(character.GetExtentsSize, character)
+\tif ok and typeof(size) == "Vector3" then
+\t\treturn size
+\tend
+\treturn Vector3.new(4, 4, 4)
+end
+
+function state.movementFootprint(character)
+\tlocal size = state.movementBodySize(character)
+\treturn math.max(size.X, size.Z)
+end
+
+function state.isHeavyGroundMover(character)
+\tif not character or state.isFlyingMovementCharacter(character) then
+\t\treturn false
+\tend
+
+\tlocal key = state.safeMovementAnimalKey(character)
+\tlocal namedHeavy =
+\t\tkey == "elephant"
+\t\tor key == "giraffe"
+\t\tor key == "hippo"
+\t\tor key == "lion"
+\t\tor key == "tiger"
+\t\tor key == "buffalo"
+\t\tor key == "wildebeest"
+\t\tor key:find("rhino", 1, true) ~= nil
+\t\tor key:find("croc", 1, true) ~= nil
+
+\tif namedHeavy then return true end
+\tlocal size = state.movementBodySize(character)
+\treturn math.max(size.X, size.Z) >= 7.25 or size.Y >= 7.75
+end
+
+function state.movementProbeHeight(character)
+\tif not state.isHeavyGroundMover(character) then return 2.5 end
+\tlocal size = state.movementBodySize(character)
+\treturn math.clamp(size.Y * 0.42, 3.8, 8.5)
+end
+
+function state.movementRootClearance(character)
+\tif not character then return 3 end
+\tlocal root = character:FindFirstChild("HumanoidRootPart")
+\tif not root then return 3 end
+\tlocal lowest = math.huge
+\tfor _, object in ipairs(character:GetDescendants()) do
+\t\tif object:IsA("BasePart") then
+\t\t\tlowest = math.min(lowest, object.Position.Y - object.Size.Y * 0.5)
+\t\tend
+\tend
+\tif lowest == math.huge then return 3 end
+\treturn math.clamp(root.Position.Y - lowest, 2.2, 10)
+end
+
+function state.aquaticWaterStandOffset(character)
+\tlocal clearance = state.movementRootClearance(character)
+\tlocal key = state.safeMovementAnimalKey(character)
+\tif key == "hippo" then
+\t\treturn math.clamp(clearance + 0.35, 2.8, 7.5)
+\tend
+\treturn math.clamp(clearance + 0.20, 2.5, 8)
+end
+
+function state.releaseMovementNow(character, zeroHorizontal)
+\tpcall(function()
+\t\tlocal env = (getgenv and getgenv()) or _G
+\t\tlocal release = env and env.keyrelease
+\t\tif type(release) == "function" then release(0x57) end
+\tend)
+\tpcall(function()
+\t\tgame:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.W, false, game)
+\tend)
+\tstate.questLandKeyDown = false
+\tstate.questLandLastPulseAt = 0
+\tstate.questLandLastRefreshAt = 0
+\tstate.questLandRefreshingW = false
+\tcharacter = character or player.Character
+\tif not character then return end
+\tlocal humanoid = character:FindFirstChildOfClass("Humanoid")
+\tlocal root = character:FindFirstChild("HumanoidRootPart")
+\tif humanoid then
+\t\tpcall(humanoid.Move, humanoid, Vector3.zero, false)
+\t\tpcall(function()
+\t\t\thumanoid.PlatformStand = false
+\t\t\thumanoid.AutoRotate = true
+\t\tend)
+\tend
+\tif root and zeroHorizontal ~= false then
+\t\tlocal velocity = root.AssemblyLinearVelocity
+\t\troot.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+\t\troot.AssemblyAngularVelocity = Vector3.zero
+\tend
+end
+
+function state.applySurvivalDefaults(forceEnable)
+\tif forceEnable then
+\t\tstate.autoEatManualDisabled = false
+\t\tstate.autoDrinkManualDisabled = false
+\tend
+\tif not state.autoEatManualDisabled then state.autoEat = true end
+\tif not state.autoDrinkManualDisabled then state.autoDrink = true end
+end
+
 function state.isFlyingMovementCharacter(character)
 	local key =
 		state.safeMovementAnimalKey(character)
@@ -857,6 +969,26 @@ end
 
 function state.safeNudgeToward(root, targetPosition, speedScale)
 	if not root or typeof(targetPosition) ~= "Vector3" then return false end
+
+	local character = player.Character
+	if state.isHeavyGroundMover(character) then
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local flatNative = Vector3.new(
+			targetPosition.X - root.Position.X,
+			0,
+			targetPosition.Z - root.Position.Z
+		)
+		if flatNative.Magnitude <= 0.15 then return true end
+		if humanoid then
+			pcall(function()
+				humanoid.PlatformStand = false
+				humanoid.AutoRotate = true
+				humanoid:Move(flatNative.Unit, false)
+			end)
+			setSubState("Walking")
+			return true
+		end
+	end
 
 	local flat = Vector3.new(
 		targetPosition.X - root.Position.X,
@@ -1318,6 +1450,10 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 	state.safeMove.routeCheckError = nil
 	state.safeMove.routeInterruptReason = nil
 
+	state.safeMove.heavy = state.isHeavyGroundMover(character)
+	state.safeMove.probeHeight = state.movementProbeHeight(character)
+	state.safeMove.nativeW = false
+
 	state.safeMove.hill = {
 		sign = nil,
 		startedAt = 0,
@@ -1682,11 +1818,10 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				liveRoot.AssemblyAngularVelocity * 0.2
 		end
 
-		if state.questSetW then
-			pcall(state.questSetW, false)
-		end
+		state.releaseMovementNow(player.Character, true)
 
 		state.safeMove.landQuestW = false
+		state.safeMove.nativeW = false
 		state.safeMove.active = false
 		state.safeMove.target = nil
 		state.safeMove.reason = nil
@@ -1974,11 +2109,20 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 
 			state.safeMove.landQuestW = landQuestW == true
 
-			if state.questSetW then
-				if landQuestW then
-					state.questMotionMoving = true
-					state.questMotionMode = "Land"
+			local heavyNativeW =
+				state.safeMove.heavy
+					and not verticalMovement
+					and not calmRiverApproach
+					and flatDistance > math.max(tolerance * 1.35, 7)
 
+			state.safeMove.nativeW = heavyNativeW == true
+
+			if state.questSetW then
+				if landQuestW or heavyNativeW then
+					if landQuestW then
+						state.questMotionMoving = true
+						state.questMotionMode = "Land"
+					end
 					if tick() - lastMoveWReassertAt >= 3.5 then
 						lastMoveWReassertAt = tick()
 						state.questSetW(true, true)
@@ -2211,14 +2355,10 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					stallCount += 1
 					obstacleSign *= -1
 
-					if tick() - lastJumpAt >= 0.9 then
+					if not state.safeMove.heavy
+						and tick() - lastJumpAt >= 0.9 then
 						lastJumpAt = tick()
-						state.virtualJump(
-							character,
-							humanoid,
-							"safe_move_stall",
-							0.85
-						)
+						state.virtualJump(character, humanoid, "safe_move_stall", 0.85)
 					end
 
 					if stallCount >= stallBudget then
@@ -2503,7 +2643,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					math.clamp(maximumSpeed * 0.20, 7, 22)
 
 				local obstacle = workspace:Raycast(
-					root.Position + Vector3.new(0, 2.5, 0),
+					root.Position + Vector3.new(0, state.safeMove.probeHeight or 2.5, 0),
 					desired * probeDistance,
 					params
 				)
@@ -2567,7 +2707,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 								)
 								or 0
 
-						if rise > 1 and rise < 28 then
+						if rise > 1 and rise < 28 and not state.safeMove.heavy then
 							local assistScale =
 								purpose == "food"
 									and 0.55
@@ -2595,7 +2735,8 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 								)
 						end
 
-						if tick() - blockingSince >= 0.45
+						if not state.safeMove.heavy
+							and tick() - blockingSince >= 0.45
 							and tick() - lastJumpAt >= 0.9 then
 
 							lastJumpAt = tick()
@@ -2628,7 +2769,8 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 									+ desired.Z * c
 							).Unit
 
-						if not calmRiverApproach
+						if not state.safeMove.heavy
+							and not calmRiverApproach
 							and tick() >= hillAvoidUntil
 							and (
 								tick() - blockingSince
@@ -2692,22 +2834,20 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					Vector3.zero
 			end
 
-			-- Orientation only: the root position is not changed.
-			pcall(function()
-				local face = Vector3.new(
-					desired.X,
-					0,
-					desired.Z
-				)
-
-				if face.Magnitude > 0.1 then
-					root.CFrame = CFrame.lookAt(
-						root.Position,
-						root.Position + face.Unit,
-						Vector3.yAxis
-					)
-				end
-			end)
+			if state.safeMove.heavy and not verticalMovement then
+				pcall(function()
+					humanoid.PlatformStand = false
+					humanoid.AutoRotate = true
+				end)
+			else
+				-- Orientation only: the root position is not changed.
+				pcall(function()
+					local face = Vector3.new(desired.X, 0, desired.Z)
+					if face.Magnitude > 0.1 then
+						root.CFrame = CFrame.lookAt(root.Position, root.Position + face.Unit, Vector3.yAxis)
+					end
+				end)
+			end
 
 			if not rawVerticalTransit then
 				pcall(
@@ -2733,6 +2873,8 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				setSubState("Swimming")
 			elseif flying then
 				setSubState("Flying")
+			elseif state.safeMove.heavy and flatDistance <= math.max(tolerance * 3, 24) then
+				setSubState("Walking")
 			else
 				setSubState("Running")
 			end
@@ -2754,22 +2896,20 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			if verticalMovement then
 				root.AssemblyLinearVelocity = Vector3.new(
 					desired.X * speed,
-					math.clamp(
-						desired.Y * speed,
-						-maximumSpeed,
-						maximumSpeed
-					),
+					math.clamp(desired.Y * speed, -maximumSpeed, maximumSpeed),
 					desired.Z * speed
 				)
+			elseif state.safeMove.heavy then
+				-- Native locomotion: do not push large colliders through Terrain every frame.
+				local planar = Vector3.new(velocity.X, 0, velocity.Z)
+				if planar.Magnitude > maximumSpeed * 1.20 then
+					local capped = planar.Unit * maximumSpeed
+					root.AssemblyLinearVelocity = Vector3.new(capped.X, velocity.Y, capped.Z)
+				end
 			else
 				root.AssemblyLinearVelocity = Vector3.new(
 					desired.X * speed,
-					terrainClimbAssist > 0
-						and math.max(
-							velocity.Y,
-							terrainClimbAssist
-						)
-						or velocity.Y,
+					terrainClimbAssist > 0 and math.max(velocity.Y, terrainClimbAssist) or velocity.Y,
 					desired.Z * speed
 				)
 			end
@@ -3232,7 +3372,8 @@ end
 function state.drinkFindMainWaterBank(
 	waterPosition,
 	origin,
-	waterPart
+	waterPart,
+	character
 )
 	if typeof(waterPosition) ~= "Vector3"
 		or typeof(origin) ~= "Vector3"
@@ -3373,11 +3514,12 @@ function state.drinkFindMainWaterBank(
 	end
 
 	-- One precomputed bank point. No movement refinement after arrival.
-	local standDistance =
-		math.max(
-			0,
-			low - 0.80
-		)
+	local bankBackoff =
+		CROC.isCharacter(character)
+			and math.clamp(state.movementFootprint(character) * 0.20, 1.8, 3.4)
+			or 0.80
+
+	local standDistance = math.max(0, low - bankBackoff)
 
 	local standXZ =
 		origin
@@ -3449,7 +3591,7 @@ function state.drinkFindAccessibleSpot(origin, character)
 		if isAquatic and not isCroc then
 			return {
 				water = waterPoint,
-				stand = waterPoint + Vector3.new(0, surfaceStandOffset(character), 0),
+				stand = waterPoint + Vector3.new(0, state.aquaticWaterStandOffset(character), 0),
 				source = source,
 			}
 		end
@@ -3465,7 +3607,8 @@ function state.drinkFindAccessibleSpot(origin, character)
 				state.drinkFindMainWaterBank(
 					waterPoint,
 					origin,
-					waterPart
+					waterPart,
+					character
 				)
 		else
 			-- Puddles/Terrain Water keep the v92 behavior unchanged.
@@ -3798,15 +3941,13 @@ local function findDistantGrass(origin)
 end
 
 local function moveToGrass(grassPosition, speedOverride)
+	local character = player.Character
+	local heavy = state.isHeavyGroundMover(character)
 	local options = {
 		purpose = "food",
-
-		-- Keep the v66 close arrival tolerance, but do NOT decelerate on the
-		-- final approach. Grass movement now uses the animal's full Acceleration
-		-- speed until it is actually within eating range.
-		tolerance = 2.75,
+		tolerance = heavy and math.clamp(state.movementFootprint(character) * 0.42, 4.5, 8) or 2.75,
 		speedScale = 1,
-		constantSpeed = true,
+		constantSpeed = not heavy,
 		maxDuration = 220,
 	}
 
@@ -6870,6 +7011,14 @@ local function autoEatStep()
 		return
 	end
 
+	if availableFood == "Eat" then
+		eatingSourcePosition = root.Position
+		eatingTargetReachedAt = tick()
+		runtimeMessage = "Comendo a grama proxima"
+		startGrassEatingIfAvailable(character, root, eatingSourcePosition)
+		return
+	end
+
 	if food <= 55 and tick() >= nextEmergencyGrassCheck then
 		nextEmergencyGrassCheck = tick() + 120
 		local distantGrass = findDistantGrass(root.Position)
@@ -6902,18 +7051,6 @@ local function autoEatStep()
 		end
 	end
 
-	if availableFood == "Eat" then
-		eatingSourcePosition = root.Position
-		eatingTargetReachedAt = tick()
-		runtimeMessage = "Comendo a grama proxima"
-		startGrassEatingIfAvailable(
-			character,
-			root,
-			eatingSourcePosition
-		)
-		return
-	end
-
 	-- v66: a cached grass point is valid only while the Eat prompt really
 	-- exists. v65 blindly called Eating for 5 seconds even with no prompt,
 	-- producing the alternating "Trying current grass / Moving nearby grass".
@@ -6938,11 +7075,9 @@ local function autoEatStep()
 
 			-- Give the game a very short prompt-appearance grace while nudging
 			-- physically closer. Do not wait the old 5 seconds.
-			state.safeNudgeToward(
-				root,
-				eatingSourcePosition,
-				1
-			)
+			if not state.isHeavyGroundMover(character) then
+				state.safeNudgeToward(root, eatingSourcePosition, 1)
+			end
 			faceGrassPoint(root, eatingSourcePosition)
 			runtimeMessage =
 				"Ajustando posicao na grama proxima"
@@ -7000,7 +7135,9 @@ local function autoEatStep()
 
 	-- Prompt can appear a few frames after movement stops. Keep a very short
 	-- physical settle window; autoEatStep will retry this target on the next tick.
-	state.safeNudgeToward(root, grass, 1)
+	if not state.isHeavyGroundMover(character) then
+		state.safeNudgeToward(root, grass, 1)
+	end
 	faceGrassPoint(root, grass)
 	runtimeMessage =
 		"Chegou na grama; ajustando para aparecer Eat"
@@ -7294,6 +7431,102 @@ function state.findNearestDryWaterExit(root)
 	end
 
 	return best
+end
+
+function state.findAquaticDryTerrainExit(character, root)
+\tif not character or not root then return nil end
+\tlocal origin = root.Position
+\tlocal bodyRadius = math.clamp(state.movementFootprint(character) * 0.38, 4, 9)
+\tlocal waterPart = workspace:FindFirstChild("MainWaterPart")
+\tlocal waterY = waterPart and waterPart:IsA("BasePart")
+\t\tand (waterPart.Position.Y + waterPart.Size.Y * 0.5) or origin.Y
+\tlocal best, bestScore = nil, math.huge
+\tlocal angleOffset = (player.UserId % 360) * math.pi / 180
+
+\tfor _, radius in ipairs({18,26,36,48,64,84,108,138}) do
+\t\tlocal samples = radius <= 48 and 20 or 24
+\t\tfor index = 0, samples - 1 do
+\t\t\tlocal angle = angleOffset + index / samples * math.pi * 2
+\t\t\tlocal x = origin.X + math.cos(angle) * radius
+\t\t\tlocal z = origin.Z + math.sin(angle) * radius
+\t\t\tlocal hit = workspace:Raycast(
+\t\t\t\tVector3.new(x, math.max(origin.Y, waterY) + 180, z),
+\t\t\t\tVector3.new(0, -420, 0),
+\t\t\t\tterrainParams
+\t\t\t)
+\t\t\tif hit and hit.Material ~= Enum.Material.Water
+\t\t\t\tand hit.Normal.Y >= 0.52 and hit.Position.Y >= waterY - 1.5 then
+\t\t\t\tlocal clearPatch = true
+\t\t\t\tfor _, offset in ipairs({
+\t\t\t\t\tVector3.new(bodyRadius,0,0), Vector3.new(-bodyRadius,0,0),
+\t\t\t\t\tVector3.new(0,0,bodyRadius), Vector3.new(0,0,-bodyRadius),
+\t\t\t\t}) do
+\t\t\t\t\tlocal neighbor = workspace:Raycast(
+\t\t\t\t\t\tVector3.new(x + offset.X, hit.Position.Y + 80, z + offset.Z),
+\t\t\t\t\t\tVector3.new(0, -180, 0), terrainParams)
+\t\t\t\t\tif not neighbor or neighbor.Material == Enum.Material.Water
+\t\t\t\t\t\tor neighbor.Normal.Y < 0.42
+\t\t\t\t\t\tor math.abs(neighbor.Position.Y - hit.Position.Y) > 9 then
+\t\t\t\t\t\tclearPatch = false
+\t\t\t\t\t\tbreak
+\t\t\t\t\tend
+\t\t\t\tend
+\t\t\t\tif clearPatch then
+\t\t\t\t\tlocal candidate = hit.Position + Vector3.new(0, math.max(2.5, state.movementRootClearance(character) * 0.35), 0)
+\t\t\t\t\tif not isPositionInWaterTerrain(candidate, bodyRadius * 0.65, 5) then
+\t\t\t\t\t\tlocal score = radius + math.abs(hit.Position.Y - origin.Y) * 0.25
+\t\t\t\t\t\tif score < bestScore then bestScore, best = score, candidate end
+\t\t\t\t\tend
+\t\t\t\tend
+\t\t\tend
+\t\tend
+\t\tif best and radius >= 48 then break end
+\tend
+\treturn best
+end
+
+function state.moveAquaticToDryTerrain(character, root)
+\tif not character or not root then return false end
+\tsetAquaticWaterCollision(character, true)
+\tstate.releaseMovementNow(character, true)
+\tlocal target = state.findAquaticDryTerrainExit(character, root)
+\tif not target then return false end
+
+\tlocal waterPart = workspace:FindFirstChild("MainWaterPart")
+\tlocal waterY = waterPart and waterPart:IsA("BasePart")
+\t\tand (waterPart.Position.Y + waterPart.Size.Y * 0.5) or nil
+\tlocal deeplySubmerged = waterY and root.Position.Y < waterY - 2.5
+
+\tif deeplySubmerged and waterPart and waterPart:IsA("BasePart") then
+\t\t-- Only recovery for an already-bugged animal below the collision plane.
+\t\twaterPart.CanCollide = false
+\tend
+
+\tlocal moved = safeMoveToPosition(target, 10, nil, {
+\t\tpurpose = "safety",
+\t\ttolerance = math.clamp(state.movementFootprint(character) * 0.65, 8, 15),
+\t\tvertical = deeplySubmerged == true,
+\t\tconstantSpeed = not deeplySubmerged,
+\t\tstopOnDryGround = true,
+\t\tmaxDuration = 260,
+\t\trouteCheckInterval = 0.10,
+\t\trouteCheck = function(liveCharacter, liveRoot)
+\t\t\tif waterPart and waterPart.Parent and waterY and liveRoot
+\t\t\t\tand liveRoot.Position.Y >= waterY - 0.5 then
+\t\t\t\twaterPart.CanCollide = true
+\t\t\tend
+\t\t\treturn false
+\t\tend,
+\t})
+
+\tcharacter, root = characterParts()
+\tif character then setAquaticWaterCollision(character, true) end
+\tif moved and character and root and state.normalizeDryLandState(character, root) then
+\t\tsetAquaticWaterCollision(character, false)
+\t\tstate.releaseMovementNow(character, true)
+\t\treturn true
+\tend
+\treturn false
 end
 
 local function isNearSavedSwimLocation(root, radius)
@@ -8328,7 +8561,32 @@ function DAMAGE.moveToSafety()
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = false
+		waterPart.CanCollide = isAquaticCharacter(character)
+	end
+
+	if isAquaticCharacter(
+		character
+	) and state.moveAquaticToDryTerrain then
+
+		local aquaticEscaped =
+			state.moveAquaticToDryTerrain(
+				character,
+				root
+			)
+
+		if aquaticEscaped then
+			setAquaticWaterCollision(
+				character,
+				false
+			)
+
+			state.releaseMovementNow(
+				character,
+				true
+			)
+
+			return true, nil
+		end
 	end
 
 	local candidates = DAMAGE.getNearestSafeSpawns(root)
@@ -8348,7 +8606,26 @@ function DAMAGE.moveToSafety()
 		task.wait(0.25)
 
 		local _, newRoot = characterParts()
-		if ok and newRoot and not isStandingInWater(newRoot) then
+		if ok
+			and newRoot
+			and not isStandingInWater(
+				newRoot
+			) then
+
+			if isAquaticCharacter(
+				character
+			) then
+				setAquaticWaterCollision(
+					character,
+					false
+				)
+			end
+
+			state.releaseMovementNow(
+				character,
+				true
+			)
+
 			return true, spawnPart
 		end
 	end
@@ -8369,7 +8646,26 @@ function DAMAGE.moveToSafety()
 		task.wait(0.25)
 
 		local _, newRoot = characterParts()
-		if ok and newRoot and not isStandingInWater(newRoot) then
+		if ok
+			and newRoot
+			and not isStandingInWater(
+				newRoot
+			) then
+
+			if isAquaticCharacter(
+				character
+			) then
+				setAquaticWaterCollision(
+					character,
+					false
+				)
+			end
+
+			state.releaseMovementNow(
+				character,
+				true
+			)
+
 			return true, nil
 		end
 	end
@@ -8527,8 +8823,9 @@ function DAMAGE.recover(character, humanoid, healthBefore, healthAfter, reason, 
 		or state.growExisting
 		or state.growAllSlots
 		or state.growNew then
-		state.autoEat = true
-		state.autoDrink = true
+		state.applySurvivalDefaults(
+			false
+		)
 	end
 
 	if renders then
@@ -8740,6 +9037,17 @@ table.insert(connections, player.CharacterAdded:Connect(function(character)
 	DAMAGE.cooldownUntil = tick() + 1.5
 	DAMAGE.active = false
 	task.defer(DAMAGE.bind, character)
+	task.defer(function()
+		task.wait(0.35)
+		if character ~= player.Character then return end
+		state.releaseMovementNow(character, true)
+		if CROC.isCharacter(character) then
+			state.autoDrinkMode = "surface"
+			state.autoDrinkPreferredMode = "surface"
+			state.drinkClearUndergroundMode()
+		end
+		if state.renderAutoDrinkModeButtons then pcall(state.renderAutoDrinkModeButtons) end
+	end)
 end))
 
 local function forcePostDrinkMove(wasUnderground)
@@ -8753,15 +9061,23 @@ local function forcePostDrinkMove(wasUnderground)
 	state.questLandInputActive = false
 	state.questMotionMoving = false
 	state.questMotionMode = nil
-	if state.questSetW then state.questSetW(false) end
+	if state.questSetW then
+		state.questSetW(false)
+	end
+
+	state.releaseMovementNow(
+		player.Character,
+		true
+	)
 
 	runtimeMessage = wasUnderground
 		and "Agua cheia; SAINDO de baixo do Terrain antes de liberar Auto Run"
 		or "Agua cheia; saindo da agua antes de liberar quests"
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
+	local aquaticExit = isAquaticCharacter(player.Character)
 	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = false
+		waterPart.CanCollide = aquaticExit == true
 	end
 
 	local function confirmedOutside()
@@ -8787,6 +9103,25 @@ local function forcePostDrinkMove(wasUnderground)
 		state.drinkClearUndergroundMode()
 		resetEatingSearch(nil)
 		drinkingSourcePosition = nil
+
+		local dryCharacter =
+			player.Character
+
+		if dryCharacter
+			and isAquaticCharacter(
+				dryCharacter
+			) then
+
+			setAquaticWaterCollision(
+				dryCharacter,
+				false
+			)
+		end
+
+		state.releaseMovementNow(
+			dryCharacter,
+			true
+		)
 
 		criticalRecoveryActive = false
 		forcingPostDrinkMove = false
@@ -8826,7 +9161,13 @@ local function forcePostDrinkMove(wasUnderground)
 			end
 		end
 	else
-		refreshCompletionSpawns()
+		local aquaticCharacter, aquaticRoot = characterParts()
+		if aquaticCharacter and aquaticRoot and isAquaticCharacter(aquaticCharacter) then
+			runtimeMessage = "Aquatic exit: finding verified dry Terrain"
+			escaped = state.moveAquaticToDryTerrain(aquaticCharacter, aquaticRoot)
+		end
+
+		if not escaped then refreshCompletionSpawns() end
 
 		local candidates = {}
 		local _, root = characterParts()
@@ -8871,6 +9212,7 @@ local function forcePostDrinkMove(wasUnderground)
 		table.insert(candidates, config.farm)
 
 		for _, position in ipairs(candidates) do
+			if escaped then break end
 			if ensureOnSolidGround(
 				position,
 				wasUnderground
@@ -8889,6 +9231,9 @@ local function forcePostDrinkMove(wasUnderground)
 	-- Final independent proof. Reaching a target is not enough.
 	if escaped and confirmedOutside() then
 		state.drinkClearUndergroundMode()
+		local dryCharacter = player.Character
+		if dryCharacter and isAquaticCharacter(dryCharacter) then setAquaticWaterCollision(dryCharacter, false) end
+		state.releaseMovementNow(dryCharacter, true)
 
 		criticalRecoveryActive = false
 		forcingPostDrinkMove = false
@@ -8903,6 +9248,9 @@ local function forcePostDrinkMove(wasUnderground)
 	-- One last strict dry-ground proof before escalating.
 	if confirmedOutside() then
 		state.drinkClearUndergroundMode()
+		local dryCharacter = player.Character
+		if dryCharacter and isAquaticCharacter(dryCharacter) then setAquaticWaterCollision(dryCharacter, false) end
+		state.releaseMovementNow(dryCharacter, true)
 		criticalRecoveryActive = false
 		forcingPostDrinkMove = false
 		state.questForceFastRecheckUntil =
@@ -8916,6 +9264,10 @@ local function forcePostDrinkMove(wasUnderground)
 	forcingPostDrinkMove = false
 
 	local liveCharacter, liveRoot = characterParts()
+	state.releaseMovementNow(liveCharacter, true)
+	if liveCharacter and isAquaticCharacter(liveCharacter) then
+		setAquaticWaterCollision(liveCharacter, true)
+	end
 
 	if liveCharacter and liveRoot then
 		state.drinkEmergencyEscape(
@@ -8950,10 +9302,13 @@ function state.noIdleWaterSafetyStep()
 		return
 	end
 
-	-- Aquatic species have their own water/collision handling. This watchdog is
-	-- specifically for land/flying animals that should never remain idle in a
-	-- puddle after drinking or after a route accidentally enters water.
-	if isAquaticCharacter(character) then
+	-- Hippo may remain aquatic; Crocodile must be driven back to verified
+	-- dry Terrain because its large body repeatedly sinks/sticks in water.
+	if isAquaticCharacter(character)
+		and not CROC.isCharacter(
+			character
+		) then
+
 		return
 	end
 
@@ -8995,7 +9350,9 @@ function state.noIdleWaterSafetyStep()
 	end
 
 	runtimeMessage =
-		"Water safety: animal is still inside water; moving to dry bank"
+		CROC.isCharacter(character)
+			and "Croc water safety: forcing verified dry Terrain exit"
+			or "Water safety: animal is still inside water; moving to dry bank"
 
 	task.spawn(
 		forcePostDrinkMove,
@@ -9317,14 +9674,9 @@ local function sustainDrinkAtCurrentPrompt()
 	local liveCharacter = player.Character
 
 	if liveCharacter
-		and isAquaticCharacter(
-			liveCharacter
-		) then
-
-		setAquaticWaterCollision(
-			liveCharacter,
-			false
-		)
+		and isAquaticCharacter(liveCharacter) then
+		-- Do not create a one-frame sink window between drinking and dry exit.
+		setAquaticWaterCollision(liveCharacter, true)
 	end
 
 	drinkPromptSustainBusy = false
@@ -9365,10 +9717,48 @@ function state.drinkEmergencyEscape(character, root, reason)
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = false
+		waterPart.CanCollide = isAquaticCharacter(character)
 	end
 
 	runtimeMessage = reason or "ANTI-AFOGAMENTO: escapando para cima do Terrain"
+
+	if isAquaticCharacter(
+		character
+	) and state.moveAquaticToDryTerrain then
+
+		local aquaticEscaped =
+			state.moveAquaticToDryTerrain(
+				character,
+				root
+			)
+
+		if aquaticEscaped then
+			setAquaticWaterCollision(
+				character,
+				false
+			)
+
+			state.releaseMovementNow(
+				character,
+				true
+			)
+
+			state.drinkClearUndergroundMode()
+			criticalRecoveryActive = false
+			state.questForceFastRecheckUntil =
+				tick() + 25
+
+			runtimeMessage =
+				"Aquatic safety: verified dry Terrain confirmed"
+
+			return true
+		end
+
+		setAquaticWaterCollision(
+			character,
+			true
+		)
+	end
 
 	local function confirmedAboveTerrain()
 		local _, liveRoot = characterParts()
@@ -9431,6 +9821,25 @@ function state.drinkEmergencyEscape(character, root, reason)
 
 			if confirmedAboveTerrain() then
 				state.drinkClearUndergroundMode()
+
+				local safeCharacter =
+					player.Character
+
+				if safeCharacter
+					and isAquaticCharacter(
+						safeCharacter
+					) then
+					setAquaticWaterCollision(
+						safeCharacter,
+						false
+					)
+				end
+
+				state.releaseMovementNow(
+					safeCharacter,
+					true
+				)
+
 				criticalRecoveryActive = false
 				state.questForceFastRecheckUntil = tick() + 25
 				runtimeMessage = "ANTI-AFOGAMENTO: ACIMA do Terrain confirmado"
@@ -9444,6 +9853,25 @@ function state.drinkEmergencyEscape(character, root, reason)
 
 			if confirmedAboveTerrain() then
 				state.drinkClearUndergroundMode()
+
+				local safeCharacter =
+					player.Character
+
+				if safeCharacter
+					and isAquaticCharacter(
+						safeCharacter
+					) then
+					setAquaticWaterCollision(
+						safeCharacter,
+						false
+					)
+				end
+
+				state.releaseMovementNow(
+					safeCharacter,
+					true
+				)
+
 				criticalRecoveryActive = false
 				state.questForceFastRecheckUntil = tick() + 25
 				runtimeMessage = "ANTI-AFOGAMENTO: spawn seguro confirmado"
@@ -10101,6 +10529,10 @@ function state.runUndergroundDrinkTest()
 					true
 				)
 
+				if isAquaticCharacter(character) then
+					setAquaticWaterCollision(character, true)
+				end
+
 				state.drinkTestSetPhase(
 					"drink",
 					"Underground Drink: underground position confirmed; testing Drink"
@@ -10516,11 +10948,28 @@ local function autoDrinkStep()
 			character:GetAttribute("Water")
 		) or 100
 
+	-- Hippo/Croc need solid MainWaterPart BEFORE the approach. Enabling it
+	-- after arrival is too late for their large body physics.
+	if isAquaticCharacter(character)
+		and (earlyWater <= 75 or drinkingToFull) then
+		setAquaticWaterCollision(character, true)
+	end
+
+	-- Crocodile can NEVER use Underground Drink. Its low body/physics make the
+	-- hidden-water transit unsafe; Surface Water is mandatory.
+	if state.autoDrinkMode == "underground"
+		and CROC.isCharacter(character) then
+		state.autoDrinkMode = "surface"
+		state.autoDrinkPreferredMode = "surface"
+		state.drinkClearUndergroundMode()
+		runtimeMessage = "Underground Drink is disabled for Crocodile; Surface Water forced"
+		if state.renderAutoDrinkModeButtons then pcall(state.renderAutoDrinkModeButtons) end
+	end
+
 	-- v103 permanent underground Auto Drink mode.
-	-- Trigger at the normal thirst threshold, or continue an already-latched
-	-- drink cycle after the player changes modes.
 	if state.autoDrinkMode == "underground"
 		and isSavannahLife
+		and not CROC.isCharacter(character)
 		and (
 			earlyWater <= 75
 			or (
@@ -10787,7 +11236,8 @@ local function autoDrinkStep()
 		removeSwimBarrier()
 
 		if isAquaticCharacter(character) then
-			setAquaticWaterCollision(character, false)
+			-- Keep solid water until dry Terrain is confirmed by the exit routine.
+			setAquaticWaterCollision(character, true)
 		end
 
 		if state.questSwimActive and not wasUnderground then
@@ -11063,6 +11513,7 @@ local function autoDrinkStep()
 			isSavannahLife
 				and water < 70
 				and state.autoDrinkMode == "surface"
+				and not CROC.isCharacter(character)
 
 		if emergencyUnderground then
 			state.drinkSearch.failedCount = 0
@@ -11220,11 +11671,10 @@ local function autoDrinkStep()
 			{
 				purpose = "water",
 				tolerance =
-					spot.source
-						== "MainWaterPart"
-						and 1.15
-						or 2.5,
-				speedScale = 0.50,
+					spot.source == "MainWaterPart"
+						and math.clamp(state.movementFootprint(character) * 0.22, 2.0, 3.8)
+						or 3.0,
+				speedScale = 0.72,
 				constantSpeed = true,
 				riverApproach =
 					spot.source
@@ -11238,12 +11688,13 @@ local function autoDrinkStep()
 
 		landed = safeMoveToPosition(
 			spot.stand,
-			8,
+			10,
 			spot.water,
 			{
 				purpose = "water",
-				tolerance = 13,
-				speedScale = 0.85,
+				tolerance = math.clamp(state.movementFootprint(character) * 0.48, 4.5, 8),
+				speedScale = 0.72,
+				maxDuration = 300,
 			}
 		)
 	else
@@ -14869,8 +15320,7 @@ function state.questSlots.createForQuest(
 				return
 			end
 
-			state.autoEat = true
-			state.autoDrink = true
+			state.applySurvivalDefaults(false)
 
 			state.questSlotsFinishTransaction(
 				spawned
@@ -14915,8 +15365,7 @@ function state.questSlots.createForQuest(
 				)
 			end
 
-			state.autoEat = true
-			state.autoDrink = true
+			state.applySurvivalDefaults(false)
 
 			state.questSlotsFinishTransaction(
 				"Quest slot: no free slot; previous animal restored"
@@ -15036,8 +15485,7 @@ function state.questSlots.createForQuest(
 				player.Character
 			)
 
-			state.autoEat = true
-			state.autoDrink = true
+			state.applySurvivalDefaults(false)
 
 			if spawned then
 				questStatusText =
@@ -15084,8 +15532,7 @@ function state.questSlots.createForQuest(
 				)
 			end
 
-			state.autoEat = true
-			state.autoDrink = true
+			state.applySurvivalDefaults(false)
 
 			state.questSlotsFinishTransaction(
 				"Quest slot unavailable; previous animal restored"
@@ -15825,8 +16272,7 @@ function state.questGrowthResetEndExclusive(reason)
 	state.questGrowthReset.restoreAutoDrink = nil
 
 	if state.autoQuests then
-		state.autoEat = true
-		state.autoDrink = true
+		state.applySurvivalDefaults(false)
 	else
 		if restoreEat ~= nil then state.autoEat = restoreEat end
 		if restoreDrink ~= nil then state.autoDrink = restoreDrink end
@@ -16206,8 +16652,7 @@ local function trySwitchToQuestAnimal(quest, records, resolvedTarget)
 		)
 
 		if spawned then
-			state.autoEat = true
-			state.autoDrink = true
+			state.applySurvivalDefaults(false)
 			state.questForceFastRecheckUntil =
 				tick() + 25
 
@@ -16820,6 +17265,13 @@ function state.questZoneDrinkApply(zoneName)
 		override.startedAt > 0 and override.startedAt
 		or tick()
 
+	if CROC.isCharacter(player.Character) then
+		state.autoDrinkMode = "surface"
+		runtimeMessage = "Survive in Zone: Crocodile cannot use Underground Drink"
+		state.questZoneDrinkRender()
+		return
+	end
+
 	if state.autoDrinkMode ~= "underground" then
 		state.autoDrinkMode = "underground"
 		state.drinkTest.retryAfter = 0
@@ -16859,9 +17311,13 @@ function state.questZoneDrinkRelease(reason)
 		state.autoDrinkPreferredMode = preferred
 	end
 
-	state.autoDrinkMode = preferred
+	if CROC.isCharacter(player.Character) then
+		state.autoDrinkMode = "surface"
+	else
+		state.autoDrinkMode = preferred
+	end
 
-	if preferred == "surface"
+	if state.autoDrinkMode == "surface"
 		and state.drinkTest
 		and state.drinkTest.active then
 		state.drinkTest.cancelRequested = true
@@ -17091,7 +17547,7 @@ local function updateQuestAutomation()
 	end
 
 	if not criticalRecoveryActive and not questSwitchingAnimal then
-		state.autoEat, state.autoDrink = true, true
+		state.applySurvivalDefaults(false)
 		if renders then
 			if renders.autoEat then renders.autoEat() end
 			if renders.autoDrink then renders.autoDrink() end
@@ -17169,7 +17625,7 @@ local function updateQuestAutomation()
 		state.questTravelActive = false
 		state.questLandInputActive = false
 		state.questSetW(false)
-		state.autoEat, state.autoDrink = true, true
+		state.applySurvivalDefaults(false)
 
 		local tracked =
 			state.questGrowthReset.active
@@ -17300,7 +17756,9 @@ local function updateQuestAutomation()
 			end
 		end
 
-		state.autoEat, state.autoDrink = true, true
+		state.applySurvivalDefaults(
+			false
+		)
 		if renders then
 			for _, key in ipairs({
 				"autoQuests", "growExisting", "growAllSlots", "growNew",
@@ -17344,8 +17802,7 @@ local function updateQuestAutomation()
 		--   1) Water <=75 -> drink to full.
 		--   2) Food <=68 (or an already-active feeding cycle) -> eat.
 		--   3) Only when survival is stable do we travel to/run the Swim farm.
-		state.autoEat = true
-		state.autoDrink = true
+		state.applySurvivalDefaults(false)
 
 		local swimWater =
 			tonumber(character:GetAttribute("Water")) or 100
@@ -17505,7 +17962,7 @@ local function updateQuestAutomation()
 		removeSwimBarrier()
 		blockClientSubState = false
 
-		state.autoEat, state.autoDrink = true, true
+		state.applySurvivalDefaults(false)
 		if renders then
 			if renders.autoEat then renders.autoEat() end
 			if renders.autoDrink then renders.autoDrink() end
@@ -19125,8 +19582,7 @@ function state.coinFarmTryPreferredSwitch()
 		state.coinFarmSwitching = false
 
 		if state.farmCoins then
-			state.autoEat = true
-			state.autoDrink = true
+			state.applySurvivalDefaults(false)
 		else
 			state.autoEat = previousAutoEat
 			state.autoDrink = previousAutoDrink
@@ -19384,7 +19840,9 @@ local function growthStep()
 	-- nada — senão as duas rotinas brigam pra mover o personagem pra
 	-- lugares diferentes ao mesmo tempo (isso já matou um Rex no Dino Life).
 	if criticalRecoveryActive then return end
-	state.autoEat, state.autoDrink = true, true
+	state.applySurvivalDefaults(
+		false
+	)
 	if renders then
 		if renders.autoEat then renders.autoEat() end
 		if renders.autoDrink then renders.autoDrink() end
@@ -19532,7 +19990,9 @@ local function growthStep()
 		state.moveBeforeSlotChange()
 	if not landedSafely then
 		runtimeMessage = "Não confirmei terra firme; adiando troca de slot"
-		state.autoEat, state.autoDrink = true, true
+		state.applySurvivalDefaults(
+			false
+		)
 		if renders then
 			if renders.autoEat then renders.autoEat() end
 			if renders.autoDrink then renders.autoDrink() end
@@ -19647,7 +20107,9 @@ local function growthStep()
 		state.growExistingAutomaticAll = false
 		state.farmCoins = true
 	end
-	state.autoEat, state.autoDrink = true, true
+	state.applySurvivalDefaults(
+		false
+	)
 	if renders then
 		for _, key in ipairs({
 			"growExisting", "growAllSlots", "growNew",
@@ -20385,6 +20847,12 @@ local function toggle(parent, label, key, order)
 	row.Activated:Connect(function()
 		state[key] = not state[key]
 
+		if key == "autoEat" then
+			state.autoEatManualDisabled = not state[key]
+		elseif key == "autoDrink" then
+			state.autoDrinkManualDisabled = not state[key]
+		end
+
 		if key == "autoEat" and not state[key] then
 			eatingToFull = false
 			activeCarcass = nil
@@ -20400,6 +20868,7 @@ local function toggle(parent, label, key, order)
 				state.safeMove.cancelToken += 1
 			end
 
+			state.releaseMovementNow(player.Character, true)
 			runtimeMessage =
 				"Auto Eat disabled; current food route cancelled"
 		end
@@ -20430,6 +20899,7 @@ local function toggle(parent, label, key, order)
 					state.safeMove.cancelToken += 1
 				end
 
+				state.releaseMovementNow(player.Character, true)
 				runtimeMessage =
 					"Auto Drink disabled; current water route cancelled"
 			end
@@ -20459,7 +20929,7 @@ local function toggle(parent, label, key, order)
 			state.growExistingAutomaticAll = false
 			state.growAllSlots = false
 			state.growExisting, state.growNew, state.autoQuests = false, false, false
-			state.autoEat, state.autoDrink = true, true
+			state.applySurvivalDefaults(true)
 			runtimeMessage = state.coinFarmPreferredAnimal
 				and (
 					"AFK Coin Farm active; preferred animal queued: "
@@ -20482,7 +20952,7 @@ local function toggle(parent, label, key, order)
 			state.questEmptyScans = 0
 			state.questGroup.difficultySince = nil
 			state.farmCoins, state.growExisting, state.growNew = false, false, false
-			state.autoEat, state.autoDrink = true, true
+			state.applySurvivalDefaults(true)
 			questStatusText = "Scanning Daily + Weekly quests"
 			runtimeMessage = "Auto Quests active"
 		elseif key == "autoQuests" and not state[key] then
@@ -20491,6 +20961,7 @@ local function toggle(parent, label, key, order)
 			state.questTravelActive = false
 			state.questLandInputActive = false
 			state.questSetW(false)
+			state.releaseMovementNow(player.Character, true)
 			state.questLandWWatchReset()
 			state.questSwimActive = false
 			state.questSwimReady = false
@@ -20726,8 +21197,14 @@ state.renderAutoDrinkModeButtons = function()
 	for mode, data in pairs(
 		state.autoDrinkModeButtons
 	) do
+		local crocBlocked =
+			mode == "underground" and CROC.isCharacter(player.Character)
+
 		local selected =
-			state.autoDrinkMode == mode
+			state.autoDrinkMode == mode and not crocBlocked
+
+		data.button.Active = not crocBlocked
+		data.button.BackgroundTransparency = crocBlocked and 0.28 or 0
 
 		data.button.BackgroundColor3 =
 			selected
@@ -20744,19 +21221,16 @@ state.renderAutoDrinkModeButtons = function()
 				)
 
 		data.title.TextColor3 =
-			selected
-				and COLOR_ACCENT
-				or COLOR_TEXT
+			crocBlocked and COLOR_SUBTEXT
+			or (selected and COLOR_ACCENT or COLOR_TEXT)
 
 		data.radio.Text =
-			selected
-				and "●"
-				or "○"
+			crocBlocked and "×"
+			or (selected and "●" or "○")
 
 		data.radio.TextColor3 =
-			selected
-				and COLOR_ACCENT
-				or COLOR_SUBTEXT
+			crocBlocked and COLOR_SUBTEXT
+			or (selected and COLOR_ACCENT or COLOR_SUBTEXT)
 	end
 end
 
@@ -20929,6 +21403,14 @@ state.createAutoDrinkModeButton = function(
 	end)
 
 	button.Activated:Connect(function()
+		if mode == "underground" and CROC.isCharacter(player.Character) then
+			state.autoDrinkPreferredMode = "surface"
+			state.autoDrinkMode = "surface"
+			runtimeMessage = "Underground Drink is unavailable for Crocodile"
+			state.renderAutoDrinkModeButtons()
+			return
+		end
+
 		local overrideActive =
 			state.questZoneDrinkOverride
 				and state.questZoneDrinkOverride.active
@@ -20993,7 +21475,7 @@ end
 state.createAutoDrinkModeButton(
 	"underground",
 	"Drink below the Terrain",
-	"Higher chance of bugs, but does not require searching for puddles or traveling to the river.",
+	"Higher chance of bugs; no puddle/river travel. Unavailable for Crocodile.",
 	4,
 	UserInputService.TouchEnabled
 		and 92
@@ -21789,7 +22271,9 @@ task.spawn(function()
 				state.questSeenAny = true
 				state.questEmptyScans = 0
 				state.autoQuests = true
-				state.autoEat, state.autoDrink = true, true
+				state.applySurvivalDefaults(
+			false
+		)
 				questStatusText = "Actionable quest opportunity found -> Auto Quests"
 				runtimeMessage =
 					"AFK Coins: a previously impossible/new quest is now actually workable"
@@ -22496,7 +22980,9 @@ task.spawn(function()
 				root.Position
 					+ Vector3.new(
 						0,
-						2.5,
+						state.movementProbeHeight(
+							character
+						),
 						0
 					),
 				heading * 32,
@@ -22828,17 +23314,34 @@ task.spawn(function()
 		local leftDirection = rotatePlanar(direction, -55)
 		local rightDirection = rotatePlanar(direction, 55)
 
-		local leftHit = workspace:Raycast(
-			root.Position + Vector3.new(0, 2.5, 0),
-			leftDirection * distance,
-			params
-		)
+		local probeHeight =
+			state.movementProbeHeight(
+				character
+			)
 
-		local rightHit = workspace:Raycast(
-			root.Position + Vector3.new(0, 2.5, 0),
-			rightDirection * distance,
-			params
-		)
+		local leftHit =
+			workspace:Raycast(
+				root.Position
+					+ Vector3.new(
+						0,
+						probeHeight,
+						0
+					),
+				leftDirection * distance,
+				params
+			)
+
+		local rightHit =
+			workspace:Raycast(
+				root.Position
+					+ Vector3.new(
+						0,
+						probeHeight,
+						0
+					),
+				rightDirection * distance,
+				params
+			)
 
 		if leftHit and not rightHit then return 1 end
 		if rightHit and not leftHit then return -1 end
@@ -22978,7 +23481,7 @@ task.spawn(function()
 			math.clamp((speed or 30) * 0.24, 8, 20)
 
 		local obstacle = workspace:Raycast(
-			root.Position + Vector3.new(0, 2.5, 0),
+			root.Position + Vector3.new(0, state.movementProbeHeight(character), 0),
 			direction * probeDistance,
 			params
 		)
@@ -22997,6 +23500,7 @@ task.spawn(function()
 			-- Terrain was already handled by the height probes above.
 			if obstacle.Instance == workspace.Terrain then
 				if humanoid
+					and not state.isHeavyGroundMover(character)
 					and tick() - autoBlockingSince >= 0.50
 					and tick() - autoLastJumpAt >= 0.9 then
 
@@ -23026,6 +23530,7 @@ task.spawn(function()
 			-- Give lateral avoidance time to work first. If the same object is
 			-- still blocking after ~0.7s, virtualize Space as a second escape tool.
 			if humanoid
+				and not state.isHeavyGroundMover(character)
 				and tick() - autoBlockingSince >= 0.70
 				and tick() - autoLastJumpAt >= 0.9 then
 
@@ -23321,7 +23826,7 @@ task.spawn(function()
 								autoAvoidUntil =
 									tick() + 1.45
 
-								if humanoid then
+								if humanoid and not state.isHeavyGroundMover(character) then
 									state.virtualJump(
 										character,
 										humanoid,
@@ -23344,21 +23849,27 @@ task.spawn(function()
 						speed
 					)
 
-					if landMove and state.questLandInputActive then
-						pcall(function()
-							root.CFrame = CFrame.lookAt(
-								root.Position,
-								root.Position + direction,
-								Vector3.yAxis
-							)
-						end)
+					if state.isHeavyGroundMover(character) then
+						if humanoid then
+							pcall(function()
+								humanoid.PlatformStand = false
+								humanoid.AutoRotate = true
+								humanoid:Move(direction, false)
+							end)
+						end
+						local planar = Vector3.new(velocity.X, 0, velocity.Z)
+						if planar.Magnitude > speed * 1.20 then
+							local capped = planar.Unit * speed
+							root.AssemblyLinearVelocity = Vector3.new(capped.X, velocity.Y, capped.Z)
+						end
+					else
+						if landMove and state.questLandInputActive then
+							pcall(function()
+								root.CFrame = CFrame.lookAt(root.Position, root.Position + direction, Vector3.yAxis)
+							end)
+						end
+						root.AssemblyLinearVelocity = Vector3.new(direction.X * speed, velocity.Y, direction.Z * speed)
 					end
-
-					root.AssemblyLinearVelocity = Vector3.new(
-						direction.X * speed,
-						velocity.Y,
-						direction.Z * speed
-					)
 					wasMoving = true
 				end
 			end
@@ -23400,6 +23911,7 @@ task.spawn(function()
 				state.questMotionMoving = false
 				state.questMotionMode = nil
 				state.questSetW(false)
+				if state.questLandKeyDown then state.releaseMovementNow(player.Character, true) end
 			end
 
 			if root and not moveOwnsLandQuestW then
@@ -23470,6 +23982,9 @@ shared.__uiRootCleanup = function()
 
 		autoDrinkPreferredMode =
 			state.autoDrinkPreferredMode,
+
+		autoEatManualDisabled = state.autoEatManualDisabled == true,
+		autoDrinkManualDisabled = state.autoDrinkManualDisabled == true,
 	}
 
 	state.alive = false
@@ -23487,10 +24002,8 @@ shared.__uiRootCleanup = function()
 		player.Character
 
 	if cleanupCharacter then
-		pcall(
-			state.questSlotsNormalizeControl,
-			cleanupCharacter
-		)
+		pcall(state.releaseMovementNow, cleanupCharacter, true)
+		pcall(state.questSlotsNormalizeControl, cleanupCharacter)
 	end
 
 	local cleanupWater = workspace:FindFirstChild("MainWaterPart")
@@ -23545,8 +24058,7 @@ task.defer(function()
 	)
 
 	if state.autoQuests then
-		state.autoEat = true
-		state.autoDrink = true
+		state.applySurvivalDefaults(false)
 		state.questSeenAny = false
 		state.questEmptyScans = 0
 		state.questForceFastRecheckUntil =
