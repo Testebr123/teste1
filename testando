@@ -7,7 +7,16 @@ local VirtualUser = game:GetService("VirtualUser")
 local CoreGui = game:GetService("CoreGui")
 local player = Players.LocalPlayer
 
-if shared.__uiRootCleanup then pcall(shared.__uiRootCleanup) end
+if shared.__uiRootCleanup then
+	pcall(shared.__uiRootCleanup)
+end
+
+local resumeState =
+	type(shared.__mmbHubResume) == "table"
+		and shared.__mmbHubResume
+		or {}
+
+shared.__mmbHubResume = nil
 
 local CONFIGS = {
 	[6174994284] = { name = "SavannahLife", farm = Vector3.new(-6245.2, 10, 4664.3), dangerY = -100 },
@@ -19,20 +28,40 @@ local isSavannahLife = game.GameId == 6174994284 or game.GameId == 18214855317
 local isDinoLife = game.PlaceId == 75541741887441
 local DINO_DRINK_POSITION = Vector3.new(-552.27, 41.46, -520.35)
 local state = {
-	autoEat = false,
-	autoDrink = false,
+	autoEat =
+		resumeState.autoQuests == true
+			or resumeState.autoEat == true,
+
+	autoDrink =
+		resumeState.autoQuests == true
+			or resumeState.autoDrink == true,
 
 	-- v103 Auto Drink mode:
 	-- "surface" = puddles/rivers (safer default)
 	-- "underground" = protected hidden MainWaterPart routine
-	autoDrinkMode = "surface",
+	autoDrinkMode =
+		(
+			resumeState.autoDrinkPreferredMode == "underground"
+				and "underground"
+				or "surface"
+		),
 
 	-- v104: player's real preference is separate from the effective mode.
-	autoDrinkPreferredMode = "surface",
+	autoDrinkPreferredMode =
+		(
+			resumeState.autoDrinkPreferredMode == "underground"
+				and "underground"
+				or "surface"
+		),
 	questZoneDrinkOverride = {
 		active = false,
 		zone = nil,
 		startedAt = 0,
+	},
+
+	-- v109: pure TravelDistance herbivore feeding hysteresis.
+	questTravelHerbivoreFeed = {
+		active = false,
 	},
 
 	escapeTerrain = false,
@@ -46,8 +75,11 @@ local state = {
 	coinFarmSwitching = false,
 	coinFarmSwitchReason = nil,
 	coinFarmRetryAt = 0,
-	autoQuests = false,
-	autoClaimQuests = false,
+	autoQuests =
+		resumeState.autoQuests == true,
+
+	autoClaimQuests =
+		resumeState.autoClaimQuests == true,
 	questMoveSubState = "Running",
 	questLastSubStateAt = 0,
 	questLastEatTapAt = 0,
@@ -6515,6 +6547,38 @@ local function autoEatStep()
 	local questGiraffe =
 		zoneSurvivalFeeding and giraffe
 
+	-- v109:
+	-- During pure TravelDistance, grass-eating herbivores should not abandon
+	-- Auto Run every time Food drops a little. Start a real feeding route only
+	-- at <=60%, then recover to 85% so the next stop is not immediate.
+	local travelHerbivoreFeeding =
+		state.autoQuests
+			and state.questTravelActive
+			and not state.questSwimActive
+			and not (
+				state.questZoneDrinkOverride
+				and state.questZoneDrinkOverride.active
+			)
+			and not carnivore
+			and not baboon
+			and not giraffe
+			and not preSwitchFoodTarget
+
+	if travelHerbivoreFeeding then
+		if not state.questTravelHerbivoreFeed.active
+			and food <= 60 then
+
+			state.questTravelHerbivoreFeed.active = true
+
+		elseif state.questTravelHerbivoreFeed.active
+			and food >= 85 then
+
+			state.questTravelHerbivoreFeed.active = false
+		end
+	else
+		state.questTravelHerbivoreFeed.active = false
+	end
+
 	-- Baboon never competes with Auto Drink. If Water needs service, drop all
 	-- Baboon food ownership immediately and let autoDrinkStep take over.
 	if baboon and water <= 75 then
@@ -6612,15 +6676,32 @@ local function autoEatStep()
 		state.questCarnivoreFeeding = false
 	end
 
-	local foodCap = (questCarnivore or questBaboon or questGiraffe)
-		and 100
-		or (preSwitchFoodTarget or 92)
+	local foodCap =
+		(questCarnivore or questBaboon or questGiraffe)
+			and 100
+			or (
+				travelHerbivoreFeeding
+					and state.questTravelHerbivoreFeed.active
+					and 85
+			)
+			or (preSwitchFoodTarget or 92)
 	if food >= foodCap then
 		local wasEating = eatingToFull
 		eatingToFull = false
 		resetEatingSearch(food)
 		activeCarcass = nil
 		eatingStuckSince = nil
+
+		if state.questTravelHerbivoreFeed
+			and state.questTravelHerbivoreFeed.active
+			and food >= 85 then
+
+			state.questTravelHerbivoreFeed.active =
+				false
+
+			runtimeMessage =
+				"Auto Run food break complete; resuming TravelDistance"
+		end
 
 		if wasEating and state.autoQuests then
 			state.questForceFastRecheckUntil = tick() + 12
@@ -6633,37 +6714,66 @@ local function autoEatStep()
 
 	local availableFood = detectAvailableFood(character)
 
-	-- Herbívoro durante Auto Quests:
-	-- o modo especial "Eat enquanto corre" só existe se ainda houver uma
-	-- Travel/Land Distance incompleta. Sem missão de corrida, volta ao Auto Eat
-	-- padrão: procura a grama e vai até ela normalmente.
-	if state.autoQuests and state.questTravelActive
-		and not preSwitchFoodTarget
-		and not carnivore
-		and not baboon
-		and not giraffe then
-		if availableFood == "Eat" then
+	-- v109 TravelDistance grass policy:
+	-- Comfortable (>60%): NEVER leave the run just to search grass.
+	-- Grass already underfoot can still be tapped while W/Auto Run continues.
+	-- Low-food cycle (<=60%): allow normal Auto Eat routing until 85%.
+	if travelHerbivoreFeeding then
+		if availableFood == "Eat"
+			and not state.questTravelHerbivoreFeed.active then
+
 			eatingToFull = false
 			eatingSourcePosition = nil
 			eatingTargetReachedAt = nil
 			eatingStuckSince = nil
-			runtimeMessage = "Eating while running"
 
-			if tick() - (state.questLastEatTapAt or 0) >= 0.8 then
-				state.questLastEatTapAt = tick()
+			runtimeMessage =
+				"Auto Run: eating grass on the path"
+
+			if tick()
+				- (state.questLastEatTapAt or 0)
+				>= 0.8 then
+
+				state.questLastEatTapAt =
+					tick()
+
 				pcall(function()
-					VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+					VirtualInputManager:SendKeyEvent(
+						true,
+						Enum.KeyCode.E,
+						false,
+						game
+					)
+
 					task.wait(0.04)
-					VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+
+					VirtualInputManager:SendKeyEvent(
+						false,
+						Enum.KeyCode.E,
+						false,
+						game
+					)
 				end)
+
 				setSubState("Eating")
 			end
+
 			return
 		end
 
-		-- v108: no suppression here. If there is no Eat prompt underfoot,
-		-- normal Auto Eat may route to food immediately; that physical movement
-		-- can still contribute to TravelDistance.
+		if not state.questTravelHerbivoreFeed.active then
+			-- Food is still comfortable. Keep running and do NOT create a
+			-- moveToGrass/SafeMove food route.
+			return
+		end
+
+		eatingToFull = true
+
+		runtimeMessage =
+			string.format(
+				"Auto Run food break (%d%% -> 85%%)",
+				math.floor(food)
+			)
 	end
 
 	if not eatingToFull then
@@ -11431,7 +11541,11 @@ local function motherNameFor(entry)
 	end
 end
 
-local function spawnSlot(entry, skipSafeMove)
+local function spawnSlot(
+	entry,
+	skipSafeMove,
+	strictExpected
+)
 	local uniqueName = type(entry) == "table"
 		and (entry.UniqueCharacterName or entry.CharacterName)
 	if not SpawnRemote or not uniqueName then return false end
@@ -11492,9 +11606,14 @@ local function spawnSlot(entry, skipSafeMove)
 			end
 
 			-- New Character but attributes are still loading.
-			if candidate ~= oldCharacter
+			-- For a quest-only slot transaction we KNOW the exact requested
+			-- CharacterName + AnimalName, so never accept a different spawned
+			-- character merely because two seconds elapsed.
+			if not strictExpected
+				and candidate ~= oldCharacter
 				and changedSince
 				and tick() - changedSince >= 2 then
+
 				matched = candidate
 				break
 			end
@@ -11537,6 +11656,167 @@ local function spawnSlot(entry, skipSafeMove)
 
 	runtimeMessage = "Slot ativo: " .. tostring(expectedName)
 	return true
+end
+
+function state.questSlotsNormalizeControl(character)
+	character =
+		character
+		or player.Character
+
+	if not character then
+		return false
+	end
+
+	local root =
+		character:FindFirstChild(
+			"HumanoidRootPart"
+		)
+
+	local humanoid =
+		character:FindFirstChildOfClass(
+			"Humanoid"
+		)
+
+	if not root or not humanoid then
+		return false
+	end
+
+	-- A quest slot must never inherit a movement lock from SafeMove,
+	-- underground transit, a reset transaction, or a previous execution.
+	character:SetAttribute(
+		"MovementDisabled",
+		false
+	)
+
+	pcall(function()
+		humanoid.PlatformStand = false
+		humanoid.AutoRotate = true
+
+		if humanoid:GetState()
+			== Enum.HumanoidStateType.Physics then
+
+			humanoid:ChangeState(
+				Enum.HumanoidStateType.GettingUp
+			)
+		end
+
+		humanoid:Move(
+			Vector3.zero,
+			false
+		)
+	end)
+
+	local velocity =
+		root.AssemblyLinearVelocity
+
+	root.AssemblyLinearVelocity =
+		Vector3.new(
+			0,
+			velocity.Y,
+			0
+		)
+
+	root.AssemblyAngularVelocity =
+		Vector3.zero
+
+	blockClientSubState = false
+
+	if state.questSetW then
+		pcall(
+			state.questSetW,
+			false
+		)
+	end
+
+	return true
+end
+
+function state.questSlotsCurrentPositionSafe()
+	local character, root =
+		characterParts()
+
+	if not character or not root then
+		return false
+	end
+
+	if root.Position.Y
+		<= config.dangerY + 8 then
+		return false
+	end
+
+	if state.drinkIsBuriedUnderTerrain
+		and state.drinkIsBuriedUnderTerrain(
+			root
+		) then
+		return false
+	end
+
+	if state.isBodyActuallyInWater
+		and state.isBodyActuallyInWater(
+			character,
+			root
+		) then
+		return false
+	end
+
+	return state.normalizeDryLandState
+		and state.normalizeDryLandState(
+			character,
+			root
+		)
+end
+
+function state.questSlotsPrepareForCreate()
+	local character =
+		player.Character
+
+	if not character then
+		return false
+	end
+
+	state.questSlotsNormalizeControl(
+		character
+	)
+
+	-- If the player is already on ordinary dry ground, DO NOT move the current
+	-- animal anywhere. Reset/Create can begin immediately.
+	if state.questSlotsCurrentPositionSafe() then
+		return true
+	end
+
+	-- Only unsafe water / buried / void cases require physical recovery.
+	runtimeMessage =
+		"Quest slot: current position unsafe; moving to slot-switch safety point"
+
+	if state.moveBeforeSlotChange then
+		return state.moveBeforeSlotChange()
+	end
+
+	return ensureOnSolidGround(
+		getSafeFarmPosition(),
+		"quest slot safety"
+	)
+end
+
+function state.questSlotsFinishTransaction(
+	message,
+	forceRecheck
+)
+	state.questSlots.busy = false
+	questSwitchingAnimal = false
+
+	state.questSlotsNormalizeControl(
+		player.Character
+	)
+
+	if forceRecheck ~= false then
+		state.questForceFastRecheckUntil =
+			tick() + 25
+	end
+
+	if message then
+		runtimeMessage = message
+	end
 end
 
 local slotIndex = 0
@@ -14277,16 +14557,47 @@ function state.questSlots.deleteTempForNext(nextAnimal)
 	state.questTravelActive = false
 
 	task.spawn(function()
-		runtimeMessage = "Quest slot: removing temporary " .. tostring(temp.animalName)
+		if not state.alive then
+			state.questSlotsFinishTransaction(
+				nil,
+				false
+			)
+
+			return
+		end
+
+		runtimeMessage =
+			"Quest slot: removing temporary "
+			.. tostring(temp.animalName)
 
 		local current = player.Character
 		local currentName = current and current:GetAttribute("CharacterName")
-		if currentName == temp.characterName and ResetRemote then
-			pcall(ResetRemote.InvokeServer, ResetRemote)
+		if currentName == temp.characterName
+			and ResetRemote then
+
+			pcall(
+				ResetRemote.InvokeServer,
+				ResetRemote
+			)
+
 			task.wait(1.5)
 		end
 
-		local ok = pcall(deleteRemote.InvokeServer, deleteRemote, temp.characterName)
+		if not state.alive then
+			state.questSlotsFinishTransaction(
+				nil,
+				false
+			)
+
+			return
+		end
+
+		local ok =
+			pcall(
+				deleteRemote.InvokeServer,
+				deleteRemote,
+				temp.characterName
+			)
 		if ok then
 			local deadline = tick() + 7
 			local removed = false
@@ -14312,43 +14623,79 @@ function state.questSlots.deleteTempForNext(nextAnimal)
 			questStatusText = "Temporary slot deletion failed"
 		end
 
-		state.questSlots.busy = false
-		questSwitchingAnimal = false
+		state.questSlotsFinishTransaction(
+			nil
+		)
 	end)
 
 	return true
 end
 
-function state.questSlots.createForQuest(quest, targetAnimal, records)
-	if state.questSlots.busy or questSwitchingAnimal or state.busy or criticalRecoveryActive then
+function state.questSlots.createForQuest(
+	quest,
+	targetAnimal,
+	records
+)
+	if state.questSlots.busy
+		or questSwitchingAnimal
+		or state.busy
+		or criticalRecoveryActive then
+
 		return true
 	end
-	if not CreateRemote or type(targetAnimal) ~= "string" or targetAnimal == "" then
+
+	if not CreateRemote
+		or type(targetAnimal) ~= "string"
+		or targetAnimal == "" then
+
 		return false
 	end
 
 	-- Hard rule: flying species are forbidden until ALL Auto Run quests finish.
 	if state.questIsFlyingAnimalName(targetAnimal)
-		and (state.questBlockFlying or (state.questPendingLandCount or 0) > 0) then
-		questStatusText = string.format(
-			"Running quests first (%d pending); flying animal blocked",
-			state.questPendingLandCount or 0
-		)
-		runtimeMessage = "Flying quest slot blocked until all running quests finish"
+		and (
+			state.questBlockFlying
+			or (
+				state.questPendingLandCount
+				or 0
+			) > 0
+		) then
+
+		questStatusText =
+			string.format(
+				"Running quests first (%d pending); flying animal blocked",
+				state.questPendingLandCount
+					or 0
+			)
+
+		runtimeMessage =
+			"Flying quest slot blocked until all running quests finish"
+
 		return true
 	end
 
-	records = records or savedCharacters()
+	records =
+		records
+		or savedCharacters()
 
 	local previousEntry
-	local currentCharacter = player.Character
-	local currentCharacterName = currentCharacter
-		and currentCharacter:GetAttribute("CharacterName")
+	local currentCharacter =
+		player.Character
 
-	if type(currentCharacterName) == "string" then
+	local currentCharacterName =
+		currentCharacter
+			and currentCharacter:GetAttribute(
+				"CharacterName"
+			)
+
+	if type(currentCharacterName)
+		== "string" then
+
 		for _, entry in ipairs(records) do
 			if type(entry) == "table"
-				and entry.CharacterName == currentCharacterName then
+				and entry.CharacterName
+					== currentCharacterName then
+
 				previousEntry = entry
 				break
 			end
@@ -14356,29 +14703,70 @@ function state.questSlots.createForQuest(quest, targetAnimal, records)
 	end
 
 	-- Never create a duplicate if replication changed since the previous scan.
-	local existing = state.questSlots.findAnimalSlot(records, targetAnimal)
-	if existing then return false end
+	local existing =
+		state.questSlots.findAnimalSlot(
+			records,
+			targetAnimal
+		)
 
-	if #records >= (state.questSlots.maxSlots or 40)
-		and not state.questSlots.hasDeletableTemp(records, targetAnimal) then
+	if existing then
+		return false
+	end
 
-		state.questSlots.markBlocked(targetAnimal, "no_free_slot")
-		questStatusText = "Skipping " .. targetAnimal .. ": NO FREE SLOT"
+	if #records
+			>= (
+				state.questSlots.maxSlots
+				or 40
+			)
+		and not state.questSlots.hasDeletableTemp(
+			records,
+			targetAnimal
+		) then
+
+		state.questSlots.markBlocked(
+			targetAnimal,
+			"no_free_slot"
+		)
+
+		questStatusText =
+			"Skipping "
+			.. targetAnimal
+			.. ": NO FREE SLOT"
+
 		runtimeMessage =
 			"Specific-animal quest skipped; checking other quests / Growth / AFK Coins"
+
 		return false
 	end
 
-	local failedUntil = state.questSlots.failedUntil[targetAnimal:lower()] or 0
+	local failedUntil =
+		state.questSlots.failedUntil[
+			targetAnimal:lower()
+		] or 0
+
 	if tick() < failedUntil then
-		state.questSlots.markBlocked(targetAnimal, "create_retry")
-		questStatusText = "Skipping " .. targetAnimal .. " until slot-create retry"
+		state.questSlots.markBlocked(
+			targetAnimal,
+			"create_retry"
+		)
+
+		questStatusText =
+			"Skipping "
+			.. targetAnimal
+			.. " until slot-create retry"
+
 		return false
 	end
 
-	local characterName = state.questSlots.generateQuestName(records)
+	local characterName =
+		state.questSlots.generateQuestName(
+			records
+		)
+
 	if not characterName then
-		questStatusText = "Could not generate a safe quest slot name"
+		questStatusText =
+			"Could not generate a safe quest slot name"
+
 		return false
 	end
 
@@ -14386,116 +14774,327 @@ function state.questSlots.createForQuest(quest, targetAnimal, records)
 	questSwitchingAnimal = true
 	questTravelWanted = false
 	state.questTravelActive = false
+	state.questLandInputActive = false
+	state.questMotionMoving = false
+	state.questMotionMode = nil
+
+	if state.questSetW then
+		pcall(
+			state.questSetW,
+			false
+		)
+	end
 
 	task.spawn(function()
-		-- Move away from water/void first, then reset. The Create remote itself
-		-- is the server-authoritative ownership validation: after invoking it,
-		-- we ONLY trust success if SavedCharacters actually contains exactly
-		-- the new CharacterName + requested AnimalName.
-		runtimeMessage = "Quest slot: validating/creating " .. targetAnimal
-		pcall(function()
-			safeMoveToPosition(
-			getSafeFarmPosition(),
-			8,
-			nil,
-			{
-				purpose = "safety",
-				tolerance = 18,
-				vertical = true,
-			}
-		)
-		end)
-		task.wait(0.5)
+		runtimeMessage =
+			"Quest slot: preparing "
+			.. targetAnimal
+
+		-- v110: the previous code ALWAYS walked to getSafeFarmPosition() here.
+		-- On ordinary dry ground that movement is unnecessary and hijacks the
+		-- current animal's controls. Only recover physically if position is
+		-- genuinely unsafe.
+		local prepared =
+			state.questSlotsPrepareForCreate()
+
+		if not state.alive then
+			state.questSlotsFinishTransaction(
+				nil,
+				false
+			)
+
+			return
+		end
+
+		if not prepared then
+			state.questSlotsFinishTransaction(
+				"Quest slot: could not confirm safe position; retrying later"
+			)
+
+			state.questSlots.failedUntil[
+				targetAnimal:lower()
+			] = tick() + 4
+
+			return
+		end
+
+		runtimeMessage =
+			"Quest slot: validating/creating "
+			.. targetAnimal
 
 		if ResetRemote then
-			pcall(ResetRemote.InvokeServer, ResetRemote)
+			pcall(
+				ResetRemote.InvokeServer,
+				ResetRemote
+			)
+
 			task.wait(1.5)
 		end
 
-		local refreshedBefore = savedCharacters()
-		local appearedExisting = state.questSlots.findAnimalSlot(refreshedBefore, targetAnimal)
-		if appearedExisting then
-			spawnSlot(appearedExisting)
-			state.questSlots.busy = false
-			questSwitchingAnimal = false
+		-- CRITICAL re-execution guard:
+		-- an old script execution is forbidden from creating/spawning a slot
+		-- after its cleanup has already set state.alive=false.
+		if not state.alive then
+			state.questSlotsFinishTransaction(
+				nil,
+				false
+			)
+
 			return
 		end
 
-		if #refreshedBefore >= (state.questSlots.maxSlots or 40) then
-			state.questSlots.markBlocked(targetAnimal, "no_free_slot")
-			questStatusText = "Skipping " .. targetAnimal .. ": NO FREE SLOT"
+		local refreshedBefore =
+			savedCharacters()
+
+		local appearedExisting =
+			state.questSlots.findAnimalSlot(
+				refreshedBefore,
+				targetAnimal
+			)
+
+		if appearedExisting then
+			local spawned =
+				spawnSlot(
+					appearedExisting,
+					true,
+					true
+				)
+
+			if not state.alive then
+				state.questSlotsFinishTransaction(
+					nil,
+					false
+				)
+
+				return
+			end
+
+			state.autoEat = true
+			state.autoDrink = true
+
+			state.questSlotsFinishTransaction(
+				spawned
+					and "Quest animal ready; resuming quest automation"
+					or "Quest slot found but spawn was not confirmed; retrying"
+			)
+
+			questStatusText =
+				spawned
+					and "Quest animal ready; rescanning missions"
+					or "Quest animal spawn retry pending"
+
+			return
+		end
+
+		if #refreshedBefore
+			>= (
+				state.questSlots.maxSlots
+				or 40
+			) then
+
+			state.questSlots.markBlocked(
+				targetAnimal,
+				"no_free_slot"
+			)
+
+			questStatusText =
+				"Skipping "
+				.. targetAnimal
+				.. ": NO FREE SLOT"
+
 			runtimeMessage =
 				"Quest slot creation cancelled at 40/40; recovering previous slot and moving on"
 
-			if previousEntry then
-				spawnSlot(previousEntry, true)
+			if previousEntry
+				and state.alive then
+
+				spawnSlot(
+					previousEntry,
+					true,
+					true
+				)
 			end
 
-			state.autoEat, state.autoDrink = true, true
-			state.questSlots.busy = false
-			questSwitchingAnimal = false
-			state.questForceFastRecheckUntil = tick() + 20
+			state.autoEat = true
+			state.autoDrink = true
+
+			state.questSlotsFinishTransaction(
+				"Quest slot: no free slot; previous animal restored"
+			)
+
 			return
 		end
 
-		local gender = state.newSlotGender or "Male"
-		local invokeOk = pcall(
-			CreateRemote.InvokeServer,
-			CreateRemote,
-			characterName,
-			targetAnimal,
-			gender,
-			"Default"
-		)
+		if not state.alive then
+			state.questSlotsFinishTransaction(
+				nil,
+				false
+			)
+
+			return
+		end
+
+		local gender =
+			state.newSlotGender
+			or "Male"
+
+		local invokeOk =
+			pcall(
+				CreateRemote.InvokeServer,
+				CreateRemote,
+				characterName,
+				targetAnimal,
+				gender,
+				"Default"
+			)
+
+		if not state.alive then
+			state.questSlotsFinishTransaction(
+				nil,
+				false
+			)
+
+			return
+		end
 
 		local created
+
 		if invokeOk then
-			local deadline = tick() + 8
+			local deadline =
+				tick() + 8
+
 			repeat
 				task.wait(0.4)
-				local refreshed = savedCharacters()
-				created = state.questSlots.findExactSlot(
-					refreshed,
-					characterName,
-					targetAnimal
-				)
-			until created or tick() >= deadline
+
+				if not state.alive then
+					break
+				end
+
+				local refreshed =
+					savedCharacters()
+
+				created =
+					state.questSlots.findExactSlot(
+						refreshed,
+						characterName,
+						targetAnimal
+					)
+
+			until created
+				or tick() >= deadline
+		end
+
+		if not state.alive then
+			state.questSlotsFinishTransaction(
+				nil,
+				false
+			)
+
+			return
 		end
 
 		if created then
 			state.questSlots.temp = {
-				characterName = characterName,
-				animalName = targetAnimal,
-				questId = quest and quest.id or nil,
+				characterName =
+					characterName,
+				animalName =
+					targetAnimal,
+				questId =
+					quest
+						and quest.id
+						or nil,
 			}
-			runtimeMessage = "Quest-only slot confirmed: " .. targetAnimal
-			questStatusText = "Created quest slot: " .. targetAnimal
-			spawnSlot(created)
-		else
-			-- If the account does not own the animal, do not leave the player on
-			-- the menu and do not freeze every other quest for 60 seconds.
-			state.questSlots.failedUntil[targetAnimal:lower()] = tick() + 60
-			state.questSlots.markBlocked(targetAnimal, "create_retry")
-			runtimeMessage =
-				"Quest slot unavailable/rejected; previous slot restored and other quests continue"
-			questStatusText =
-				"Skipping unavailable quest animal for now: " .. targetAnimal
 
-			if previousEntry then
-				spawnSlot(previousEntry, true)
+			runtimeMessage =
+				"Quest-only slot confirmed: "
+				.. targetAnimal
+
+			questStatusText =
+				"Created quest slot: "
+				.. targetAnimal
+
+			-- v110:
+			-- DO NOT call normal spawnSlot post-spawn SafeMove here. The quest
+			-- worker should take over immediately after the exact slot appears.
+			local spawned =
+				spawnSlot(
+					created,
+					true,
+					true
+				)
+
+			if not state.alive then
+				state.questSlotsFinishTransaction(
+					nil,
+					false
+				)
+
+				return
 			end
 
-			state.autoEat, state.autoDrink = true, true
-			state.questForceFastRecheckUntil = tick() + 20
-		end
+			state.questSlotsNormalizeControl(
+				player.Character
+			)
 
-		state.questSlots.busy = false
-		questSwitchingAnimal = false
+			state.autoEat = true
+			state.autoDrink = true
+
+			if spawned then
+				questStatusText =
+					"Quest animal ready; rescanning missions"
+
+				state.questSlotsFinishTransaction(
+					"Quest animal ready; resuming quest automation"
+				)
+			else
+				questStatusText =
+					"Created quest slot; spawn retry pending"
+
+				-- Slot exists in SavedCharacters, so the next quest scan can
+				-- switch to it normally instead of trying to CREATE it again.
+				state.questSlotsFinishTransaction(
+					"Quest slot created but spawn was not confirmed; rescanning"
+				)
+			end
+
+		else
+			state.questSlots.failedUntil[
+				targetAnimal:lower()
+			] = tick() + 60
+
+			state.questSlots.markBlocked(
+				targetAnimal,
+				"create_retry"
+			)
+
+			runtimeMessage =
+				"Quest slot unavailable/rejected; previous slot restored and other quests continue"
+
+			questStatusText =
+				"Skipping unavailable quest animal for now: "
+				.. targetAnimal
+
+			if previousEntry
+				and state.alive then
+
+				spawnSlot(
+					previousEntry,
+					true,
+					true
+				)
+			end
+
+			state.autoEat = true
+			state.autoDrink = true
+
+			state.questSlotsFinishTransaction(
+				"Quest slot unavailable; previous animal restored"
+			)
+		end
 	end)
 
 	return true
 end
-
 
 function state.questSlots.hasDeletableTemp(records, targetAnimal)
 	local temp = state.questSlots.temp
@@ -15593,11 +16192,30 @@ local function trySwitchToQuestAnimal(quest, records, resolvedTarget)
 			pcall(ResetRemote.InvokeServer, ResetRemote)
 			task.wait(1.5)
 		end
-		local spawned = spawnSlot(targetSlot, true)
+		local spawned =
+			spawnSlot(
+				targetSlot,
+				true,
+				true
+			)
+
 		questSwitchingAnimal = false
+
+		state.questSlotsNormalizeControl(
+			player.Character
+		)
+
 		if spawned then
-			state.questForceFastRecheckUntil = tick() + 20
-			runtimeMessage = "Quest animal ready; resuming route checks"
+			state.autoEat = true
+			state.autoDrink = true
+			state.questForceFastRecheckUntil =
+				tick() + 25
+
+			questStatusText =
+				"Quest animal ready; rescanning missions"
+
+			runtimeMessage =
+				"Quest animal ready; resuming quest automation"
 		end
 	end)
 	return true
@@ -16453,6 +17071,7 @@ local function updateQuestAutomation()
 
 	if not state.autoQuests then
 		state.questZoneDrinkRelease("zone_inactive")
+		state.questTravelHerbivoreFeed.active = false
 		questTargetZoneName = nil
 		questTravelWanted = false
 		state.questTravelActive = false
@@ -22444,6 +23063,13 @@ task.spawn(function()
 			and questTravelWanted
 			and not state.questSwimActive
 
+		local travelGrassHerbivore =
+			landMove
+				and character
+				and not isCarnivoreCharacter(character)
+				and not isBaboonCharacter(character)
+				and not isGiraffeCharacter(character)
+
 		local buriedNow = character
 			and root
 			and not isDinoLife
@@ -22475,7 +23101,14 @@ task.spawn(function()
 				landMove
 				and not drinkingToFull
 				and not eatingToFull
-				and food > 68
+				and (
+					travelGrassHerbivore
+						and food > 60
+					or (
+						not travelGrassHerbivore
+						and food > 68
+					)
+				)
 				and (
 					water > 75
 					or (
@@ -22821,7 +23454,45 @@ task.spawn(function()
 end)
 
 shared.__uiRootCleanup = function()
+	-- Preserve the user's automation intent for the next execution.
+	shared.__mmbHubResume = {
+		autoQuests =
+			state.autoQuests == true,
+
+		autoClaimQuests =
+			state.autoClaimQuests == true,
+
+		autoEat =
+			state.autoEat == true,
+
+		autoDrink =
+			state.autoDrink == true,
+
+		autoDrinkPreferredMode =
+			state.autoDrinkPreferredMode,
+	}
+
 	state.alive = false
+
+	-- Stop any SafeMove immediately. In-flight quest-slot tasks also check
+	-- state.alive before every Reset/Create/Spawn stage.
+	if state.safeMove then
+		state.safeMove.cancelToken += 1
+	end
+
+	state.questSlots.busy = false
+	questSwitchingAnimal = false
+
+	local cleanupCharacter =
+		player.Character
+
+	if cleanupCharacter then
+		pcall(
+			state.questSlotsNormalizeControl,
+			cleanupCharacter
+		)
+	end
+
 	local cleanupWater = workspace:FindFirstChild("MainWaterPart")
 	if state.drinkTest
 		and state.drinkTest.collisionSnapshot
@@ -22862,6 +23533,46 @@ shared.__uiRootCleanup = function()
 	gui:Destroy()
 	shared.__uiRootCleanup = nil
 end
+task.defer(function()
+	task.wait(0.20)
+
+	if not state.alive then
+		return
+	end
+
+	state.questSlotsNormalizeControl(
+		player.Character
+	)
+
+	if state.autoQuests then
+		state.autoEat = true
+		state.autoDrink = true
+		state.questSeenAny = false
+		state.questEmptyScans = 0
+		state.questForceFastRecheckUntil =
+			tick() + 25
+
+		questStatusText =
+			"Auto Quests resumed after script reload"
+
+		runtimeMessage =
+			"Auto Quests restored; rescanning Daily + Weekly"
+	end
+
+	if renders then
+		for _, key in ipairs({
+			"autoQuests",
+			"autoClaimQuests",
+			"autoEat",
+			"autoDrink",
+		}) do
+			if renders[key] then
+				pcall(renders[key])
+			end
+		end
+	end
+end)
+
 print("Script carregado com sucesso!")
 
 task.spawn(function()
