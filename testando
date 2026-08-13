@@ -10018,6 +10018,18 @@ function state.drinkTestSetTransitPhysics(
 
 	if enabled then
 		if not test.humanoidSnapshot then
+			local freefallEnabled
+			local fallingDownEnabled
+
+			pcall(function()
+				freefallEnabled = humanoid:GetStateEnabled(
+					Enum.HumanoidStateType.Freefall
+				)
+				fallingDownEnabled = humanoid:GetStateEnabled(
+					Enum.HumanoidStateType.FallingDown
+				)
+			end)
+
 			test.humanoidSnapshot = {
 				platformStand =
 					humanoid.PlatformStand,
@@ -10027,10 +10039,20 @@ function state.drinkTestSetTransitPhysics(
 					character:GetAttribute(
 						"MovementDisabled"
 					),
+				freefallEnabled = freefallEnabled,
+				fallingDownEnabled = fallingDownEnabled,
 			}
 		end
 
 		pcall(function()
+			humanoid:SetStateEnabled(
+				Enum.HumanoidStateType.Freefall,
+				false
+			)
+			humanoid:SetStateEnabled(
+				Enum.HumanoidStateType.FallingDown,
+				false
+			)
 			humanoid.PlatformStand = true
 			humanoid.AutoRotate = false
 			humanoid:ChangeState(
@@ -10051,6 +10073,20 @@ function state.drinkTestSetTransitPhysics(
 
 	if snapshot then
 		pcall(function()
+			if snapshot.freefallEnabled ~= nil then
+				humanoid:SetStateEnabled(
+					Enum.HumanoidStateType.Freefall,
+					snapshot.freefallEnabled == true
+				)
+			end
+
+			if snapshot.fallingDownEnabled ~= nil then
+				humanoid:SetStateEnabled(
+					Enum.HumanoidStateType.FallingDown,
+					snapshot.fallingDownEnabled == true
+				)
+			end
+
 			humanoid.PlatformStand =
 				snapshot.platformStand == true
 
@@ -10075,6 +10111,14 @@ function state.drinkTestSetTransitPhysics(
 		end
 	else
 		pcall(function()
+			humanoid:SetStateEnabled(
+				Enum.HumanoidStateType.Freefall,
+				true
+			)
+			humanoid:SetStateEnabled(
+				Enum.HumanoidStateType.FallingDown,
+				true
+			)
 			humanoid.PlatformStand = false
 			humanoid.AutoRotate = true
 			humanoid:ChangeState(
@@ -10155,16 +10199,12 @@ function state.drinkTestSmoothMove(
 		return false, "collision"
 	end
 
-	-- Do NOT use PlatformStand as the movement engine here.
-	-- The old script moved the root itself smoothly each frame.
-	pcall(function()
-		humanoid.PlatformStand = false
-		humanoid.AutoRotate = false
-	end)
-
-	character:SetAttribute(
-		"MovementDisabled",
-		true
+	-- CFrame owns movement; keep Humanoid in Physics so this vertical
+	-- displacement never accumulates Freefall/fall distance.
+	state.drinkTestMaintainTransit(
+		character,
+		root,
+		humanoid
 	)
 
 	if state.questSetW then
@@ -10184,25 +10224,19 @@ function state.drinkTestSmoothMove(
 			- root.Position
 		).Magnitude
 
-	local moveSpeed =
-		math.clamp(
-			state.safeMovementSpeed(
-				character
-			) * 0.55,
-			16,
-			42
+	-- Cross Terrain in a few frames. The previous multi-second descent could
+	-- be interpreted by game-side fall trackers as a real long fall.
+	local transitSpeed =
+		math.max(
+			220,
+			state.safeMovementSpeed(character) * 4
 		)
 
 	local duration =
 		math.clamp(
-			distance
-				/ math.max(
-					moveSpeed,
-					1
-				),
-			0.30,
-			tonumber(maxDuration)
-				or 12
+			distance / transitSpeed,
+			0.08,
+			0.40
 		)
 
 	local startedAt = tick()
@@ -10256,10 +10290,11 @@ function state.drinkTestSmoothMove(
 			true
 		)
 
-		pcall(function()
-			humanoid.PlatformStand = false
-			humanoid.AutoRotate = false
-		end)
+		state.drinkTestMaintainTransit(
+			character,
+			root,
+			humanoid
+		)
 
 		local alpha =
 			math.clamp(
@@ -12128,10 +12163,11 @@ function state.drinkTestHardEject(reason)
 		true
 	)
 
-	pcall(function()
-		humanoid.PlatformStand = false
-		humanoid.AutoRotate = false
-	end)
+	state.drinkTestSetTransitPhysics(
+		character,
+		humanoid,
+		true
+	)
 
 	root.AssemblyLinearVelocity = Vector3.zero
 	root.AssemblyAngularVelocity = Vector3.zero
@@ -12158,6 +12194,12 @@ function state.drinkTestHardEject(reason)
 			state.drinkTestGhostCharacter(
 				character,
 				true
+			)
+
+			state.drinkTestMaintainTransit(
+				character,
+				root,
+				humanoid
 			)
 
 			root.CFrame =
@@ -12196,14 +12238,27 @@ function state.drinkTestHardEject(reason)
 			and surfaceExit.Z
 			or current.Z
 
-	local verticalY =
-		math.max(
-			current.Y + 35,
-			(surfaceY or current.Y) + 28,
-			typeof(surfaceExit) == "Vector3"
-				and surfaceExit.Y + 18
-				or current.Y + 35
+	local standClearance =
+		math.clamp(
+			state.movementRootClearance(character) + 1.25,
+			3.5,
+			11
 		)
+
+	local surfaceBaseY =
+		surfaceY
+			or (
+				typeof(surfaceExit) == "Vector3"
+					and (surfaceExit.Y - standClearance - 2)
+					or nil
+			)
+
+	-- Restore normal physics only when the HRP is already at a real standing
+	-- height. The old +28 exit created its own fall after every underground drink.
+	local verticalY =
+		typeof(surfaceBaseY) == "number"
+			and (surfaceBaseY + standClearance)
+			or (current.Y + standClearance + 8)
 
 	placeAndHold(
 		Vector3.new(
@@ -12226,7 +12281,7 @@ function state.drinkTestHardEject(reason)
 			test.entryPosition
 				+ Vector3.new(
 					0,
-					12,
+					0.75,
 					0
 				)
 
@@ -12254,7 +12309,7 @@ function state.drinkTestHardEject(reason)
 				safe
 					+ Vector3.new(
 						0,
-						18,
+						math.max(1.5, standClearance * 0.35),
 						0
 					),
 				14
@@ -12269,14 +12324,23 @@ function state.drinkTestHardEject(reason)
 	end
 
 	if confirmed then
-		state.drinkTestSetTransitPhysics(
+		-- Restore collision while Physics still owns the Humanoid, then give the
+		-- game a few frames at zero velocity before re-enabling Freefall. This
+		-- prevents the surface transition itself from registering as a landing.
+		state.drinkTestGhostCharacter(
 			character,
-			humanoid,
 			false
 		)
 
-		state.drinkTestGhostCharacter(
+		for _ = 1, 4 do
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			RunService.Heartbeat:Wait()
+		end
+
+		state.drinkTestSetTransitPhysics(
 			character,
+			humanoid,
 			false
 		)
 
@@ -12284,14 +12348,6 @@ function state.drinkTestHardEject(reason)
 			"MovementDisabled",
 			false
 		)
-
-		pcall(function()
-			humanoid.PlatformStand = false
-			humanoid.AutoRotate = true
-			humanoid:ChangeState(
-				Enum.HumanoidStateType.GettingUp
-			)
-		end)
 
 		root.AssemblyLinearVelocity =
 			Vector3.zero
@@ -12602,14 +12658,10 @@ function state.runUndergroundDrinkTest()
 					)
 				end
 
-				pcall(function()
-					humanoid.PlatformStand = false
-					humanoid.AutoRotate = false
-				end)
-
-				character:SetAttribute(
-					"MovementDisabled",
-					true
+				state.drinkTestMaintainTransit(
+					character,
+					root,
+					humanoid
 				)
 
 				-- Underground transit/drinking always stays non-collidable. Do not
@@ -12681,6 +12733,12 @@ function state.runUndergroundDrinkTest()
 					character:SetAttribute(
 						"MovementDisabled",
 						true
+					)
+
+					state.drinkTestMaintainTransit(
+						character,
+						root,
+						humanoid
 					)
 
 					root.AssemblyLinearVelocity =
@@ -14367,24 +14425,16 @@ function state.questSlotsPrepareForCreate()
 		character
 	)
 
-	-- If the player is already on ordinary dry ground, DO NOT move the current
-	-- animal anywhere. Reset/Create can begin immediately.
-	if state.questSlotsCurrentPositionSafe() then
-		return true
-	end
-
-	-- Only unsafe water / buried / void cases require physical recovery.
+	-- Slot-switch point belongs to the OUTGOING animal. Never reset first and
+	-- let the replacement animal perform the staging walk afterward.
 	runtimeMessage =
-		"Quest slot: current position unsafe; moving to slot-switch safety point"
+		"Quest slot: staging current animal before switch"
 
 	if state.moveBeforeSlotChange then
 		return state.moveBeforeSlotChange()
 	end
 
-	return ensureOnSolidGround(
-		getSafeFarmPosition(),
-		"quest slot safety"
-	)
+	return false
 end
 
 function state.questSlotsFinishTransaction(
@@ -15958,7 +16008,15 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 					)
 
 					task.spawn(function()
-						if ResetRemote then
+						if not state.prepareCurrentSlotForSwitch(
+						"MMB group: staging current animal before species switch"
+					) then
+						questSwitchingAnimal = false
+						runtimeMessage = "MMB group switch postponed: staging failed"
+						return
+					end
+
+					if ResetRemote then
 							pcall(
 								ResetRemote.InvokeServer,
 								ResetRemote
@@ -15966,7 +16024,7 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 							task.wait(1.5)
 						end
 
-						spawnSlot(mmbLeader.slot)
+						spawnSlot(mmbLeader.slot, true)
 						questSwitchingAnimal = false
 					end)
 
@@ -16068,14 +16126,22 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 					)
 
 					task.spawn(function()
-						if ResetRemote then
+						if not state.prepareCurrentSlotForSwitch(
+						"Group quest: staging current animal before species switch"
+					) then
+						questSwitchingAnimal = false
+						runtimeMessage = "Group switch postponed: staging failed"
+						return
+					end
+
+					if ResetRemote then
 							pcall(
 								ResetRemote.InvokeServer,
 								ResetRemote
 							)
 							task.wait(1.5)
 						end
-						spawnSlot(best.slot)
+						spawnSlot(best.slot, true)
 						questSwitchingAnimal = false
 					end)
 
@@ -16607,6 +16673,15 @@ function state.questGroup.restoreAFKAfterHelp()
 				"MMB helper complete: restoring AFK Coin animal"
 
 			task.spawn(function()
+				if not state.prepareCurrentSlotForSwitch(
+					"MMB helper: staging current animal before restoring AFK slot"
+				) then
+					questSwitchingAnimal = false
+					coop.helperSwitching = false
+					runtimeMessage = "MMB helper restore postponed: staging failed"
+					return
+				end
+
 				if ResetRemote then
 					pcall(
 						ResetRemote.InvokeServer,
@@ -16615,7 +16690,7 @@ function state.questGroup.restoreAFKAfterHelp()
 					task.wait(1.35)
 				end
 
-				spawnSlot(target)
+				spawnSlot(target, true)
 				task.wait(0.60)
 
 				questSwitchingAnimal = false
@@ -16731,6 +16806,15 @@ function state.questGroup.beginAFKHelp(handler, target)
 	)
 
 	task.spawn(function()
+		if not state.prepareCurrentSlotForSwitch(
+			"MMB helper: staging current animal before helper slot"
+		) then
+			questSwitchingAnimal = false
+			coop.helperSwitching = false
+			runtimeMessage = "MMB helper switch postponed: staging failed"
+			return
+		end
+
 		if ResetRemote then
 			pcall(
 				ResetRemote.InvokeServer,
@@ -16739,7 +16823,7 @@ function state.questGroup.beginAFKHelp(handler, target)
 			task.wait(1.35)
 		end
 
-		spawnSlot(target.slot)
+		spawnSlot(target.slot, true)
 		task.wait(0.75)
 
 		questSwitchingAnimal = false
@@ -17746,6 +17830,16 @@ function state.questSlots.deleteTempForNext(nextAnimal)
 
 		local current = player.Character
 		local currentName = current and current:GetAttribute("CharacterName")
+		if currentName == temp.characterName
+			and not state.prepareCurrentSlotForSwitch(
+				"Quest slot: staging temporary animal before deletion"
+			) then
+			state.questSlotsFinishTransaction(
+				"Temporary quest slot deletion postponed: staging failed"
+			)
+			return
+		end
+
 		if currentName == temp.characterName
 			and ResetRemote then
 
@@ -19618,6 +19712,14 @@ local function trySwitchToQuestAnimal(quest, records, resolvedTarget)
 	state.questTravelActive = false
 	runtimeMessage = "Quest: switching to " .. targetAnimal
 	task.spawn(function()
+		if not state.prepareCurrentSlotForSwitch(
+			"Quest: staging current animal before switching to " .. tostring(targetAnimal)
+		) then
+			questSwitchingAnimal = false
+			runtimeMessage = "Quest switch postponed: staging failed"
+			return
+		end
+
 		if ResetRemote then
 			pcall(ResetRemote.InvokeServer, ResetRemote)
 			task.wait(1.5)
@@ -20128,6 +20230,14 @@ local function trySwitchToGrowingSlot(
 		)
 
 		task.spawn(function()
+			if not state.prepareCurrentSlotForSwitch(
+				"Growth: staging current animal before existing-slot switch"
+			) then
+				questSwitchingAnimal = false
+				runtimeMessage = "Growth switch postponed: staging failed"
+				return
+			end
+
 			if ResetRemote then
 				pcall(ResetRemote.InvokeServer, ResetRemote)
 				task.wait(1.15)
@@ -21103,6 +21213,14 @@ local function updateQuestAutomation()
 					or "Flying animal blocked until Land Distance quests finish"
 
 				task.spawn(function()
+					if not state.prepareCurrentSlotForSwitch(
+						"Run/Growth: staging current animal before grounded-slot switch"
+					) then
+						questSwitchingAnimal = false
+						runtimeMessage = "Grounded-slot switch postponed: staging failed"
+						return
+					end
+
 					if ResetRemote then
 						pcall(ResetRemote.InvokeServer, ResetRemote)
 						task.wait(1.3)
@@ -22341,6 +22459,14 @@ local function createNextSlot()
 	if not CreateRemote or not ResetRemote then return false end
 	local character = player.Character
 	if not character then return false end
+
+	if not state.atSlotSwitchPoint()
+		and not state.prepareCurrentSlotForSwitch(
+			"Growth: staging current animal before creating next slot"
+		) then
+		return false
+	end
+
 	local entry = {
 		CharacterName = uniqueName(),
 		AnimalName = character:GetAttribute("AnimalName") or "Elephant",
@@ -22353,7 +22479,7 @@ local function createNextSlot()
 	local ok = pcall(CreateRemote.InvokeServer, CreateRemote, entry.CharacterName, entry.AnimalName, entry.Gender, entry.Skin)
 	if not ok then return false end
 	task.wait(2)
-	return spawnSlot(entry)
+	return spawnSlot(entry, true)
 end
 
 local growthBusy = false
@@ -22579,6 +22705,18 @@ function state.coinFarmTryPreferredSwitch()
 		.. requestedAnimal
 
 	task.spawn(function()
+		if not state.prepareCurrentSlotForSwitch(
+			"AFK Coin: staging current animal before preferred-slot switch"
+		) then
+			state.coinFarmSwitching = false
+			state.coinFarmSwitchPending = true
+			state.coinFarmRetryAt = tick() + 3
+			state.autoEat = previousAutoEat
+			state.autoDrink = previousAutoDrink
+			runtimeMessage = "AFK Coin switch postponed: staging failed"
+			return
+		end
+
 		if ResetRemote then
 			pcall(ResetRemote.InvokeServer, ResetRemote)
 			task.wait(1.35)
@@ -22586,7 +22724,7 @@ function state.coinFarmTryPreferredSwitch()
 
 		-- Even if Coin Farm/selection changed while the menu was open, always
 		-- finish spawning something so the player is never left slotless.
-		local spawned = spawnSlot(target)
+		local spawned = spawnSlot(target, true)
 
 		state.coinFarmSwitching = false
 
@@ -22849,6 +22987,28 @@ function state.moveBeforeSlotChange()
 	)
 end
 
+function state.prepareCurrentSlotForSwitch(reason)
+	local character, root =
+		characterParts()
+
+	if not character or not root then
+		return false
+	end
+
+	state.releaseMovementNow(character, true)
+	blockClientSubState = false
+
+	if state.atSlotSwitchPoint() then
+		return true
+	end
+
+	runtimeMessage = reason
+		or "Staging current animal before slot switch"
+
+	local moved = state.moveBeforeSlotChange()
+	return moved == true and state.atSlotSwitchPoint()
+end
+
 local function growthStep()
 	if state.questGrowthReset.exclusive then return end
 	if state.farmCoins
@@ -23082,7 +23242,7 @@ local function growthStep()
 				"Grow All Slots switched species to continue every saved slot below 100%"
 		end
 
-		spawnSlot(entry)
+		spawnSlot(entry, true)
 
 	elseif state.growNew then
 		local totalSlots = #savedCharacters()
@@ -23092,7 +23252,7 @@ local function growthStep()
 			state.growExistingAutomaticAll = false
 			state.growAllSlots = false
 			state.farmCoins = true
-			if previousEntry then spawnSlot(previousEntry) end
+			if previousEntry then spawnSlot(previousEntry, true) end
 		else
 			runtimeMessage = "Criando novo slot"
 			createNextSlot()
@@ -23124,7 +23284,7 @@ local function growthStep()
 		end
 
 		if previousEntry then
-			spawnSlot(previousEntry)
+			spawnSlot(previousEntry, true)
 		end
 
 		state.growExisting = false
