@@ -1032,6 +1032,52 @@ local function characterParts()
 		character and character:FindFirstChildOfClass("Humanoid")
 end
 
+-- ============================================================
+-- OXYGEN GUARD
+-- Oxygen is calculated client-side by Savannah Life. Keep the active slot at
+-- 100 without touching Swimming/Growth/DrainTime or globally blocking damage.
+-- The guard is intentionally always-on because its only purpose is slot safety.
+-- ============================================================
+state.oxygenGuardEnabled = true
+state.oxygenGuardLastCorrectionAt = 0
+
+function state.oxygenGuardApply(character)
+	if not state.oxygenGuardEnabled or not character or not character.Parent then
+		return false
+	end
+
+	local oxygen = character:GetAttribute("Oxygen")
+	if type(oxygen) ~= "number" then
+		return false
+	end
+
+	if oxygen < 100 then
+		local ok = pcall(
+			character.SetAttribute,
+			character,
+			"Oxygen",
+			100
+		)
+
+		if ok then
+			state.oxygenGuardLastCorrectionAt = tick()
+			return true
+		end
+	end
+
+	return oxygen >= 100
+end
+
+task.spawn(function()
+	while state.alive do
+		pcall(function()
+			state.oxygenGuardApply(player.Character)
+		end)
+
+		task.wait(0.10)
+	end
+end)
+
 local function setSubState(name)
 	if state.questGrowthReset and state.questGrowthReset.exclusive then
 		return
@@ -11827,10 +11873,12 @@ end)
 table.insert(connections, player.CharacterAdded:Connect(function(character)
 	DAMAGE.cooldownUntil = tick() + 1.5
 	DAMAGE.active = false
+	state.oxygenGuardApply(character)
 	mmbTaskDefer(DAMAGE.bind, character)
 	mmbTaskDefer(function()
 		task.wait(0.35)
 		if character ~= player.Character then return end
+		state.oxygenGuardApply(character)
 		state.releaseMovementNow(character, true)
 		if CROC.isCharacter(character) then
 			state.autoDrinkMode = "surface"
@@ -13143,6 +13191,10 @@ function state.runUndergroundDrinkTest()
 
 	criticalRecoveryActive = true
 	blockClientSubState = false
+
+	-- Start every underground transaction with a full oxygen reserve. The global
+	-- Oxygen Guard keeps it at 100 while the animal remains submerged.
+	state.oxygenGuardApply(character)
 
 	-- Enable before the first Y displacement so FallDamageHandler never records
 	-- the scripted Terrain crossing as a real fall. The same scoped guard also
