@@ -1907,15 +1907,17 @@ function state.heavyWalkPrepare(
 				walk.targetWalkSpeed
 		end
 
-		-- Crocodile's long, low body catches on terrain seams and steep beach
-		-- transitions. Give it only a tiny temporary ground clearance while the
-		-- automation is walking on land; restore the exact original HipHeight
-		-- in heavyWalkStop().
+		-- Crocodile and Hippo have long/heavy low rigs that can catch on
+		-- Terrain seams and steep beach transitions. Give both the same tiny
+		-- temporary ground clearance only while automated land walking is active;
+		-- heavyWalkStop() restores the exact original HipHeight afterward.
 		if walk.originalHipHeight ~= nil then
 			local wantedHipHeight =
 				walk.originalHipHeight
 				+ (
-					CROC.isCharacter(character)
+					state.isCrocOrHippoMovementCharacter(
+						character
+					)
 						and 0.28
 						or 0
 				)
@@ -3114,7 +3116,50 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 
 	local waterBridgeDone = false
 
-	local function mainWaterRouteCrossing(
+	local function exposedTerrainWaterAt(
+		worldPosition
+	)
+		if typeof(worldPosition)
+			~= "Vector3" then
+			return false,
+				nil
+		end
+
+		local params =
+			RaycastParams.new()
+
+		params.FilterType =
+			Enum.RaycastFilterType.Include
+
+		params.FilterDescendantsInstances = {
+			workspace.Terrain,
+		}
+
+		params.IgnoreWater = false
+
+		local hit =
+			workspace:Raycast(
+				worldPosition
+					+ Vector3.new(
+						0,
+						100,
+						0
+					),
+				Vector3.new(
+					0,
+					-220,
+					0
+				),
+				params
+			)
+
+		return hit
+				and hit.Material
+					== Enum.Material.Water,
+			hit
+	end
+
+	local function exposedWaterBridgeAhead(
 		fromPosition,
 		toPosition
 	)
@@ -3141,121 +3186,116 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			return nil
 		end
 
-		local a =
-			waterPart.CFrame:PointToObjectSpace(
+		local flat =
+			Vector3.new(
+				toPosition.X
+					- fromPosition.X,
+				0,
+				toPosition.Z
+					- fromPosition.Z
+			)
+
+		local totalDistance =
+			flat.Magnitude
+
+		if totalDistance < 8 then
+			return nil
+		end
+
+		local direction =
+			flat.Unit
+
+		-- This scanner runs ONLY after the normal look-ahead has already found
+		-- exposed Terrain water. It looks for the first dry bank after that
+		-- water, instead of using MainWaterPart's enormous underground footprint.
+		local scanLimit =
+			math.min(
+				totalDistance,
+				240
+			)
+
+		local step =
+			8
+
+		local enteredWater =
+			false
+
+		local entryWorld
+		local exitWorld
+		local dryAfterWater =
+			0
+
+		local distance =
+			4
+
+		while distance
+			<= scanLimit do
+
+			local probe =
 				fromPosition
-			)
+					+ direction
+						* distance
 
-		local b =
-			waterPart.CFrame:PointToObjectSpace(
-				toPosition
-			)
-
-		local halfX =
-			waterPart.Size.X * 0.5
-
-		local halfZ =
-			waterPart.Size.Z * 0.5
-
-		local insideA =
-			math.abs(a.X) <= halfX
-			and math.abs(a.Z) <= halfZ
-
-		local insideB =
-			math.abs(b.X) <= halfX
-			and math.abs(b.Z) <= halfZ
-
-		-- Water destinations are handled by Auto Drink, never by this bridge.
-		if insideA or insideB then
-			return nil
-		end
-
-		local dx = b.X - a.X
-		local dz = b.Z - a.Z
-		local tEnter = 0
-		local tExit = 1
-
-		local function clipAxis(
-			origin,
-			delta,
-			minimum,
-			maximum
-		)
-			if math.abs(delta) < 0.0001 then
-				return origin >= minimum
-					and origin <= maximum
-			end
-
-			local t1 =
-				(minimum - origin)
-				/ delta
-
-			local t2 =
-				(maximum - origin)
-				/ delta
-
-			if t1 > t2 then
-				t1, t2 = t2, t1
-			end
-
-			tEnter =
-				math.max(
-					tEnter,
-					t1
+			local isWater, hit =
+				exposedTerrainWaterAt(
+					probe
 				)
 
-			tExit =
-				math.min(
-					tExit,
-					t2
-				)
+			if isWater then
+				if not enteredWater then
+					enteredWater = true
+					entryWorld =
+						hit
+						and hit.Position
+						or probe
+				end
 
-			return tEnter <= tExit
+				dryAfterWater =
+					0
+
+			elseif enteredWater
+				and hit
+				and hit.Material
+					~= Enum.Material.Water then
+
+				dryAfterWater += 1
+
+				-- Require two dry samples so a tiny Terrain island/noise does
+				-- not terminate the bridge in the middle of the river.
+				if dryAfterWater >= 2 then
+					exitWorld =
+						hit.Position
+
+					break
+				end
+			end
+
+			distance += step
 		end
 
-		if not clipAxis(
-			a.X,
-			dx,
-			-halfX,
-			halfX
-		) then
-			return nil
-		end
-
-		if not clipAxis(
-			a.Z,
-			dz,
-			-halfZ,
-			halfZ
-		) then
-			return nil
-		end
-
-		if tExit <= 0
-			or tEnter >= 1
-			or tEnter > tExit then
+		if not enteredWater
+			or not entryWorld
+			or not exitWorld then
 
 			return nil
 		end
 
 		local entryLocal =
-			Vector3.new(
-				a.X + dx * tEnter,
-				0,
-				a.Z + dz * tEnter
+			waterPart.CFrame:PointToObjectSpace(
+				entryWorld
 			)
 
 		local exitLocal =
-			Vector3.new(
-				a.X + dx * tExit,
-				0,
-				a.Z + dz * tExit
+			waterPart.CFrame:PointToObjectSpace(
+				exitWorld
 			)
 
 		local entryDistance =
 			Vector2.new(
-				entryLocal.X - a.X,
-				entryLocal.Z - a.Z
+				entryWorld.X
+					- fromPosition.X,
+				entryWorld.Z
+					- fromPosition.Z
 			).Magnitude
 
 		return {
@@ -4057,49 +4097,6 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 
 			local current = root.Position
 
-			if aquaticBankClimber
-				and not waterBridgeDone
-				and purpose ~= "water"
-				and purpose ~= "safety"
-				and not forceVertical
-				and not swimApproach
-				and not rawVerticalTransit then
-
-				local bridge =
-					mainWaterRouteCrossing(
-						current,
-						position
-					)
-
-				if bridge
-					and bridge.entryDistance
-						<= math.max(
-							18,
-							state.movementFootprint(
-								character
-							) + 8
-						) then
-
-					local crossed =
-						runMainWaterElevatedBridge(
-							bridge,
-							maximumSpeed
-						)
-
-					if not crossed then
-						runtimeMessage =
-							"Elevated water crossing failed; land route postponed"
-
-						return false
-					end
-
-					waterBridgeDone = true
-					current = root.Position
-					lastProgressAt = tick()
-					lastDistance = math.huge
-				end
-			end
-
 			local flatDelta = Vector3.new(
 				position.X - current.X,
 				0,
@@ -4121,12 +4118,14 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 
 				runtimeMessage =
 					string.format(
-						"Move To WORLD: %s · %.0f studs restantes",
+						"Move To WORLD: %s · %.0f studs · target %.0f, %.0f",
 						tostring(
 							state.safeMove.manualLabel
 								or "location"
 						),
-						flatDistance
+						flatDistance,
+						position.X,
+						position.Z
 					)
 			end
 
@@ -4552,32 +4551,13 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				local waterAhead = false
 
 				if aquaticBankClimber then
-					-- Croc/Hippo land routes use only the known MainWaterPart
-					-- rectangle here: zero Terrain raycasts and no accidental
-					-- re-entry after the underwater escape.
-					local waterPart =
-						workspace:FindFirstChild(
-							"MainWaterPart"
+					-- IMPORTANT: MainWaterPart is enormous and exists underneath
+					-- dry Terrain. Its X/Z footprint is NOT a valid "water ahead"
+					-- test. Only visible/exposed Terrain Water may alter a land route.
+					waterAhead =
+						exposedTerrainWaterAt(
+							ahead
 						)
-
-					if waterPart
-						and waterPart:IsA(
-							"BasePart"
-						) then
-
-						local localAhead =
-							waterPart.CFrame:PointToObjectSpace(
-								ahead
-							)
-
-						waterAhead =
-							math.abs(
-								localAhead.X
-							) <= waterPart.Size.X * 0.5
-							and math.abs(
-								localAhead.Z
-							) <= waterPart.Size.Z * 0.5
-					end
 				else
 					local terrainProbe =
 						RaycastParams.new()
@@ -4618,18 +4598,61 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					and flatDistance <= 48
 
 				if waterAhead and not mayApproachWater then
-					local angle = math.rad(68 * obstacleSign)
-					local c = math.cos(angle)
-					local s = math.sin(angle)
+					if aquaticBankClimber
+						and not waterBridgeDone then
 
-					desired = Vector3.new(
-						desired.X * c - desired.Z * s,
-						0,
-						desired.X * s + desired.Z * c
-					).Unit
+						local bridge =
+							exposedWaterBridgeAhead(
+								root.Position,
+								position
+							)
 
-					-- Water is a routing problem, not a jump target. Keep steering;
-					-- the generic stall fallback will virtualize Space only if needed.
+						if bridge then
+							local crossed =
+								runMainWaterElevatedBridge(
+									bridge,
+									maximumSpeed
+								)
+
+							if crossed then
+								waterBridgeDone = true
+								lastProgressAt = tick()
+								lastDistance = math.huge
+
+								-- Recalculate the world-space target vector next
+								-- frame from the new position on the far bank.
+								RunService.Heartbeat:Wait()
+								continue
+							end
+						end
+					end
+
+					-- No confirmed far bank: steer around the actually exposed
+					-- water. This branch can no longer fire just because an
+					-- underground MainWaterPart exists under dry land.
+					local angle =
+						math.rad(
+							68 * obstacleSign
+						)
+
+					local c =
+						math.cos(
+							angle
+						)
+
+					local s =
+						math.sin(
+							angle
+						)
+
+					desired =
+						Vector3.new(
+							desired.X * c
+								- desired.Z * s,
+							0,
+							desired.X * s
+								+ desired.Z * c
+						).Unit
 				end
 			end
 
