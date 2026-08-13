@@ -11245,6 +11245,7 @@ state.aquaticRiverEscape =
 		fallDamageConfig = nil,
 		fallDamageConfigOld = nil,
 		bodyVelocity = nil,
+		bodyPosition = nil,
 		bodyGyro = nil,
 		survivalSuspended = false,
 	}
@@ -12103,8 +12104,24 @@ function state.aquaticRiverInfinityFlyExit(
 		end
 	end)
 
+	pcall(function()
+		local old =
+			root:FindFirstChild(
+				"MMB_AquaticFlyPosition"
+			)
+
+		if old then
+			old:Destroy()
+		end
+	end)
+
 	local oldAutoRotate =
 		humanoid.AutoRotate
+
+	local oldMovementDisabled =
+		character:GetAttribute(
+			"MovementDisabled"
+		)
 
 	local oldWaterCollision =
 		waterPart.CanCollide
@@ -12121,18 +12138,19 @@ function state.aquaticRiverInfinityFlyExit(
 			"BodyGyro"
 		)
 
-	local BV =
+	local BP =
 		Instance.new(
-			"BodyVelocity"
+			"BodyPosition"
 		)
 
 	BG.Name =
 		"MMB_AquaticFlyGyro"
 
-	BV.Name =
-		"MMB_AquaticFlyVelocity"
+	BP.Name =
+		"MMB_AquaticFlyPosition"
 
-	-- Infinite Yield plain Fly core.
+	-- Underwater exit needs POSITION ownership, not just velocity.
+	-- BodyPosition is fed a moving world-space setpoint each Heartbeat.
 	BG.P = 9e4
 	BG.MaxTorque =
 		Vector3.new(
@@ -12144,37 +12162,42 @@ function state.aquaticRiverInfinityFlyExit(
 	BG.CFrame =
 		root.CFrame
 
-	BV.MaxForce =
+	BP.P = 26000
+	BP.D = 3200
+	BP.MaxForce =
 		Vector3.new(
-			9e9,
-			9e9,
-			9e9
+			9e8,
+			9e8,
+			9e8
 		)
 
-	BV.Velocity =
-		Vector3.zero
+	BP.Position =
+		root.Position
 
 	BG.Parent =
 		root
 
-	BV.Parent =
+	BP.Parent =
 		root
 
 	fly.bodyGyro = BG
-	fly.bodyVelocity = BV
+	fly.bodyPosition = BP
+	fly.bodyVelocity = nil
 
 	pcall(function()
 		humanoid.PlatformStand = true
 		humanoid.AutoRotate = false
 	end)
 
+	-- CRITICAL: Savannah's SwimmingController must stop issuing its own
+	-- locomotion commands while the positional water-exit controller owns HRP.
 	character:SetAttribute(
 		"MovementDisabled",
-		false
+		true
 	)
 
-	-- Plain `fly` internal movement speed. Not Acceleration / WalkSpeed.
-	local IY_FLY_SPEED = 50
+	-- Maximum rate at which the world-space setpoint advances.
+	local WATER_EXIT_SPEED = 50
 
 	local initialDistance =
 		(target - root.Position).Magnitude
@@ -12183,7 +12206,7 @@ function state.aquaticRiverInfinityFlyExit(
 		tick()
 		+ math.clamp(
 			initialDistance
-				/ IY_FLY_SPEED
+				/ WATER_EXIT_SPEED
 				+ 2.5,
 			3.0,
 			12.0
@@ -12194,6 +12217,12 @@ function state.aquaticRiverInfinityFlyExit(
 
 	local nextDryBankCheckAt =
 		0
+
+	local commandedPosition =
+		root.Position
+
+	local lastHeartbeatAt =
+		tick()
 
 	local callOk, callError =
 		pcall(function()
@@ -12230,27 +12259,57 @@ function state.aquaticRiverInfinityFlyExit(
 				local delta =
 					target - root.Position
 
-				if delta.Magnitude <= 0.20 then
-					BV.Velocity =
-						Vector3.zero
-				else
-					local flySpeed =
+				local nowHeartbeat =
+					tick()
+
+				local dt =
+					math.clamp(
+						nowHeartbeat
+							- lastHeartbeatAt,
+						1 / 120,
+						1 / 20
+					)
+
+				lastHeartbeatAt =
+					nowHeartbeat
+
+				local commandDelta =
+					target
+						- commandedPosition
+
+				if commandDelta.Magnitude > 0.05 then
+					local commandSpeed =
 						math.clamp(
-							delta.Magnitude * 1.65,
-							14,
-							IY_FLY_SPEED
+							commandDelta.Magnitude * 2.0,
+							10,
+							WATER_EXIT_SPEED
 						)
 
-					BV.Velocity =
-						delta.Unit
-						* flySpeed
+					local step =
+						math.min(
+							commandDelta.Magnitude,
+							commandSpeed * dt
+						)
+
+					commandedPosition =
+						commandedPosition
+						+ commandDelta.Unit
+							* step
+				else
+					commandedPosition =
+						target
 				end
+
+				BP.Position =
+					commandedPosition
 
 				local flat =
 					Vector3.new(
-						delta.X,
+						target.X
+							- root.Position.X,
 						0,
-						delta.Z
+						target.Z
+							- root.Position.Z
 					)
 
 				if flat.Magnitude > 0.20 then
@@ -12263,6 +12322,11 @@ function state.aquaticRiverInfinityFlyExit(
 						)
 				end
 
+				-- Kill inherited swimming momentum. Position is controlled by BP.
+				root.AssemblyLinearVelocity =
+					root.AssemblyLinearVelocity
+						* 0.18
+
 				root.AssemblyAngularVelocity =
 					Vector3.zero
 
@@ -12271,11 +12335,11 @@ function state.aquaticRiverInfinityFlyExit(
 						character
 					)
 						and string.format(
-							"Croc water Fly: moving to nearby dry bank (%.0f)",
+							"Croc water position-control -> nearby bank (%.0f)",
 							delta.Magnitude
 						)
 						or string.format(
-							"Hippo water Fly: moving to nearby dry bank (%.0f)",
+							"Hippo water position-control -> nearby bank (%.0f)",
 							delta.Magnitude
 						)
 
@@ -12299,8 +12363,8 @@ function state.aquaticRiverInfinityFlyExit(
 
 	-- UNFLY
 	pcall(function()
-		if BV and BV.Parent then
-			BV:Destroy()
+		if BP and BP.Parent then
+			BP:Destroy()
 		end
 	end)
 
@@ -12310,6 +12374,7 @@ function state.aquaticRiverInfinityFlyExit(
 		end
 	end)
 
+	fly.bodyPosition = nil
 	fly.bodyVelocity = nil
 	fly.bodyGyro = nil
 
@@ -12331,10 +12396,17 @@ function state.aquaticRiverInfinityFlyExit(
 		)
 	end)
 
-	character:SetAttribute(
-		"MovementDisabled",
-		false
-	)
+	if oldMovementDisabled == nil then
+		character:SetAttribute(
+			"MovementDisabled",
+			false
+		)
+	else
+		character:SetAttribute(
+			"MovementDisabled",
+			oldMovementDisabled
+		)
+	end
 
 	-- Restore exactly what the water part had before this Fly.
 	if waterPart and waterPart.Parent then
