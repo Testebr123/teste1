@@ -10421,28 +10421,53 @@ end
 
 function state.aquaticFlyDryGroundReached(
 	character,
-	root
+	root,
+	waterY
 )
-	if not character or not root then
+	if not character
+		or not root
+		or type(waterY) ~= "number" then
 		return false
 	end
 
-	-- Savannah exposes the locomotion state directly on the player's workspace
-	-- model. While MovementState == "Swimming", the animal is still in water.
-	-- This is intentionally the primary test: no water scans or Terrain rays
-	-- are executed every frame anymore.
-	if state.isCharacterSwimmingState(
-		character
-	) then
+	if root.Position.Y < config.dangerY then
 		return false
 	end
 
-	if root.Position.Y
-		< config.dangerY then
+	-- Critical distinction:
+	-- solid Terrain under the animal is NOT enough, because the river bottom
+	-- itself is solid Terrain. We only allow UNFLY after the rig has first
+	-- climbed to approximately the river-surface height.
+	if root.Position.Y < waterY - 0.35 then
 		return false
 	end
 
-	return true
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+	params.IgnoreWater = true
+
+	-- Very short local ray only. This runs at 5 Hz, not every Heartbeat.
+	local hit =
+		workspace:Raycast(
+			root.Position + Vector3.new(0, 1.5, 0),
+			Vector3.new(0, -12, 0),
+			params
+		)
+
+	if not hit
+		or hit.Material == Enum.Material.Water
+		or hit.Normal.Y < 0.10 then
+		return false
+	end
+
+	-- The bank must really be close under the body. A deep riverbed cannot
+	-- satisfy this after the Croc/Hippo has reached surface height.
+	local verticalGap =
+		(root.Position.Y - hit.Position.Y)
+
+	return verticalGap >= -0.5
+		and verticalGap <= 9.5
 end
 
 function state.findAquaticDryTerrainExit(character, root, preferredTarget)
@@ -10617,10 +10642,20 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 
+	local waterY =
+		waterPart
+		and waterPart:IsA("BasePart")
+		and (waterPart.Position.Y + waterPart.Size.Y * 0.5)
+		or nil
+
+	if not waterY then
+		return false
+	end
+
 	if state.aquaticFlyDryGroundReached(
 		character,
 		root,
-		waterPart
+		waterY
 	) then
 		pcall(
 			humanoid.ChangeState,
@@ -10630,11 +10665,23 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 		return true
 	end
 
-	-- Fly is created ONLY while Savannah itself reports Swimming.
-	-- This avoids expensive body/water geometry checks before every retry.
-	if not state.isCharacterSwimmingState(
-		character
-	) then
+	-- MovementState == Swimming is a useful ENTRY signal from Savannah, but
+	-- once recovery begins we do not depend on it: forcing locomotion can make
+	-- the game briefly report Idle even though the Croc/Hippo is still in water.
+	local swimmingAtStart =
+		state.isCharacterSwimmingState(
+			character
+		)
+
+	-- Cheap fallback for a recovery that already disturbed MovementState:
+	-- being materially below the known river surface is enough to permit one
+	-- water-exit attempt. No raycast / water-volume scan is needed here.
+	local belowRiverSurface =
+		root.Position.Y
+			< waterY - 0.75
+
+	if not swimmingAtStart
+		and not belowRiverSurface then
 		return false
 	end
 
@@ -10702,17 +10749,14 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 	fly.bodyVelocity = BV
 
 	pcall(function()
-		humanoid.PlatformStand = true
+		-- Savannah-specific adaptation: PlatformStand=true immediately pushes
+		-- the custom locomotion state toward Idle and causes our recovery to
+		-- self-cancel. Keep the IY BodyVelocity/BodyGyro core without PlatformStand.
+		humanoid.PlatformStand = false
 		humanoid.AutoRotate = false
 	end)
 
 	character:SetAttribute("MovementDisabled", false)
-
-	local waterY =
-		waterPart
-		and waterPart:IsA("BasePart")
-		and (waterPart.Position.Y + waterPart.Size.Y * 0.5)
-		or root.Position.Y
 
 	local clearance = state.movementRootClearance(character)
 
@@ -10758,8 +10802,7 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 		)
 
 	local success = false
-	local nextMovementStateCheckAt = 0
-	local leftSwimmingSince = nil
+	local nextGroundCheckAt = 0
 
 	local callOk, callError =
 		pcall(function()
@@ -10770,33 +10813,21 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 				and humanoid.Health > 0
 				and tick() < deadline do
 
-				-- Do NOT raycast every Heartbeat. Savannah already tells us when
-				-- the rig leaves swimming. Check that lightweight state only at the
-				-- native-ish 0.15 s cadence, and require a tiny debounce so a one-frame
-				-- state flick does not shut Fly off while still in the river.
+				-- Keep Fly itself at Heartbeat cadence, but the only physical
+				-- completion test runs at 5 Hz and is a single 12-stud ray.
 				local now = tick()
 
-				if now >= nextMovementStateCheckAt then
-					nextMovementStateCheckAt =
-						now + 0.15
+				if now >= nextGroundCheckAt then
+					nextGroundCheckAt =
+						now + 0.20
 
 					if state.aquaticFlyDryGroundReached(
 						character,
-						root
+						root,
+						waterY
 					) then
-						leftSwimmingSince =
-							leftSwimmingSince
-							or now
-
-						if now
-							- leftSwimmingSince
-							>= 0.12 then
-							success = true
-							break
-						end
-					else
-						leftSwimmingSince =
-							nil
+						success = true
+						break
 					end
 				end
 
@@ -10954,7 +10985,7 @@ function state.moveAquaticToDryTerrain(character, root, preferredTarget)
 			)
 
 		controller.busy = false
-		controller.retryAt = ok and 0 or tick() + 1.25
+		controller.retryAt = ok and 0 or tick() + 3.0
 		return ok
 	end
 
@@ -13022,9 +13053,32 @@ function state.noIdleWaterSafetyStep()
 	if state.isCrocOrHippoMovementCharacter(
 		character
 	) then
-		if not state.isCharacterSwimmingState(
-			character
-		) then
+		local swimming =
+			state.isCharacterSwimmingState(
+				character
+			)
+
+		local waterPart =
+			workspace:FindFirstChild(
+				"MainWaterPart"
+			)
+
+		local riverY =
+			waterPart
+			and waterPart:IsA("BasePart")
+			and (
+				waterPart.Position.Y
+				+ waterPart.Size.Y * 0.5
+			)
+			or nil
+
+		local belowRiver =
+			riverY
+			and root.Position.Y
+				< riverY - 0.75
+
+		if not swimming
+			and not belowRiver then
 			return
 		end
 	elseif not state.isBodyActuallyInWater(
