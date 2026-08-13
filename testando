@@ -10357,9 +10357,12 @@ function state.drinkTestSetTransitPhysics(
 	end
 
 	if enabled then
+		local root = character:FindFirstChild("HumanoidRootPart")
+
 		if not test.humanoidSnapshot then
 			local freefallEnabled
 			local fallingDownEnabled
+			local ragdollEnabled
 
 			pcall(function()
 				freefallEnabled = humanoid:GetStateEnabled(
@@ -10368,22 +10371,28 @@ function state.drinkTestSetTransitPhysics(
 				fallingDownEnabled = humanoid:GetStateEnabled(
 					Enum.HumanoidStateType.FallingDown
 				)
+				ragdollEnabled = humanoid:GetStateEnabled(
+					Enum.HumanoidStateType.Ragdoll
+				)
 			end)
 
 			test.humanoidSnapshot = {
-				platformStand =
-					humanoid.PlatformStand,
-				autoRotate =
-					humanoid.AutoRotate,
-				movementDisabled =
-					character:GetAttribute(
-						"MovementDisabled"
-					),
+				platformStand = humanoid.PlatformStand,
+				autoRotate = humanoid.AutoRotate,
+				sit = humanoid.Sit,
+				movementDisabled = character:GetAttribute(
+					"MovementDisabled"
+				),
 				freefallEnabled = freefallEnabled,
 				fallingDownEnabled = fallingDownEnabled,
+				ragdollEnabled = ragdollEnabled,
+				rootAnchored = root and root.Anchored or false,
 			}
 		end
 
+		-- Underground Drink must NEVER use Physics/PlatformStand as a movement
+		-- mode. Physics is visually a ragdoll on Savannah custom rigs. Instead we
+		-- freeze the root assembly and move the complete model only with PivotTo.
 		pcall(function()
 			humanoid:SetStateEnabled(
 				Enum.HumanoidStateType.Freefall,
@@ -10393,15 +10402,33 @@ function state.drinkTestSetTransitPhysics(
 				Enum.HumanoidStateType.FallingDown,
 				false
 			)
-			-- Keep the rig upright. PlatformStand=true makes large Savannah rigs
-			-- (especially Elephant) fold/compress against Terrain before the root
-			-- can cross it. Physics + disabled Freefall/FallingDown is sufficient.
-			humanoid.PlatformStand = false
-			humanoid.AutoRotate = false
-			humanoid:ChangeState(
-				Enum.HumanoidStateType.Physics
+			humanoid:SetStateEnabled(
+				Enum.HumanoidStateType.Ragdoll,
+				false
 			)
+			humanoid.PlatformStand = false
+			humanoid.Sit = false
+			humanoid.AutoRotate = false
+
+			local currentState = humanoid:GetState()
+			if currentState == Enum.HumanoidStateType.Physics
+				or currentState == Enum.HumanoidStateType.Ragdoll
+				or currentState == Enum.HumanoidStateType.FallingDown
+				or currentState == Enum.HumanoidStateType.Freefall then
+
+				humanoid:ChangeState(
+					Enum.HumanoidStateType.GettingUp
+				)
+			end
 		end)
+
+		if root then
+			pcall(function()
+				root.Anchored = true
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+			end)
+		end
 
 		character:SetAttribute(
 			"MovementDisabled",
@@ -10415,6 +10442,18 @@ function state.drinkTestSetTransitPhysics(
 		test.humanoidSnapshot
 
 	if snapshot then
+		local root = character:FindFirstChild("HumanoidRootPart")
+
+		-- Restore anchoring only after the controlled surface exit has completed.
+		-- This avoids one physics frame in which the animal could fall/ragdoll.
+		if root then
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+				root.Anchored = snapshot.rootAnchored == true
+			end)
+		end
+
 		pcall(function()
 			if snapshot.freefallEnabled ~= nil then
 				humanoid:SetStateEnabled(
@@ -10430,12 +10469,16 @@ function state.drinkTestSetTransitPhysics(
 				)
 			end
 
-			humanoid.PlatformStand =
-				snapshot.platformStand == true
+			if snapshot.ragdollEnabled ~= nil then
+				humanoid:SetStateEnabled(
+					Enum.HumanoidStateType.Ragdoll,
+					snapshot.ragdollEnabled == true
+				)
+			end
 
-			humanoid.AutoRotate =
-				snapshot.autoRotate ~= false
-
+			humanoid.PlatformStand = snapshot.platformStand == true
+			humanoid.Sit = snapshot.sit == true
+			humanoid.AutoRotate = snapshot.autoRotate ~= false
 			humanoid:ChangeState(
 				Enum.HumanoidStateType.GettingUp
 			)
@@ -10453,6 +10496,15 @@ function state.drinkTestSetTransitPhysics(
 			)
 		end
 	else
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if root then
+			pcall(function()
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+				root.Anchored = false
+			end)
+		end
+
 		pcall(function()
 			humanoid:SetStateEnabled(
 				Enum.HumanoidStateType.Freefall,
@@ -10462,7 +10514,12 @@ function state.drinkTestSetTransitPhysics(
 				Enum.HumanoidStateType.FallingDown,
 				true
 			)
+			humanoid:SetStateEnabled(
+				Enum.HumanoidStateType.Ragdoll,
+				true
+			)
 			humanoid.PlatformStand = false
+			humanoid.Sit = false
 			humanoid.AutoRotate = true
 			humanoid:ChangeState(
 				Enum.HumanoidStateType.GettingUp
@@ -10505,8 +10562,26 @@ function state.drinkTestMaintainTransit(
 		true
 	)
 
-	root.AssemblyAngularVelocity =
-		Vector3.zero
+	-- Reassert a rigid, upright underground hold. No Physics state, no
+	-- PlatformStand and no velocity are allowed to accumulate between frames.
+	pcall(function()
+		root.Anchored = true
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		humanoid.PlatformStand = false
+		humanoid.Sit = false
+
+		local currentState = humanoid:GetState()
+		if currentState == Enum.HumanoidStateType.Physics
+			or currentState == Enum.HumanoidStateType.Ragdoll
+			or currentState == Enum.HumanoidStateType.FallingDown
+			or currentState == Enum.HumanoidStateType.Freefall then
+
+			humanoid:ChangeState(
+				Enum.HumanoidStateType.GettingUp
+			)
+		end
+	end)
 
 	return true
 end
@@ -12942,8 +13017,8 @@ function state.runUndergroundDrinkTest()
 					)
 				end
 
-				-- v100: same smooth movement style as the uploaded old script.
-				-- No SafeMove/velocity is used to cross Terrain anymore.
+				-- Underground crossing uses rigid PivotTo translation with the root anchored.
+				-- No SafeMove, Freefall, Physics state or ragdoll is used.
 				local descended, descentMoveReason =
 					state.drinkTestSmoothMove(
 						spot.stand,
@@ -13041,6 +13116,54 @@ function state.runUndergroundDrinkTest()
 					root,
 					humanoid
 				)
+
+				-- Lock one exact underground pose for the whole drinking transaction.
+				-- The remote does not require physical animation, so there is no reason
+				-- to let the animal tumble, slide or rotate below Terrain.
+				local flatLook = Vector3.new(
+					root.CFrame.LookVector.X,
+					0,
+					root.CFrame.LookVector.Z
+				)
+
+				if flatLook.Magnitude < 0.05 then
+					flatLook = Vector3.new(0, 0, -1)
+				else
+					flatLook = flatLook.Unit
+				end
+
+				local rigidRootCFrame = CFrame.lookAt(
+					spot.stand,
+					spot.stand + flatLook,
+					Vector3.yAxis
+				)
+
+				local rigidRootToPivot
+				pcall(function()
+					rigidRootToPivot = root.CFrame:ToObjectSpace(
+						character:GetPivot()
+					)
+				end)
+
+				if rigidRootToPivot then
+					pcall(function()
+						character:PivotTo(
+							rigidRootCFrame * rigidRootToPivot
+						)
+					end)
+				else
+					pcall(function()
+						root.CFrame = rigidRootCFrame
+					end)
+				end
+
+				root.AssemblyLinearVelocity = Vector3.zero
+				root.AssemblyAngularVelocity = Vector3.zero
+
+				local rigidPivotCFrame
+				pcall(function()
+					rigidPivotCFrame = character:GetPivot()
+				end)
 
 				-- Underground transit/drinking always stays non-collidable. Do not
 				-- re-enable MainWaterPart collision while the animal is below Terrain.
@@ -13176,15 +13299,20 @@ function state.runUndergroundDrinkTest()
 						)
 					end
 
-					if state.drinkIsUpsideDown(
-						root
-					) then
-						state.drinkUprightCharacter(
-							character,
-							root,
-							spot.water
-						)
+					-- Hard pin: while Drinking is active below Terrain the model stays in
+					-- exactly one pose. Do not use upright impulses or any physics movement.
+					if rigidPivotCFrame then
+						pcall(function()
+							character:PivotTo(rigidPivotCFrame)
+						end)
+					elseif rigidRootCFrame then
+						pcall(function()
+							root.CFrame = rigidRootCFrame
+						end)
 					end
+
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
 
 					if water
 						> lastWater + 0.01 then
