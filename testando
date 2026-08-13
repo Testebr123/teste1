@@ -8462,7 +8462,11 @@ function state.faceCarcass(root, carcassRoot)
 	end)
 end
 
-local function approachCarcass(carcassRoot, distance)
+local function approachCarcass(
+	carcassRoot,
+	distance,
+	passiveScavenge
+)
 	local character, root = characterParts()
 	if not character or not root then return false end
 	local approachDirection = Vector3.new(root.Position.X - carcassRoot.Position.X, 0, root.Position.Z - carcassRoot.Position.Z)
@@ -8485,6 +8489,28 @@ local function approachCarcass(carcassRoot, distance)
 			speedScale = 1,
 			constantSpeed = true,
 			maxDuration = 220,
+
+			routeCheckInterval =
+				passiveScavenge
+					and 0.20
+					or nil,
+
+			routeCheck =
+				passiveScavenge
+					and function(
+						liveCharacter
+					)
+						if not state.carnivorePassiveScavengeAllowed(
+							liveCharacter
+						) then
+
+							return true,
+								"priority"
+						end
+
+						return false
+					end
+					or nil,
 		}
 	)
 
@@ -8496,7 +8522,11 @@ local function approachCarcass(carcassRoot, distance)
 	return moved
 end
 
-local function eatCarcass(carcass, carcassRoot)
+local function eatCarcass(
+	carcass,
+	carcassRoot,
+	passiveScavenge
+)
 	if state.questGrowthReset.exclusive then return end
 	if carcassEatBusy or not carcass or not carcassRoot then return end
 	local character, root, humanoid = characterParts()
@@ -8532,7 +8562,20 @@ local function eatCarcass(carcass, carcassRoot)
 			attempt
 		)
 
-		approachCarcass(carcassRoot, standDistance)
+		approachCarcass(
+			carcassRoot,
+			standDistance,
+			passiveScavenge
+		)
+
+		if passiveScavenge
+			and not state.carnivorePassiveScavengeAllowed(
+				character
+			) then
+
+			break
+		end
+
 		task.wait(0.18)
 	end
 
@@ -8619,6 +8662,17 @@ local function eatCarcass(carcass, carcassRoot)
 			break
 		end
 
+		if passiveScavenge
+			and not state.carnivorePassiveScavengeAllowed(
+				character
+			) then
+
+			runtimeMessage =
+				"Passive carcass patrol yielded to Reset Spawn / Zone / priority"
+
+			break
+		end
+
 		-- Caiu na água durante o ciclo (ex: maré/correnteza): aborta e ignora.
 		if humanoid:GetState() == Enum.HumanoidStateType.Swimming then
 			runtimeMessage = "Carcaça na água; ignorando e procurando outra"
@@ -8642,13 +8696,24 @@ local function eatCarcass(carcass, carcassRoot)
 			foodEverRose = true
 			deadline = tick() + 4 -- ainda subindo, estende o prazo
 		end
-		local targetFood = (
-			state.autoQuests
-			and (state.questCarnivoreFeeding or state.questBaboonFeeding)
-			and not preSwitchFoodTarget
-		)
-			and 100
-			or (preSwitchFoodTarget or 92)
+		local targetFood =
+			passiveScavenge
+				and 100
+				or (
+					(
+						state.autoQuests
+						and (
+							state.questCarnivoreFeeding
+								or state.questBaboonFeeding
+						)
+						and not preSwitchFoodTarget
+					)
+						and 100
+						or (
+							preSwitchFoodTarget
+								or 92
+						)
+				)
 		if curFood >= targetFood then break end
 
 		root.AssemblyLinearVelocity = Vector3.new(
@@ -8670,7 +8735,11 @@ local function eatCarcass(carcass, carcassRoot)
 			runtimeMessage =
 				"Carcass moved; re-approaching"
 
-			approachCarcass(carcassRoot, 1.5)
+			approachCarcass(
+				carcassRoot,
+				1.5,
+				passiveScavenge
+			)
 			task.wait(0.15)
 
 			character, root, humanoid = characterParts()
@@ -8780,8 +8849,24 @@ function state.carcassOnSearchRoute(root, destination)
 	return carcass, carcassRoot
 end
 
-function state.carnivoreSearchFoodTarget(character)
-	if not character then return 92 end
+function state.carnivoreSearchFoodTarget(
+	character,
+	passiveSearch
+)
+	if not character then
+		return 92
+	end
+
+	if passiveSearch
+		and state.carnivorePassiveScavengeAllowed
+		and state.carnivorePassiveScavengeAllowed(
+			character
+		) then
+
+		-- Food caps at 100. 100.5 intentionally means "do not stop the patrol
+		-- merely because Food is full".
+		return 100.5
+	end
 
 	if state.autoQuests
 		and state.questCarnivoreFeeding
@@ -8792,7 +8877,10 @@ function state.carnivoreSearchFoodTarget(character)
 	return preSwitchFoodTarget or 92
 end
 
-function state.moveToCarcassSearchSpawn(destination)
+function state.moveToCarcassSearchSpawn(
+	destination,
+	passiveSearch
+)
 	if not destination
 		or not destination.Parent
 		or typeof(destination.Position) ~= "Vector3" then
@@ -8814,6 +8902,18 @@ function state.moveToCarcassSearchSpawn(destination)
 
 		local character, root =
 			characterParts()
+
+		if passiveSearch
+			and (
+				not state.carnivorePassiveScavengeAllowed
+				or not state.carnivorePassiveScavengeAllowed(
+					character
+				)
+			) then
+
+			return false,
+				"priority"
+		end
 
 		if not character or not root then
 			return false, "no_character"
@@ -8847,7 +8947,8 @@ function state.moveToCarcassSearchSpawn(destination)
 
 		local targetFood =
 			state.carnivoreSearchFoodTarget(
-				character
+				character,
+				passiveSearch
 			)
 
 		if food >= targetFood then
@@ -8881,7 +8982,8 @@ function state.moveToCarcassSearchSpawn(destination)
 
 			eatCarcass(
 				immediateCarcass,
-				immediateRoot
+				immediateRoot,
+				passiveSearch
 			)
 
 			task.wait(0.10)
@@ -8932,6 +9034,18 @@ function state.moveToCarcassSearchSpawn(destination)
 							return true, "interrupted"
 						end
 
+						if passiveSearch
+							and (
+								not state.carnivorePassiveScavengeAllowed
+									or not state.carnivorePassiveScavengeAllowed(
+										liveCharacter
+									)
+							) then
+
+							return true,
+								"priority"
+						end
+
 						local liveWater =
 							tonumber(
 								liveCharacter:GetAttribute(
@@ -8953,7 +9067,8 @@ function state.moveToCarcassSearchSpawn(destination)
 
 						if liveFood >=
 							state.carnivoreSearchFoodTarget(
-								liveCharacter
+								liveCharacter,
+								passiveSearch
 							) then
 
 							return true, "fed"
@@ -9075,7 +9190,8 @@ function state.moveToCarcassSearchSpawn(destination)
 
 			eatCarcass(
 				interrupt.carcass,
-				interrupt.root
+				interrupt.root,
+				passiveSearch
 			)
 
 			task.wait(0.10)
@@ -9096,6 +9212,8 @@ function state.moveToCarcassSearchSpawn(destination)
 			return false, "water_priority"
 		elseif interruptReason == "destination_gone" then
 			return false, "destination_gone"
+		elseif interruptReason == "priority" then
+			return false, "priority"
 		elseif interruptReason == "interrupted" then
 			return false, "interrupted"
 		end
@@ -9167,6 +9285,78 @@ local savannahCarcassSpawnIndex = 0
 local savannahCarcassCurrentSpawn
 local SAVANNAH_CARCASS_SPAWN_WAIT = 15
 
+function state.carnivorePassiveScavengeAllowed(
+	character
+)
+	if not character
+		or not state.autoEat
+		or not isCarnivoreCharacter(
+			character
+		) then
+
+		return false
+	end
+
+	-- Reset Spawn / slot switching always wins.
+	if state.questGrowthReset.exclusive
+		or (
+			state.questGrowthReset
+			and state.questGrowthReset.stagingBusy
+		)
+		or criticalRecoveryActive
+		or DAMAGE.active
+		or (
+			state.questSlots
+			and state.questSlots.busy
+		)
+		or preSwitchFoodTarget ~= nil
+		or (
+			state.slotGuardian
+			and state.slotGuardian.recovering
+		) then
+
+		return false
+	end
+
+	-- Never abandon/provoke a ZoneTime / Survive in Zone route just to hunt.
+	-- If Food later becomes genuinely low, the existing zone survival policy
+	-- is still allowed to feed at <=70%.
+	if state.questZonePriorityActive()
+		or (
+			state.questZoneDrinkOverride
+			and state.questZoneDrinkOverride.active
+		) then
+
+		return false
+	end
+
+	-- Explicit movement owned by the player or a higher priority controller
+	-- must not be stolen by background scavenging.
+	if state.safeMove
+		and state.safeMove.active then
+
+		local reason =
+			state.safeMove.reason
+
+		if reason == "safety"
+			or reason == "growth_home"
+			or reason == "quest"
+			or reason == "manual"
+			or reason == "water" then
+
+			return false
+		end
+	end
+
+	if state.aquaticRiverEscape
+		and state.aquaticRiverEscape.survivalSuspended then
+
+		return false
+	end
+
+	return true
+end
+
 local function resetEatingSearch(food)
 	eatingSourcePosition = nil
 	eatingTargetReachedAt = nil
@@ -9181,12 +9371,36 @@ end
 -- Savannah: quando um carnivoro nao encontra carcaca, percorre em ordem
 -- exatamente os mesmos spawns exibidos na aba Move. Fica 15s em cada
 -- ponto para dar tempo do mapa/carcacas carregarem antes de ir ao proximo.
-local function exploreSavannahCarcassSpawns()
+local function exploreSavannahCarcassSpawns(
+	passiveSearch
+)
 	if not isSavannahLife then return false end
 	if tick() < nextCarnivoreExploreCheck then
-		local remaining = math.max(0, math.ceil(nextCarnivoreExploreCheck - tick()))
-		local spawnName = savannahCarcassCurrentSpawn and savannahCarcassCurrentSpawn.Name or "spawn"
-		runtimeMessage = string.format("Procurando carcaca em %s (%ds)", spawnName, remaining)
+		local remaining =
+			math.max(
+				0,
+				nextCarnivoreExploreCheck - tick()
+			)
+
+		local spawnName =
+			savannahCarcassCurrentSpawn
+				and savannahCarcassCurrentSpawn.Name
+				or "spawn"
+
+		runtimeMessage =
+			passiveSearch
+				and string.format(
+					"Passive carcass patrol: scanning %s",
+					spawnName
+				)
+				or string.format(
+					"Procurando carcaca em %s (%ds)",
+					spawnName,
+					math.ceil(
+						remaining
+					)
+				)
+
 		return true
 	end
 
@@ -9217,25 +9431,43 @@ local function exploreSavannahCarcassSpawns()
 
 	local moved, reason =
 		state.moveToCarcassSearchSpawn(
-			destination
+			destination,
+			passiveSearch
 		)
 
 	if moved then
-		if reason == "fed" then
+		if passiveSearch then
+			runtimeMessage =
+				"Passive carcass patrol: moving to next spawn"
+
+			nextCarnivoreExploreCheck =
+				tick() + 0.35
+
+		elseif reason == "fed" then
 			runtimeMessage =
 				"Carnivore fed on route; spawn search paused"
-			nextCarnivoreExploreCheck = 0
+
+			nextCarnivoreExploreCheck =
+				0
 		else
 			runtimeMessage =
 				"Procurando carcaca em "
 				.. destination.Name
 				.. " (15s)"
+
 			nextCarnivoreExploreCheck =
 				tick()
 				+ SAVANNAH_CARCASS_SPAWN_WAIT
 		end
 	else
-		if reason == "water_priority" then
+		if reason == "priority" then
+			nextCarnivoreExploreCheck =
+				0
+
+			runtimeMessage =
+				"Passive carcass patrol paused for Reset Spawn / Zone / priority"
+
+		elseif reason == "water_priority" then
 			local character =
 				player.Character
 
@@ -9561,21 +9793,28 @@ function state.questMovementOpportunisticInteract(
 	if not data
 		or not character
 		or not root
-		or not state.autoQuests
-		or not state.questMotionMoving
-		or state.questMotionMode ~= "Land"
 		or state.questGrowthReset.exclusive
-		or state.busy
+		or (
+			state.questGrowthReset
+			and state.questGrowthReset.stagingBusy
+		)
 		or criticalRecoveryActive
 		or DAMAGE.active
-		or eatingToFull
-		or drinkingToFull
-		or carcassEatBusy
-		or BABOON.busy
-		or GIRAFFE.busy then
+		or (
+			state.aquaticRiverEscape
+			and state.aquaticRiverEscape.survivalSuspended
+		) then
 
 		return nil
 	end
+
+	-- Water opportunism is GLOBAL: SafeMove, Move To, Auto Run, carcass routes
+	-- and ordinary automated walking may all drink while physically passing
+	-- usable water. Grass keeps the old Quest/Auto Run-only behavior below.
+	local questLandMovement =
+		state.autoQuests
+		and state.questMotionMoving
+		and state.questMotionMode == "Land"
 
 	if data.character ~= character then
 		data.character = character
@@ -9598,13 +9837,21 @@ function state.questMovementOpportunisticInteract(
 			velocity.Z
 		).Magnitude
 
-	if planarSpeed < 2 then
+	local automatedMovementActive =
+		planarSpeed >= 0.60
+		or (
+			state.safeMove
+			and state.safeMove.active
+		)
+		or state.questMotionMoving
+
+	if not automatedMovementActive then
 		return nil
 	end
 
 	local now = tick()
 
-	if now - (data.lastCheckAt or 0) < 0.08 then
+	if now - (data.lastCheckAt or 0) < 0.06 then
 		if now < (data.grassGraceUntil or 0) then
 			return "eat_grace"
 		end
@@ -9695,6 +9942,7 @@ function state.questMovementOpportunisticInteract(
 
 	-- Grass is opportunistic only: never search, steer, rotate or stop for it.
 	if detected == "Eat"
+		and questLandMovement
 		and herbivore
 		and not isGiraffeCharacter(character)
 		and state.autoEat
@@ -9719,27 +9967,29 @@ function state.questMovementOpportunisticInteract(
 		return "eat"
 	end
 
-	-- Water works the same way for herbivores/carnivores: use only water that
-	-- is already under/next to the running animal. Never create a water route.
+	-- GLOBAL opportunistic water:
+	-- if the GAME already says Drink is available while the animal is moving,
+	-- use the remote immediately. Never create/cancel a route and never rotate,
+	-- stop or refine shoreline position here.
 	if detected == "Drink"
-		and (herbivore or carnivore)
 		and state.autoDrink
-		and water < 99 then
+		and water < 99.5 then
 
 		data.drinkGraceUntil =
-			now + 1.50
+			now + 1.65
 
-		-- E is only cosmetic here too. Keep the physical Auto Run untouched and
-		-- request Drinking directly from the server while water is underfoot.
 		if now
 			- (data.lastDrinkRemoteAt or 0)
-			>= 0.55 then
+			>= 0.45 then
 
 			data.lastDrinkRemoteAt = now
-			setSubState("Drinking")
+
+			setSubState(
+				"Drinking"
+			)
 
 			runtimeMessage =
-				"Auto Run: drinking by remote while moving"
+				"Opportunistic Drink: drinking by remote while moving"
 		end
 
 		return "drink"
@@ -10507,7 +10757,12 @@ local function virtualEatKick()
 		activeCarcass = nil -- força procurar carcaça de novo, pode ter sido consumida/sumido
 		local carcass, carcassRoot = nearestCarcass(root)
 		if carcass and carcassRoot and not carcassEatBusy then
-			task.spawn(eatCarcass, carcass, carcassRoot)
+			task.spawn(
+				eatCarcass,
+				carcass,
+				carcassRoot,
+				passiveCarnivoreScavenge
+			)
 		elseif not carcass then
 			runtimeMessage = "Comer sumiu (carnivoro); nenhuma carcaça encontrada por perto"
 		end
@@ -10802,6 +11057,12 @@ local function autoEatStep()
 	local baboon = not giraffe and isBaboonCharacter(character)
 	local carnivore = not giraffe and not baboon and isCarnivoreCharacter(character)
 
+	local passiveCarnivoreScavenge =
+		carnivore
+		and state.carnivorePassiveScavengeAllowed(
+			character
+		)
+
 	-- v108:
 	-- The "wait until <=70%, then feed to 100%" policy exists ONLY while an
 	-- actual Survive in Zone / ZoneTime cycle is being protected.
@@ -10955,14 +11216,21 @@ local function autoEatStep()
 	end
 
 	local foodCap =
-		(questCarnivore or questBaboon or questGiraffe)
+		passiveCarnivoreScavenge
 			and 100
 			or (
-				travelHerbivoreFeeding
-					and state.questTravelHerbivoreFeed.active
-					and 85
+				(questCarnivore or questBaboon or questGiraffe)
+					and 100
+					or (
+						travelHerbivoreFeeding
+							and state.questTravelHerbivoreFeed.active
+							and 85
+					)
+					or (
+						preSwitchFoodTarget
+							or 92
+					)
 			)
-			or (preSwitchFoodTarget or 92)
 
 	if food < foodCap then
 		if not state.survivalArbiterAcquire(
@@ -10976,13 +11244,27 @@ local function autoEatStep()
 	end
 
 	if food >= foodCap then
-		local wasEating = eatingToFull
-		eatingToFull = false
-		state.survivalArbiterNoteProgress("food", food)
-		state.survivalArbiterComplete("food")
-		resetEatingSearch(food)
-		activeCarcass = nil
-		eatingStuckSince = nil
+		local wasEating =
+			eatingToFull
+
+		eatingToFull =
+			false
+
+		state.survivalArbiterNoteProgress(
+			"food",
+			food
+		)
+
+		state.survivalArbiterComplete(
+			"food"
+		)
+
+		resetEatingSearch(
+			food
+		)
+
+		eatingStuckSince =
+			nil
 
 		if state.questTravelHerbivoreFeed
 			and state.questTravelHerbivoreFeed.active
@@ -10995,13 +11277,25 @@ local function autoEatStep()
 				"Auto Run food break complete; resuming TravelDistance"
 		end
 
-		if wasEating and state.autoQuests then
-			state.questForceFastRecheckUntil = tick() + 12
+		if wasEating
+			and state.autoQuests
+			and not passiveCarnivoreScavenge then
+
+			state.questForceFastRecheckUntil =
+				tick() + 12
+
 			runtimeMessage =
 				"Food stable; resuming quest controller"
 		end
 
-		return
+		if not passiveCarnivoreScavenge then
+			activeCarcass =
+				nil
+
+			return
+		end
+
+		-- Full carnivore intentionally falls through into the carcass controller.
 	end
 
 	local availableFood = detectAvailableFood(character)
@@ -11064,22 +11358,58 @@ local function autoEatStep()
 			)
 	end
 
-	if not eatingToFull then
-		state.questRememberZoneBeforeFeeding("feeding")
-	end
-	eatingToFull = true
+	local passiveOnly =
+		passiveCarnivoreScavenge
+		and food >= foodCap
 
-	if lastEatWatchdogFood == nil or food > lastEatWatchdogFood then
-		lastEatWatchdogFood = food
-		eatingStuckSince = tick()
-	elseif not eatingStuckSince then
-		eatingStuckSince = tick()
-	end
-	if eatingStuckSince and tick() - eatingStuckSince >= 15 then
-		lastEatWatchdogFood = food
-		eatingStuckSince = tick()
-		virtualEatKick()
-		return
+	if not passiveOnly then
+		if not eatingToFull then
+			state.questRememberZoneBeforeFeeding(
+				"feeding"
+			)
+		end
+
+		eatingToFull =
+			true
+
+		if lastEatWatchdogFood == nil
+			or food > lastEatWatchdogFood then
+
+			lastEatWatchdogFood =
+				food
+
+			eatingStuckSince =
+				tick()
+
+		elseif not eatingStuckSince then
+			eatingStuckSince =
+				tick()
+		end
+
+		if eatingStuckSince
+			and tick()
+				- eatingStuckSince
+				>= 15 then
+
+			lastEatWatchdogFood =
+				food
+
+			eatingStuckSince =
+				tick()
+
+			virtualEatKick()
+			return
+		end
+	else
+		-- Full Food patrol is movement/search only; it does not own Survival.
+		eatingToFull =
+			false
+
+		eatingStuckSince =
+			nil
+
+		lastEatWatchdogFood =
+			food
 	end
 
 	if giraffe then
@@ -11140,7 +11470,9 @@ local function autoEatStep()
 				or "Carnivoro sem carcaça por perto"
 
 			if isSavannahLife then
-				exploreSavannahCarcassSpawns()
+				exploreSavannahCarcassSpawns(
+					passiveCarnivoreScavenge
+				)
 			elseif tick() >= nextCarnivoreExploreCheck then
 				nextCarnivoreExploreCheck = tick() + 20
 				local spot = findSafeTerrainSpot(root.Position, 20, 60)
@@ -17346,11 +17678,29 @@ local function autoDrinkStep()
 			state.survivalArbiter.owner
 	end
 
+	-- A committed food route may keep ownership, but it must NOT block a FREE
+	-- opportunistic Drink already available under the moving animal. This does
+	-- not abandon the carcass/grass destination.
+	local preOwnerMovementInteraction
+
+	if state.questMovementOpportunisticInteract then
+		preOwnerMovementInteraction =
+			state.questMovementOpportunisticInteract(
+				character,
+				root
+			)
+	end
+
+	if preOwnerMovementInteraction == "drink"
+		or preOwnerMovementInteraction == "drink_grace" then
+
+		return
+	end
+
 	if survivalOwner == "food"
 		and earlyWater > 45 then
 
-		-- Food has a committed route. Normal thirst must wait instead of making
-		-- the animal abandon grass, walk to water, abandon water, and repeat.
+		-- Food route keeps ownership only when there is no free Drink contact.
 		return
 	end
 
@@ -17365,8 +17715,12 @@ local function autoDrinkStep()
 		end
 	end
 
-	local movementInteraction
-	if state.questMovementOpportunisticInteract then
+	local movementInteraction =
+		preOwnerMovementInteraction
+
+	if not movementInteraction
+		and state.questMovementOpportunisticInteract then
+
 		movementInteraction =
 			state.questMovementOpportunisticInteract(
 				character,
@@ -17374,10 +17728,25 @@ local function autoDrinkStep()
 			)
 	end
 
+	local movingVelocity =
+		root.AssemblyLinearVelocity
+
+	local movingPlanarSpeed =
+		Vector3.new(
+			movingVelocity.X,
+			0,
+			movingVelocity.Z
+		).Magnitude
+
 	local movingDrinkGrace =
 		state.questMoveInteract
-			and state.questMotionMoving
-			and state.questMotionMode == "Land"
+			and (
+				movingPlanarSpeed >= 1.5
+					or (
+						state.safeMove
+						and state.safeMove.active
+					)
+			)
 			and tick()
 				< (
 					state.questMoveInteract.drinkGraceUntil
@@ -30105,8 +30474,8 @@ DEATH_REPORT.overlay.ZIndex = 50
 DEATH_REPORT.overlay.Parent = window
 
 DEATH_REPORT.panel = Instance.new("Frame")
-DEATH_REPORT.panel.Size = UDim2.new(1, -34, 0, 366)
-DEATH_REPORT.panel.Position = UDim2.new(0, 17, 0.5, -183)
+DEATH_REPORT.panel.Size = UDim2.new(1, -28, 0, 420)
+DEATH_REPORT.panel.Position = UDim2.new(0, 14, 0.5, -210)
 DEATH_REPORT.panel.BackgroundColor3 = COLOR_HEADER
 DEATH_REPORT.panel.BorderSizePixel = 0
 DEATH_REPORT.panel.ZIndex = 51
@@ -30124,13 +30493,16 @@ DEATH_REPORT.accent.Parent = DEATH_REPORT.panel
 corner(DEATH_REPORT.accent, 2)
 
 DEATH_REPORT.title = Instance.new("TextLabel")
-DEATH_REPORT.title.Size = UDim2.new(1, -70, 0, 30)
+DEATH_REPORT.title.Size = UDim2.new(1, -76, 0, 34)
 DEATH_REPORT.title.Position = UDim2.fromOffset(18, 12)
 DEATH_REPORT.title.BackgroundTransparency = 1
 DEATH_REPORT.title.Font = Enum.Font.GothamBlack
 DEATH_REPORT.title.Text = "DEATH REPORT"
 DEATH_REPORT.title.TextColor3 = COLOR_TEXT
-DEATH_REPORT.title.TextSize = 17
+DEATH_REPORT.title.TextSize =
+	UserInputService.TouchEnabled
+		and 18
+		or 20
 DEATH_REPORT.title.TextXAlignment = Enum.TextXAlignment.Left
 DEATH_REPORT.title.ZIndex = 52
 DEATH_REPORT.title.Parent = DEATH_REPORT.panel
@@ -30150,21 +30522,24 @@ DEATH_REPORT.close.Parent = DEATH_REPORT.panel
 corner(DEATH_REPORT.close, 8)
 
 DEATH_REPORT.subtitle = Instance.new("TextLabel")
-DEATH_REPORT.subtitle.Size = UDim2.new(1, -36, 0, 28)
-DEATH_REPORT.subtitle.Position = UDim2.fromOffset(18, 44)
+DEATH_REPORT.subtitle.Size = UDim2.new(1, -36, 0, 44)
+DEATH_REPORT.subtitle.Position = UDim2.fromOffset(18, 50)
 DEATH_REPORT.subtitle.BackgroundTransparency = 1
 DEATH_REPORT.subtitle.Font = FONT_BODY
 DEATH_REPORT.subtitle.Text = "Unexpected animal deaths detected while Slot Guardian was active."
 DEATH_REPORT.subtitle.TextColor3 = COLOR_SUBTEXT
-DEATH_REPORT.subtitle.TextSize = 10
+DEATH_REPORT.subtitle.TextSize =
+	UserInputService.TouchEnabled
+		and 12
+		or 13
 DEATH_REPORT.subtitle.TextWrapped = true
 DEATH_REPORT.subtitle.TextXAlignment = Enum.TextXAlignment.Left
 DEATH_REPORT.subtitle.ZIndex = 52
 DEATH_REPORT.subtitle.Parent = DEATH_REPORT.panel
 
 DEATH_REPORT.list = Instance.new("ScrollingFrame")
-DEATH_REPORT.list.Size = UDim2.new(1, -36, 0, 272)
-DEATH_REPORT.list.Position = UDim2.fromOffset(18, 78)
+DEATH_REPORT.list.Size = UDim2.new(1, -36, 0, 304)
+DEATH_REPORT.list.Position = UDim2.fromOffset(18, 98)
 DEATH_REPORT.list.BackgroundTransparency = 1
 DEATH_REPORT.list.BorderSizePixel = 0
 DEATH_REPORT.list.ScrollBarThickness = 4
@@ -30215,7 +30590,7 @@ function DEATH_REPORT.render()
 				1,
 				0,
 				0,
-				54
+				66
 			)
 
 		empty.BackgroundColor3 =
@@ -30234,7 +30609,9 @@ function DEATH_REPORT.render()
 			COLOR_SUBTEXT
 
 		empty.TextSize =
-			12
+			UserInputService.TouchEnabled
+				and 13
+				or 14
 
 		empty.ZIndex =
 			53
@@ -30263,7 +30640,7 @@ function DEATH_REPORT.render()
 				1,
 				-2,
 				0,
-				62
+				78
 			)
 
 		card.LayoutOrder =
@@ -30293,14 +30670,14 @@ function DEATH_REPORT.render()
 
 		mark.Size =
 			UDim2.fromOffset(
-				30,
-				30
+				34,
+				34
 			)
 
 		mark.Position =
 			UDim2.fromOffset(
 				10,
-				16
+				22
 			)
 
 		mark.BackgroundColor3 =
@@ -30319,7 +30696,7 @@ function DEATH_REPORT.render()
 			COLOR_ACCENT
 
 		mark.TextSize =
-			14
+			16
 
 		mark.ZIndex =
 			54
@@ -30342,13 +30719,13 @@ function DEATH_REPORT.render()
 				1,
 				-56,
 				0,
-				22
+				28
 			)
 
 		line1.Position =
 			UDim2.fromOffset(
-				48,
-				8
+				54,
+				10
 			)
 
 		line1.BackgroundTransparency =
@@ -30372,7 +30749,9 @@ function DEATH_REPORT.render()
 			COLOR_TEXT
 
 		line1.TextSize =
-			11
+			UserInputService.TouchEnabled
+				and 13
+				or 14
 
 		line1.TextXAlignment =
 			Enum.TextXAlignment.Left
@@ -30396,13 +30775,13 @@ function DEATH_REPORT.render()
 				1,
 				-56,
 				0,
-				22
+				26
 			)
 
 		line2.Position =
 			UDim2.fromOffset(
-				48,
-				31
+				54,
+				42
 			)
 
 		line2.BackgroundTransparency =
@@ -30421,7 +30800,9 @@ function DEATH_REPORT.render()
 			COLOR_SUBTEXT
 
 		line2.TextSize =
-			10
+			UserInputService.TouchEnabled
+				and 12
+				or 13
 
 		line2.TextXAlignment =
 			Enum.TextXAlignment.Left
@@ -31089,7 +31470,7 @@ end
 renders = {}
 local function toggle(parent, label, key, order)
 	local row = Instance.new("TextButton")
-	row.Size = UDim2.new(1, 0, 0, UserInputService.TouchEnabled and 46 or 40)
+	row.Size = UDim2.new(1, 0, 0, UserInputService.TouchEnabled and 50 or 44)
 	row.LayoutOrder = order or 0
 	row.BackgroundColor3 = COLOR_CARD
 	row.BorderSizePixel = 0
@@ -31108,8 +31489,8 @@ local function toggle(parent, label, key, order)
 	labelText.Text = label
 	labelText.TextSize =
 		UserInputService.TouchEnabled
-			and 12
-			or 13
+			and 13
+			or 14
 	labelText.TextColor3 = COLOR_TEXT
 	labelText.TextXAlignment = Enum.TextXAlignment.Left
 	labelText.TextYAlignment = Enum.TextYAlignment.Center
@@ -31216,8 +31597,8 @@ local function toggle(parent, label, key, order)
 			or key == "growthPrideEnabled" then
 			labelText.TextSize =
 				UserInputService.TouchEnabled
-					and 11
-					or 12
+					and 12
+					or 13
 		end
 
 		if disabled then
@@ -31579,8 +31960,8 @@ local function coinFarmAnimalSelector(parent, order)
 	main.Font = FONT_BUTTON
 	main.TextSize =
 		UserInputService.TouchEnabled
-			and 12
-			or 13
+			and 13
+			or 14
 	main.TextColor3 = COLOR_TEXT
 	main.TextXAlignment = Enum.TextXAlignment.Left
 	main.Parent = wrap
@@ -31641,8 +32022,8 @@ local function coinFarmAnimalSelector(parent, order)
 		button.Font = FONT_BODY
 		button.TextSize =
 			UserInputService.TouchEnabled
-				and 12
-				or 13
+				and 13
+				or 14
 		button.TextColor3 = COLOR_TEXT
 		button.TextXAlignment = Enum.TextXAlignment.Left
 		button.Text = textValue
@@ -31859,7 +32240,7 @@ state.createAutoDrinkModeButton = function(
 	radio.Font =
 		Enum.Font.GothamBold
 	radio.Text = "○"
-	radio.TextSize = 20
+	radio.TextSize = 23
 	radio.TextColor3 = COLOR_SUBTEXT
 	radio.Parent = button
 
@@ -31887,8 +32268,8 @@ state.createAutoDrinkModeButton = function(
 	title.Text = titleText
 	title.TextSize =
 		UserInputService.TouchEnabled
-			and 11
-			or 12
+			and 14
+			or 15
 	title.TextColor3 = COLOR_TEXT
 	title.TextXAlignment =
 		Enum.TextXAlignment.Left
@@ -31907,13 +32288,13 @@ state.createAutoDrinkModeButton = function(
 			1,
 			-28,
 			1,
-			-38
+			-46
 		)
 
 	description.Position =
 		UDim2.fromOffset(
 			14,
-			34
+			40
 		)
 
 	description.BackgroundTransparency = 1
@@ -31921,8 +32302,8 @@ state.createAutoDrinkModeButton = function(
 	description.Text = descriptionText
 	description.TextSize =
 		UserInputService.TouchEnabled
-			and 10
-			or 11
+			and 12
+			or 13
 	description.TextColor3 =
 		warning
 			and Color3.fromRGB(
@@ -32037,8 +32418,8 @@ state.createAutoDrinkModeButton(
 	"Higher chance of bugs; no puddle/river travel. Unavailable for Crocodile.",
 	4,
 	UserInputService.TouchEnabled
-		and 92
-		or 78,
+		and 116
+		or 102,
 	false
 )
 
@@ -32048,8 +32429,8 @@ state.createAutoDrinkModeButton(
 	"Safer and more reliable, lower chance of bugs, but it will move the character more.\nDO NOT USE THIS DURING SURVIVE IN ZONE MISSIONS.",
 	5,
 	UserInputService.TouchEnabled
-		and 116
-		or 100,
+		and 148
+		or 130,
 	true
 )
 
@@ -32143,7 +32524,7 @@ task.spawn(function()
 end)
 
 local prideGrowthNote = Instance.new("TextLabel")
-prideGrowthNote.Size = UDim2.new(1, 0, 0, 34)
+prideGrowthNote.Size = UDim2.new(1, 0, 0, 44)
 prideGrowthNote.LayoutOrder = 5
 prideGrowthNote.BackgroundTransparency = 1
 prideGrowthNote.Font = FONT_BODY
@@ -32151,8 +32532,8 @@ prideGrowthNote.Text = "Recommended for herbivores. Disabled for carnivores. Zon
 prideGrowthNote.TextColor3 = COLOR_SUBTEXT
 prideGrowthNote.TextSize =
 	UserInputService.TouchEnabled
-		and 10
-		or 11
+		and 12
+		or 13
 prideGrowthNote.TextWrapped = true
 prideGrowthNote.TextXAlignment = Enum.TextXAlignment.Left
 prideGrowthNote.Parent = tabContents.Growth
@@ -32174,7 +32555,7 @@ resetSpawnWrap.Size =
 		1,
 		0,
 		0,
-		58
+		76
 	)
 
 resetSpawnWrap.LayoutOrder =
@@ -32199,7 +32580,7 @@ resetSpawnMain.Size =
 		1,
 		0,
 		0,
-		58
+		76
 	)
 
 resetSpawnMain.BackgroundColor3 =
@@ -32243,13 +32624,13 @@ resetSpawnTitle.Size =
 		1,
 		-54,
 		0,
-		23
+		28
 	)
 
 resetSpawnTitle.Position =
 	UDim2.fromOffset(
 		14,
-		6
+		8
 	)
 
 resetSpawnTitle.BackgroundTransparency =
@@ -32263,8 +32644,8 @@ resetSpawnTitle.Text =
 
 resetSpawnTitle.TextSize =
 	UserInputService.TouchEnabled
-		and 12
-		or 13
+		and 14
+		or 15
 
 resetSpawnTitle.TextColor3 =
 	COLOR_TEXT
@@ -32288,13 +32669,13 @@ resetSpawnDescription.Size =
 		1,
 		-54,
 		0,
-		23
+		34
 	)
 
 resetSpawnDescription.Position =
 	UDim2.fromOffset(
 		14,
-		29
+		38
 	)
 
 resetSpawnDescription.BackgroundTransparency =
@@ -32308,8 +32689,8 @@ resetSpawnDescription.Text =
 
 resetSpawnDescription.TextSize =
 	UserInputService.TouchEnabled
-		and 10
-		or 11
+		and 12
+		or 13
 
 resetSpawnDescription.TextColor3 =
 	COLOR_SUBTEXT
@@ -32361,7 +32742,7 @@ resetSpawnArrow.Text =
 	"⌄"
 
 resetSpawnArrow.TextSize =
-	18
+	22
 
 resetSpawnArrow.TextColor3 =
 	COLOR_ACCENT
@@ -32377,7 +32758,7 @@ local resetSpawnOptions =
 resetSpawnOptions.Position =
 	UDim2.fromOffset(
 		0,
-		64
+		82
 	)
 
 resetSpawnOptions.Size =
@@ -32660,7 +33041,7 @@ local function addResetSpawnOption(
 				1,
 				0,
 				0,
-				58
+				76
 			)
 
 		renderResetSpawn()
@@ -32747,7 +33128,7 @@ local function rebuildResetSpawnOptions()
 			1,
 			0,
 			0,
-			64 + visibleHeight
+			82 + visibleHeight
 		)
 end
 
@@ -32787,7 +33168,7 @@ resetSpawnMain.Activated:Connect(function()
 				1,
 				0,
 				0,
-				58
+				76
 			)
 	end
 
@@ -32905,7 +33286,7 @@ toggle(tabContents.Quests, "Auto Complete Quests", "autoQuests", 1)
 toggle(tabContents.Quests, "Auto Claim Rewards", "autoClaimQuests", 2)
 
 local questInfoCard = Instance.new("Frame")
-questInfoCard.Size = UDim2.new(1, 0, 0, 122)
+questInfoCard.Size = UDim2.new(1, 0, 0, 180)
 questInfoCard.LayoutOrder = 3
 questInfoCard.BackgroundColor3 = Color3.fromRGB(20, 10, 18)
 questInfoCard.BorderSizePixel = 0
@@ -32922,26 +33303,33 @@ questInfoAccent.Parent = questInfoCard
 corner(questInfoAccent, 2)
 
 local questInfoTitle = Instance.new("TextLabel")
-questInfoTitle.Size = UDim2.new(1, -28, 0, 18)
-questInfoTitle.Position = UDim2.fromOffset(14, 8)
+questInfoTitle.Size = UDim2.new(1, -28, 0, 26)
+questInfoTitle.Position = UDim2.fromOffset(14, 10)
 questInfoTitle.BackgroundTransparency = 1
 questInfoTitle.Font = FONT_BUTTON
 questInfoTitle.Text = "HOW QUEST FARM WORKS"
 questInfoTitle.TextColor3 = COLOR_ACCENT
-questInfoTitle.TextSize = 12
+questInfoTitle.TextSize =
+	UserInputService.TouchEnabled
+		and 15
+		or 16
 questInfoTitle.TextXAlignment = Enum.TextXAlignment.Left
 questInfoTitle.Parent = questInfoCard
 
 local questInfoBody = Instance.new("TextLabel")
-questInfoBody.Size = UDim2.new(1, -28, 0, 88)
-questInfoBody.Position = UDim2.fromOffset(14, 27)
+questInfoBody.Size = UDim2.new(1, -28, 0, 132)
+questInfoBody.Position = UDim2.fromOffset(14, 40)
 questInfoBody.BackgroundTransparency = 1
 questInfoBody.Font = FONT_BODY
 questInfoBody.Text = "Zone quests: moves to the required territory and stays there. Travel quests: Auto Run completes the required distance. Group quests: creates or joins MMB groups with compatible animals. Food, water and required animal changes are handled automatically when needed."
 questInfoBody.TextColor3 = COLOR_TEXT
 questInfoBody.TextTransparency = 0.12
-questInfoBody.TextSize = 12
+questInfoBody.TextSize =
+	UserInputService.TouchEnabled
+		and 14
+		or 15
 questInfoBody.TextWrapped = true
+questInfoBody.LineHeight = 1.08
 questInfoBody.TextXAlignment = Enum.TextXAlignment.Left
 questInfoBody.TextYAlignment = Enum.TextYAlignment.Top
 questInfoBody.Parent = questInfoCard
