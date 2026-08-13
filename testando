@@ -594,6 +594,49 @@ local function isAquaticCharacter(character)
 	return type(animal) == "string" and AQUATIC_ANIMALS[animal:lower()] == true
 end
 
+function state.getCharacterMovementState(character)
+	if not character then
+		return nil
+	end
+
+	local value =
+		character:GetAttribute(
+			"MovementState"
+		)
+
+	if type(value) == "string"
+		and value ~= "" then
+		return value
+	end
+
+	local stateValue =
+		character:FindFirstChild(
+			"MovementState"
+		)
+
+	if stateValue
+		and stateValue:IsA(
+			"StringValue"
+		) then
+
+		return stateValue.Value
+	end
+
+	return nil
+end
+
+function state.isCharacterSwimmingState(character)
+	local movementState =
+		state.getCharacterMovementState(
+			character
+		)
+
+	return type(movementState)
+			== "string"
+		and movementState:lower()
+			== "swimming"
+end
+
 local function setAquaticWaterCollision(character, enabled)
 	if not isAquaticCharacter(character) then return end
 
@@ -2688,14 +2731,10 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		and options.vertical ~= true
 		and options.rawVerticalTransit ~= true
 		and type(
-			state.isBodyActuallyInWater
-		) == "function"
-		and type(
 			state.moveAquaticToDryTerrain
 		) == "function"
-		and state.isBodyActuallyInWater(
-			character,
-			root
+		and state.isCharacterSwimmingState(
+			character
 		)
 
 	if aquaticLandPreflight then
@@ -10380,58 +10419,30 @@ function state.aquaticFlyDisableFallGuard()
 	fly.selfDamageGuard = false
 end
 
-function state.aquaticFlyDryGroundReached(character, root, waterPart)
+function state.aquaticFlyDryGroundReached(
+	character,
+	root
+)
 	if not character or not root then
 		return false
 	end
 
-	if root.Position.Y < config.dangerY then
-		return false
-	end
-
-	if isPositionInWaterTerrain(root.Position, 2.6, 3.5) then
-		return false
-	end
-
-	if isPositionInWaterTerrain(
-		root.Position - Vector3.new(0, 1.75, 0),
-		2.4,
-		3.0
+	-- Savannah exposes the locomotion state directly on the player's workspace
+	-- model. While MovementState == "Swimming", the animal is still in water.
+	-- This is intentionally the primary test: no water scans or Terrain rays
+	-- are executed every frame anymore.
+	if state.isCharacterSwimmingState(
+		character
 	) then
 		return false
 	end
 
-	if waterPart
-		and waterPart:IsA("BasePart")
-		and state.drinkMainWaterSurface then
-
-		local exposedWater =
-			state.drinkMainWaterSurface(
-				waterPart,
-				root.Position.X,
-				root.Position.Z
-			)
-
-		if exposedWater then
-			return false
-		end
+	if root.Position.Y
+		< config.dangerY then
+		return false
 	end
 
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { character }
-	params.IgnoreWater = false
-
-	local hit =
-		workspace:Raycast(
-			root.Position + Vector3.new(0, 8, 0),
-			Vector3.new(0, -64, 0),
-			params
-		)
-
-	return hit ~= nil
-		and hit.Material ~= Enum.Material.Water
-		and hit.Normal.Y >= 0.12
+	return true
 end
 
 function state.findAquaticDryTerrainExit(character, root, preferredTarget)
@@ -10484,7 +10495,7 @@ function state.findAquaticDryTerrainExit(character, root, preferredTarget)
 
 	if preferredDirection then
 		for _, degrees in ipairs({
-			0, -26, 26, -52, 52, -82, 82
+			0, -32, 32, -68, 68
 		}) do
 			table.insert(
 				directions,
@@ -10492,8 +10503,8 @@ function state.findAquaticDryTerrainExit(character, root, preferredTarget)
 			)
 		end
 	else
-		for index = 0, 7 do
-			local angle = index / 8 * math.pi * 2
+		for index = 0, 5 do
+			local angle = index / 6 * math.pi * 2
 			table.insert(
 				directions,
 				Vector3.new(
@@ -10508,7 +10519,7 @@ function state.findAquaticDryTerrainExit(character, root, preferredTarget)
 	local clearance = state.movementRootClearance(character)
 
 	for _, radius in ipairs({
-		18, 30, 46, 66, 92, 124
+		20, 38, 62, 92, 124
 	}) do
 		local best
 		local bestScore = math.huge
@@ -10619,8 +10630,11 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 		return true
 	end
 
-	-- Fly is created ONLY if Croc/Hippo is actually still in water.
-	if not state.isBodyActuallyInWater(character, root) then
+	-- Fly is created ONLY while Savannah itself reports Swimming.
+	-- This avoids expensive body/water geometry checks before every retry.
+	if not state.isCharacterSwimmingState(
+		character
+	) then
 		return false
 	end
 
@@ -10744,6 +10758,8 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 		)
 
 	local success = false
+	local nextMovementStateCheckAt = 0
+	local leftSwimmingSince = nil
 
 	local callOk, callError =
 		pcall(function()
@@ -10754,14 +10770,34 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 				and humanoid.Health > 0
 				and tick() < deadline do
 
-				-- First dry-ground frame = immediate UNFLY.
-				if state.aquaticFlyDryGroundReached(
-					character,
-					root,
-					waterPart
-				) then
-					success = true
-					break
+				-- Do NOT raycast every Heartbeat. Savannah already tells us when
+				-- the rig leaves swimming. Check that lightweight state only at the
+				-- native-ish 0.15 s cadence, and require a tiny debounce so a one-frame
+				-- state flick does not shut Fly off while still in the river.
+				local now = tick()
+
+				if now >= nextMovementStateCheckAt then
+					nextMovementStateCheckAt =
+						now + 0.15
+
+					if state.aquaticFlyDryGroundReached(
+						character,
+						root
+					) then
+						leftSwimmingSince =
+							leftSwimmingSince
+							or now
+
+						if now
+							- leftSwimmingSince
+							>= 0.12 then
+							success = true
+							break
+						end
+					else
+						leftSwimmingSince =
+							nil
+					end
 				end
 
 				local horizontal =
@@ -12983,7 +13019,15 @@ function state.noIdleWaterSafetyStep()
 		return
 	end
 
-	if not state.isBodyActuallyInWater(
+	if state.isCrocOrHippoMovementCharacter(
+		character
+	) then
+		if not state.isCharacterSwimmingState(
+			character
+		) then
+			return
+		end
+	elseif not state.isBodyActuallyInWater(
 		character,
 		root
 	) then
