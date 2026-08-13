@@ -10749,10 +10749,11 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 	fly.bodyVelocity = BV
 
 	pcall(function()
-		-- Savannah-specific adaptation: PlatformStand=true immediately pushes
-		-- the custom locomotion state toward Idle and causes our recovery to
-		-- self-cancel. Keep the IY BodyVelocity/BodyGyro core without PlatformStand.
-		humanoid.PlatformStand = false
+		-- Match Infinite Yield's actual Fly ownership: PlatformStand prevents the
+		-- Savannah movement controller from fighting BodyVelocity/BodyGyro.
+		-- MovementState may become Idle here, which is fine: the Fly no longer
+		-- uses MovementState as its completion condition.
+		humanoid.PlatformStand = true
 		humanoid.AutoRotate = false
 	end)
 
@@ -12834,6 +12835,42 @@ local function forcePostDrinkMove(wasUnderground)
 		local character, root = characterParts()
 		if not character or not root then return false end
 
+		-- Crocodile/Hippo use their OWN strict river-exit proof.
+		-- The generic dry-ground test can see the solid river bottom and falsely
+		-- conclude that the animal is already outside the water.
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+			local riverPart =
+				workspace:FindFirstChild(
+					"MainWaterPart"
+				)
+
+			local riverY =
+				riverPart
+				and riverPart:IsA(
+					"BasePart"
+				)
+				and (
+					riverPart.Position.Y
+					+ riverPart.Size.Y * 0.5
+				)
+				or nil
+
+			if not riverY
+				or type(
+					state.aquaticFlyDryGroundReached
+				) ~= "function" then
+				return false
+			end
+
+			return state.aquaticFlyDryGroundReached(
+				character,
+				root,
+				riverY
+			)
+		end
+
 		if state.isBodyActuallyInWater(
 			character,
 			root
@@ -13096,6 +13133,21 @@ function state.noIdleWaterSafetyStep()
 	end
 
 	state.noIdleWaterLastAt = tick()
+
+	if state.isCrocOrHippoMovementCharacter(
+		character
+	)
+		and state.aquaticRiverEscape
+		and (
+			state.aquaticRiverEscape.busy
+			or tick()
+				< (
+					state.aquaticRiverEscape.retryAt
+					or 0
+				)
+		) then
+		return
+	end
 
 	-- Immediately clear any idle/feeding ownership that could keep the animal
 	-- stationary in the puddle.
