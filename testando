@@ -637,6 +637,187 @@ function state.isCharacterSwimmingState(character)
 			== "swimming"
 end
 
+function state.gameTerrainWaterHeightAt(position)
+	if typeof(position) ~= "Vector3" then
+		return nil
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { workspace.Terrain }
+	params.IgnoreWater = false
+
+	local globalWater =
+		workspace:GetAttribute(
+			"GlobalWaterLevelHeight"
+		)
+
+	local castY =
+		math.max(
+			position.Y + 180,
+			type(globalWater) == "number"
+				and globalWater + 180
+				or position.Y + 180
+		)
+
+	local hit =
+		workspace:Raycast(
+			Vector3.new(
+				position.X,
+				castY,
+				position.Z
+			),
+			Vector3.new(
+				0,
+				-500,
+				0
+			),
+			params
+		)
+
+	if hit
+		and hit.Material
+			== Enum.Material.Water then
+		return hit.Position.Y
+	end
+
+	return nil
+end
+
+function state.gameWaterSurfaceHeightAt(position)
+	if typeof(position) ~= "Vector3" then
+		return nil
+	end
+
+	-- Savannah's normal river path is Terrain Water. Match the game's order:
+	-- Terrain water height first; global ocean height only as fallback.
+	local terrainWater =
+		state.gameTerrainWaterHeightAt(
+			position
+		)
+
+	if type(terrainWater) == "number" then
+		return terrainWater,
+			"Terrain"
+	end
+
+	local globalWater =
+		workspace:GetAttribute(
+			"GlobalWaterLevelHeight"
+		)
+
+	if type(globalWater) == "number" then
+		return globalWater,
+			"Global"
+	end
+
+	return nil,
+		nil
+end
+
+function state.gameSwimPointY(character, root)
+	if not character then
+		return root
+			and root.Position.Y
+			or nil
+	end
+
+	local attachment =
+		character:FindFirstChild(
+			"SwimHeightAttachment",
+			true
+		)
+
+	if attachment
+		and attachment:IsA(
+			"Attachment"
+		) then
+
+		return attachment.WorldPosition.Y
+	end
+
+	return root
+		and root.Position.Y
+		or nil
+end
+
+function state.gameSwimmingGeometry(
+	character,
+	root,
+	waterHeight
+)
+	if not character or not root then
+		return false
+	end
+
+	local surfaceY =
+		type(waterHeight) == "number"
+			and waterHeight
+			or state.gameWaterSurfaceHeightAt(
+				root.Position
+			)
+
+	if type(surfaceY) ~= "number" then
+		return state.isCharacterSwimmingState(
+			character
+		)
+	end
+
+	local swimY =
+		state.gameSwimPointY(
+			character,
+			root
+		)
+
+	if type(swimY) ~= "number" then
+		return false
+	end
+
+	-- We do not know the private controllerExtraOffset value for every animal.
+	-- Use the game's visible swim point directly, with a tiny 0.05 tolerance
+	-- only to prevent floating-point flicker at the exact surface.
+	return swimY <= surfaceY + 0.05
+end
+
+function state.gameSwimmingExitConfirmed(
+	character,
+	root,
+	waterHeight
+)
+	if not character or not root then
+		return false
+	end
+
+	local surfaceY =
+		type(waterHeight) == "number"
+			and waterHeight
+			or state.gameWaterSurfaceHeightAt(
+				root.Position
+			)
+
+	if type(surfaceY) ~= "number" then
+		return false
+	end
+
+	local swimY =
+		state.gameSwimPointY(
+			character,
+			root
+		)
+
+	if type(swimY) ~= "number" then
+		return false
+	end
+
+	-- Mirror the game's ExitSwimming geometry:
+	-- swim point above surface AND root at least ~0.25 stud above that surface.
+	-- MovementState is deliberately NOT required here because PlatformStand
+	-- used by IY Fly can temporarily make Savannah report Idle.
+	return swimY > surfaceY
+		and root.Position.Y
+			>= surfaceY + 0.25
+end
+
 local function setAquaticWaterCollision(character, enabled)
 	if not isAquaticCharacter(character) then return end
 
@@ -2733,8 +2914,19 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		and type(
 			state.moveAquaticToDryTerrain
 		) == "function"
-		and state.isCharacterSwimmingState(
-			character
+		and (
+			state.isCharacterSwimmingState(
+				character
+			)
+			or (
+				type(
+					state.gameSwimmingGeometry
+				) == "function"
+				and state.gameSwimmingGeometry(
+					character,
+					root
+				)
+			)
 		)
 
 	if aquaticLandPreflight then
@@ -10434,40 +10626,13 @@ function state.aquaticFlyDryGroundReached(
 		return false
 	end
 
-	-- Critical distinction:
-	-- solid Terrain under the animal is NOT enough, because the river bottom
-	-- itself is solid Terrain. We only allow UNFLY after the rig has first
-	-- climbed to approximately the river-surface height.
-	if root.Position.Y < waterY - 0.35 then
-		return false
-	end
-
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { character }
-	params.IgnoreWater = true
-
-	-- Very short local ray only. This runs at 5 Hz, not every Heartbeat.
-	local hit =
-		workspace:Raycast(
-			root.Position + Vector3.new(0, 1.5, 0),
-			Vector3.new(0, -12, 0),
-			params
-		)
-
-	if not hit
-		or hit.Material == Enum.Material.Water
-		or hit.Normal.Y < 0.10 then
-		return false
-	end
-
-	-- The bank must really be close under the body. A deep riverbed cannot
-	-- satisfy this after the Croc/Hippo has reached surface height.
-	local verticalGap =
-		(root.Position.Y - hit.Position.Y)
-
-	return verticalGap >= -0.5
-		and verticalGap <= 9.5
+	-- Never look at the river bottom. The game exits Swimming from WATER
+	-- SURFACE geometry, not from "solid Terrain under the animal".
+	return state.gameSwimmingExitConfirmed(
+		character,
+		root,
+		waterY
+	)
 end
 
 function state.findAquaticDryTerrainExit(character, root, preferredTarget)
@@ -10475,12 +10640,14 @@ function state.findAquaticDryTerrainExit(character, root, preferredTarget)
 		return nil
 	end
 
-	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	local waterY =
-		waterPart
-		and waterPart:IsA("BasePart")
-		and (waterPart.Position.Y + waterPart.Size.Y * 0.5)
-		or root.Position.Y
+		state.gameWaterSurfaceHeightAt(
+			root.Position
+		)
+
+	if type(waterY) ~= "number" then
+		return nil
+	end
 
 	local origin =
 		Vector3.new(
@@ -10568,52 +10735,36 @@ function state.findAquaticDryTerrainExit(character, root, preferredTarget)
 				and hit.Normal.Y >= 0.18
 				and hit.Position.Y >= waterY - 0.75 then
 
-				local stillExposedWater = false
+				local candidate =
+					hit.Position
+					+ Vector3.new(
+						0,
+						math.clamp(
+							clearance * 0.38,
+							1.8,
+							3.2
+						),
+						0
+					)
 
-				if waterPart
-					and waterPart:IsA("BasePart")
-					and state.drinkMainWaterSurface then
+				local score =
+					radius
+					+ math.abs(
+						hit.Position.Y - waterY
+					) * 0.15
 
-					stillExposedWater =
-						state.drinkMainWaterSurface(
-							waterPart,
-							point.X,
-							point.Z
-						) ~= nil
+				if typeof(preferredTarget) == "Vector3" then
+					score +=
+						Vector3.new(
+							preferredTarget.X - candidate.X,
+							0,
+							preferredTarget.Z - candidate.Z
+						).Magnitude * 0.01
 				end
 
-				if not stillExposedWater then
-					local candidate =
-						hit.Position
-						+ Vector3.new(
-							0,
-							math.clamp(
-								clearance * 0.38,
-								1.8,
-								3.2
-							),
-							0
-						)
-
-					local score =
-						radius
-						+ math.abs(
-							hit.Position.Y - waterY
-						) * 0.15
-
-					if typeof(preferredTarget) == "Vector3" then
-						score +=
-							Vector3.new(
-								preferredTarget.X - candidate.X,
-								0,
-								preferredTarget.Z - candidate.Z
-							).Magnitude * 0.01
-					end
-
-					if score < bestScore then
-						bestScore = score
-						best = candidate
-					end
+				if score < bestScore then
+					bestScore = score
+					best = candidate
 				end
 			end
 		end
@@ -10642,13 +10793,12 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 
-	local waterY =
-		waterPart
-		and waterPart:IsA("BasePart")
-		and (waterPart.Position.Y + waterPart.Size.Y * 0.5)
-		or nil
+	local waterY, waterSource =
+		state.gameWaterSurfaceHeightAt(
+			root.Position
+		)
 
-	if not waterY then
+	if type(waterY) ~= "number" then
 		return false
 	end
 
@@ -10665,23 +10815,23 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 		return true
 	end
 
-	-- MovementState == Swimming is a useful ENTRY signal from Savannah, but
-	-- once recovery begins we do not depend on it: forcing locomotion can make
-	-- the game briefly report Idle even though the Croc/Hippo is still in water.
+	-- Match Savannah's own swimming geometry. MovementState is useful evidence,
+	-- but the SwimHeightAttachment vs water surface comparison is authoritative
+	-- for this recovery because IY Fly may temporarily make the state show Idle.
 	local swimmingAtStart =
 		state.isCharacterSwimmingState(
 			character
 		)
 
-	-- Cheap fallback for a recovery that already disturbed MovementState:
-	-- being materially below the known river surface is enough to permit one
-	-- water-exit attempt. No raycast / water-volume scan is needed here.
-	local belowRiverSurface =
-		root.Position.Y
-			< waterY - 0.75
+	local geometryInWater =
+		state.gameSwimmingGeometry(
+			character,
+			root,
+			waterY
+		)
 
 	if not swimmingAtStart
-		and not belowRiverSurface then
+		and not geometryInWater then
 		return false
 	end
 
@@ -10888,12 +11038,14 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 				runtimeMessage =
 					CROC.isCharacter(character)
 						and string.format(
-							"Croc water Fly: exiting river (%.0f studs)",
-							remaining
+							"Croc water Fly: exiting river (%.0f studs, %s)",
+							remaining,
+							tostring(waterSource or "water")
 						)
 						or string.format(
-							"Hippo water Fly: exiting river (%.0f studs)",
-							remaining
+							"Hippo water Fly: exiting river (%.0f studs, %s)",
+							remaining,
+							tostring(waterSource or "water")
 						)
 
 				RunService.Heartbeat:Wait()
@@ -12841,23 +12993,12 @@ local function forcePostDrinkMove(wasUnderground)
 		if state.isCrocOrHippoMovementCharacter(
 			character
 		) then
-			local riverPart =
-				workspace:FindFirstChild(
-					"MainWaterPart"
-				)
-
 			local riverY =
-				riverPart
-				and riverPart:IsA(
-					"BasePart"
+				state.gameWaterSurfaceHeightAt(
+					root.Position
 				)
-				and (
-					riverPart.Position.Y
-					+ riverPart.Size.Y * 0.5
-				)
-				or nil
 
-			if not riverY
+			if type(riverY) ~= "number"
 				or type(
 					state.aquaticFlyDryGroundReached
 				) ~= "function" then
@@ -13095,27 +13236,22 @@ function state.noIdleWaterSafetyStep()
 				character
 			)
 
-		local waterPart =
-			workspace:FindFirstChild(
-				"MainWaterPart"
+		local waterY =
+			state.gameWaterSurfaceHeightAt(
+				root.Position
 			)
 
-		local riverY =
-			waterPart
-			and waterPart:IsA("BasePart")
-			and (
-				waterPart.Position.Y
-				+ waterPart.Size.Y * 0.5
+		local geometryInWater =
+			type(waterY) == "number"
+			and state.gameSwimmingGeometry(
+				character,
+				root,
+				waterY
 			)
-			or nil
-
-		local belowRiver =
-			riverY
-			and root.Position.Y
-				< riverY - 0.75
+			or false
 
 		if not swimming
-			and not belowRiver then
+			and not geometryInWater then
 			return
 		end
 	elseif not state.isBodyActuallyInWater(
@@ -13547,6 +13683,22 @@ function state.drinkEmergencyEscape(character, root, reason)
 			character,
 			true
 		)
+
+		-- Crocodile/Hippo MUST NOT fall through to the generic Terrain/spawn
+		-- anti-drowning backend. The solid river bottom makes that backend report
+		-- "above Terrain" even though the animal is still underwater.
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+			criticalRecoveryActive = false
+
+			runtimeMessage =
+				CROC.isCharacter(character)
+					and "Croc water Fly did not exit yet; retrying after cooldown"
+					or "Hippo water Fly did not exit yet; retrying after cooldown"
+
+			return false
+		end
 	end
 
 	local function confirmedAboveTerrain()
