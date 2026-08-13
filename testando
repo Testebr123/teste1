@@ -7,6 +7,53 @@ local VirtualUser = game:GetService("VirtualUser")
 local CoreGui = game:GetService("CoreGui")
 local player = Players.LocalPlayer
 
+-- Executor-safe scheduling compatibility. Some executors expose task.spawn/task.wait
+-- but not task.defer/task.delay. Never call an optional scheduler function directly.
+local function mmbTaskDefer(callback, ...)
+	if type(callback) ~= "function" then
+		return nil
+	end
+
+	local args = { ... }
+	local argCount = select("#", ...)
+
+	return task.spawn(function()
+		task.wait()
+		if argCount == 0 then
+			callback()
+		elseif argCount == 1 then
+			callback(args[1])
+		elseif argCount == 2 then
+			callback(args[1], args[2])
+		else
+			callback(table.unpack(args, 1, argCount))
+		end
+	end)
+end
+
+local function mmbTaskDelay(seconds, callback, ...)
+	if type(callback) ~= "function" then
+		return nil
+	end
+
+	local args = { ... }
+	local argCount = select("#", ...)
+	seconds = tonumber(seconds) or 0
+
+	return task.spawn(function()
+		task.wait(math.max(seconds, 0))
+		if argCount == 0 then
+			callback()
+		elseif argCount == 1 then
+			callback(args[1])
+		elseif argCount == 2 then
+			callback(args[1], args[2])
+		else
+			callback(table.unpack(args, 1, argCount))
+		end
+	end)
+end
+
 if shared.__uiRootCleanup then
 	pcall(shared.__uiRootCleanup)
 end
@@ -8989,123 +9036,123 @@ end
 -- by a few points. Only critical thirst may preempt an active food job.
 -- ============================================================
 state.survivalArbiter = state.survivalArbiter or {
-\towner = nil,
-\townerSince = 0,
-\tlastOwner = nil,
-\thandoffNotBefore = 0,
-\tlastProgressAt = 0,
-\tlastValue = nil,
-\tpreemptions = 0,
+	owner = nil,
+	ownerSince = 0,
+	lastOwner = nil,
+	handoffNotBefore = 0,
+	lastProgressAt = 0,
+	lastValue = nil,
+	preemptions = 0,
 }
 
 function state.survivalArbiterReset(reason)
-\tlocal arbiter = state.survivalArbiter
-\tarbiter.owner = nil
-\tarbiter.ownerSince = 0
-\tarbiter.lastOwner = nil
-\tarbiter.handoffNotBefore = 0
-\tarbiter.lastProgressAt = tick()
-\tarbiter.lastValue = nil
-\tarbiter.preemptions = 0
+	local arbiter = state.survivalArbiter
+	arbiter.owner = nil
+	arbiter.ownerSince = 0
+	arbiter.lastOwner = nil
+	arbiter.handoffNotBefore = 0
+	arbiter.lastProgressAt = tick()
+	arbiter.lastValue = nil
+	arbiter.preemptions = 0
 end
 
 function state.survivalArbiterChoose(food, water)
-\tfood = tonumber(food) or 100
-\twater = tonumber(water) or 100
+	food = tonumber(food) or 100
+	water = tonumber(water) or 100
 
-\t-- Critical thirst always wins. Otherwise use hysteresis: Water only steals
-\t-- initial ownership when it is meaningfully worse than Food.
-\tif state.autoDrink and water <= 45 then
-\t\treturn "water"
-\tend
+	-- Critical thirst always wins. Otherwise use hysteresis: Water only steals
+	-- initial ownership when it is meaningfully worse than Food.
+	if state.autoDrink and water <= 45 then
+		return "water"
+	end
 
-\tlocal waterNeed = state.autoDrink and water <= 75
-\tlocal foodNeed = state.autoEat and food < 92
+	local waterNeed = state.autoDrink and water <= 75
+	local foodNeed = state.autoEat and food < 92
 
-\tif waterNeed and foodNeed then
-\t\tif water <= 60 or water <= food - 8 then
-\t\t\treturn "water"
-\t\tend
-\t\treturn "food"
-\telseif waterNeed then
-\t\treturn "water"
-\telseif foodNeed then
-\t\treturn "food"
-\tend
+	if waterNeed and foodNeed then
+		if water <= 60 or water <= food - 8 then
+			return "water"
+		end
+		return "food"
+	elseif waterNeed then
+		return "water"
+	elseif foodNeed then
+		return "food"
+	end
 
-\treturn nil
+	return nil
 end
 
 function state.survivalArbiterAcquire(kind, food, water, reason)
-\tif kind ~= "food" and kind ~= "water" then
-\t\treturn false
-\tend
+	if kind ~= "food" and kind ~= "water" then
+		return false
+	end
 
-\tlocal arbiter = state.survivalArbiter
-\tlocal now = tick()
-\tfood = tonumber(food) or 100
-\twater = tonumber(water) or 100
+	local arbiter = state.survivalArbiter
+	local now = tick()
+	food = tonumber(food) or 100
+	water = tonumber(water) or 100
 
-\tif arbiter.owner == kind then
-\t\treturn true
-\tend
+	if arbiter.owner == kind then
+		return true
+	end
 
-\tif arbiter.owner ~= nil then
-\t\t-- Food may only be interrupted for genuinely dangerous thirst. Normal
-\t\t-- Water <=75 is NOT enough to abandon a grass/tree/carcass route.
-\t\tlocal emergencyWaterPreempt =
-\t\t\tkind == "water"
-\t\t\tand arbiter.owner == "food"
-\t\t\tand state.autoDrink
-\t\t\tand water <= 45
+	if arbiter.owner ~= nil then
+		-- Food may only be interrupted for genuinely dangerous thirst. Normal
+		-- Water <=75 is NOT enough to abandon a grass/tree/carcass route.
+		local emergencyWaterPreempt =
+			kind == "water"
+			and arbiter.owner == "food"
+			and state.autoDrink
+			and water <= 45
 
-\t\tif not emergencyWaterPreempt then
-\t\t\treturn false
-\t\tend
+		if not emergencyWaterPreempt then
+			return false
+		end
 
-\t\tarbiter.preemptions = (arbiter.preemptions or 0) + 1
-\tend
+		arbiter.preemptions = (arbiter.preemptions or 0) + 1
+	end
 
-\t-- Small dead-band after a completed job prevents Eat/Drink from swapping on
-\t-- adjacent scheduler frames. Critical Water bypasses it.
-\tif now < (arbiter.handoffNotBefore or 0)
-\t\tand kind ~= arbiter.lastOwner
-\t\tand not (kind == "water" and water <= 45) then
-\t\treturn false
-\tend
+	-- Small dead-band after a completed job prevents Eat/Drink from swapping on
+	-- adjacent scheduler frames. Critical Water bypasses it.
+	if now < (arbiter.handoffNotBefore or 0)
+		and kind ~= arbiter.lastOwner
+		and not (kind == "water" and water <= 45) then
+		return false
+	end
 
-\tarbiter.owner = kind
-\tarbiter.ownerSince = now
-\tarbiter.lastProgressAt = now
-\tarbiter.lastValue = kind == "water" and water or food
+	arbiter.owner = kind
+	arbiter.ownerSince = now
+	arbiter.lastProgressAt = now
+	arbiter.lastValue = kind == "water" and water or food
 
-\treturn true
+	return true
 end
 
 function state.survivalArbiterNoteProgress(kind, value)
-\tlocal arbiter = state.survivalArbiter
-\tif arbiter.owner ~= kind then return end
+	local arbiter = state.survivalArbiter
+	if arbiter.owner ~= kind then return end
 
-\tvalue = tonumber(value)
-\tif not value then return end
+	value = tonumber(value)
+	if not value then return end
 
-\tif arbiter.lastValue == nil or value > arbiter.lastValue + 0.01 then
-\t\tarbiter.lastValue = value
-\t\tarbiter.lastProgressAt = tick()
-\tend
+	if arbiter.lastValue == nil or value > arbiter.lastValue + 0.01 then
+		arbiter.lastValue = value
+		arbiter.lastProgressAt = tick()
+	end
 end
 
 function state.survivalArbiterComplete(kind)
-\tlocal arbiter = state.survivalArbiter
-\tif arbiter.owner ~= kind then return false end
+	local arbiter = state.survivalArbiter
+	if arbiter.owner ~= kind then return false end
 
-\tarbiter.lastOwner = kind
-\tarbiter.owner = nil
-\tarbiter.ownerSince = 0
-\tarbiter.lastProgressAt = tick()
-\tarbiter.lastValue = nil
-\tarbiter.handoffNotBefore = tick() + 1.1
-\treturn true
+	arbiter.lastOwner = kind
+	arbiter.owner = nil
+	arbiter.ownerSince = 0
+	arbiter.lastProgressAt = tick()
+	arbiter.lastValue = nil
+	arbiter.handoffNotBefore = tick() + 1.1
+	return true
 end
 
 local function autoEatStep()
@@ -11780,8 +11827,8 @@ end)
 table.insert(connections, player.CharacterAdded:Connect(function(character)
 	DAMAGE.cooldownUntil = tick() + 1.5
 	DAMAGE.active = false
-	task.defer(DAMAGE.bind, character)
-	task.defer(function()
+	mmbTaskDefer(DAMAGE.bind, character)
+	mmbTaskDefer(function()
 		task.wait(0.35)
 		if character ~= player.Character then return end
 		state.releaseMovementNow(character, true)
@@ -12591,7 +12638,7 @@ function state.drinkEmergencyEscape(character, root, reason)
 	-- Keep the lock and retry. Do NOT resume movement under Terrain.
 	runtimeMessage = "CRITICO: ainda sob Terrain; Auto Run BLOQUEADO; repetindo escape"
 
-	task.delay(1.0, function()
+	mmbTaskDelay(1.0, function()
 		if not state.alive then return end
 
 		local liveCharacter, retryRoot = characterParts()
@@ -20281,7 +20328,7 @@ function state.survivalBrainTakeover(kind, reason)
 				tostring(reason or "no progress")
 			)
 
-		task.defer(function()
+		mmbTaskDefer(function()
 			task.wait(0.12)
 			pcall(autoDrinkStep)
 		end)
@@ -20311,7 +20358,7 @@ function state.survivalBrainTakeover(kind, reason)
 				tostring(reason or "no progress")
 			)
 
-		task.defer(function()
+		mmbTaskDefer(function()
 			task.wait(0.12)
 			pcall(autoEatStep)
 		end)
@@ -26405,8 +26452,8 @@ end
 rebuildMoveToList()
 local spawnsModel = workspace:FindFirstChild("Spawns")
 if spawnsModel then
-	table.insert(connections, spawnsModel.DescendantAdded:Connect(function() task.defer(rebuildMoveToList) end))
-	table.insert(connections, spawnsModel.DescendantRemoving:Connect(function() task.defer(rebuildMoveToList) end))
+	table.insert(connections, spawnsModel.DescendantAdded:Connect(function() mmbTaskDefer(rebuildMoveToList) end))
+	table.insert(connections, spawnsModel.DescendantRemoving:Connect(function() mmbTaskDefer(rebuildMoveToList) end))
 end
 
 local farmButton = Instance.new("TextButton")
@@ -26575,7 +26622,7 @@ local function showWelcomeToast()
 	msg.Parent = toast
 
 	TweenService:Create(toast, TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = UDim2.new(0.5, 0, 0, 16) }):Play()
-	task.delay(4, function()
+	mmbTaskDelay(4, function()
 		if toast.Parent then
 			local outTween = TweenService:Create(toast, TweenInfo.new(0.3), { Position = UDim2.new(0.5, 0, 0, -70) })
 			outTween:Play()
@@ -26793,7 +26840,7 @@ end
 local function reassertQuestWAfterPlayerInput()
 	if not questLandInputShouldStayHeld() then return end
 
-	task.defer(function()
+	mmbTaskDefer(function()
 		-- Let the physical KeyUp/joystick movement fully reach Roblox first.
 		task.wait(0.08)
 
@@ -29542,7 +29589,7 @@ shared.__uiRootCleanup = function()
 	gui:Destroy()
 	shared.__uiRootCleanup = nil
 end
-task.defer(function()
+mmbTaskDefer(function()
 	task.wait(0.20)
 
 	if not state.alive then
