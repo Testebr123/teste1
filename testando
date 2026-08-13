@@ -1021,8 +1021,16 @@ if AskSubState and type(hookmetamethod) == "function" and type(checkcaller) == "
 					)
 
 				if selfDamageRemote
-					and state.drinkTest
-					and state.drinkTest.selfDamageGuard == true then
+					and (
+						(
+							state.drinkTest
+							and state.drinkTest.selfDamageGuard == true
+						)
+						or (
+							state.aquaticRiverEscape
+							and state.aquaticRiverEscape.selfDamageGuard == true
+						)
+					) then
 					return nil
 				end
 			end
@@ -10323,198 +10331,119 @@ state.aquaticRiverEscape =
 	or {
 		busy = false,
 		retryAt = 0,
-		lastLiftAt = 0,
+		selfDamageGuard = false,
+		fallDamageConfig = nil,
+		fallDamageConfigOld = nil,
+		bodyVelocity = nil,
+		bodyGyro = nil,
 	}
 
-function state.aquaticRiverLiftToSurface(
-	character,
-	root,
-	waterPart,
-	waterY
-)
-	if not character
-		or not root
-		or not character.Parent
-		or not root.Parent
-		or not waterPart
-		or not waterPart:IsA("BasePart")
-		or type(waterY) ~= "number" then
+function state.aquaticFlyEnableFallGuard(character)
+	local fly = state.aquaticRiverEscape
 
-		return false
+	fly.selfDamageGuard = true
+	fly.fallDamageConfig = nil
+	fly.fallDamageConfigOld = nil
+
+	if not character or not AnimalConfig then
+		return
 	end
 
-	local humanoid =
-		character:FindFirstChildOfClass(
-			"Humanoid"
-		)
+	local animalType = character:GetAttribute("AnimalType")
+	local animalName = character:GetAttribute("AnimalName")
 
-	if not humanoid
-		or humanoid.Health <= 0 then
-		return false
+	local configForAnimal =
+		animalType
+			and animalName
+			and AnimalConfig[animalType]
+			and AnimalConfig[animalType][animalName]
+
+	if type(configForAnimal) == "table" then
+		fly.fallDamageConfig = configForAnimal
+		fly.fallDamageConfigOld = configForAnimal.DisableFallDamage
+		configForAnimal.DisableFallDamage = true
 	end
-
-	-- Put the LOWEST part of the animal slightly above the water plane.
-	-- This is the same whole-rig principle used by protected Underground Drink:
-	-- move the complete assembly, never Anchor the character and never drag only
-	-- the HRP through the rig.
-	local clearance =
-		math.clamp(
-			state.movementRootClearance(
-				character
-			),
-			2.2,
-			8.5
-		)
-
-	local targetY =
-		waterY
-		+ clearance
-		+ 0.70
-
-	if root.Position.Y >= targetY - 0.35 then
-		waterPart.CanCollide = true
-		return true
-	end
-
-	state.releaseMovementNow(
-		character,
-		true
-	)
-
-	-- Let the rig pass through the water collision plane during the vertical
-	-- recovery. It is restored immediately when the lift is complete.
-	waterPart.CanCollide = false
-
-	local startRootCFrame =
-		root.CFrame
-
-	local goalRootCFrame =
-		CFrame.new(
-			root.Position.X,
-			targetY,
-			root.Position.Z
-		)
-		* startRootCFrame.Rotation
-
-	local rootToPivot
-	pcall(function()
-		rootToPivot =
-			startRootCFrame:ToObjectSpace(
-				character:GetPivot()
-			)
-	end)
-
-	local function placeWholeRig(cframe)
-		if not character.Parent
-			or not root.Parent then
-			return false
-		end
-
-		local placed = false
-
-		if rootToPivot then
-			placed =
-				pcall(function()
-					character:PivotTo(
-						cframe
-							* rootToPivot
-					)
-				end)
-		end
-
-		if not placed then
-			placed =
-				pcall(function()
-					root.CFrame =
-						cframe
-				end)
-		end
-
-		if placed then
-			root.AssemblyLinearVelocity =
-				Vector3.zero
-
-			root.AssemblyAngularVelocity =
-				Vector3.zero
-		end
-
-		return placed
-	end
-
-	-- Six frames are enough for a decisive lift without running a long
-	-- Heartbeat controller or hundreds of raycasts.
-	for step = 1, 6 do
-		local alpha =
-			step / 6
-
-		if not placeWholeRig(
-			startRootCFrame:Lerp(
-				goalRootCFrame,
-				alpha
-			)
-		) then
-			break
-		end
-
-		RunService.Heartbeat:Wait()
-	end
-
-	-- A short endpoint reassertion prevents Savannah's aquatic controller from
-	-- snapping Croc/Hippo straight back to the river bottom on the next frame.
-	for _ = 1, 4 do
-		if not placeWholeRig(
-			goalRootCFrame
-		) then
-			break
-		end
-
-		RunService.Heartbeat:Wait()
-	end
-
-	waterPart.CanCollide = true
-
-	pcall(function()
-		humanoid.PlatformStand = false
-		humanoid.AutoRotate = true
-		humanoid:ChangeState(
-			Enum.HumanoidStateType.GettingUp
-		)
-	end)
-
-	character:SetAttribute(
-		"MovementDisabled",
-		false
-	)
-
-	state.aquaticRiverEscape.lastLiftAt =
-		tick()
-
-	return root.Parent
-		and root.Position.Y
-			>= waterY + 1.0
 end
 
-function state.findAquaticDryTerrainExit(
-	character,
-	root,
-	preferredTarget
-)
+function state.aquaticFlyDisableFallGuard()
+	local fly = state.aquaticRiverEscape
+
+	if fly.fallDamageConfig then
+		pcall(function()
+			fly.fallDamageConfig.DisableFallDamage =
+				fly.fallDamageConfigOld
+		end)
+	end
+
+	fly.fallDamageConfig = nil
+	fly.fallDamageConfigOld = nil
+	fly.selfDamageGuard = false
+end
+
+function state.aquaticFlyDryGroundReached(character, root, waterPart)
+	if not character or not root then
+		return false
+	end
+
+	if root.Position.Y < config.dangerY then
+		return false
+	end
+
+	if isPositionInWaterTerrain(root.Position, 2.6, 3.5) then
+		return false
+	end
+
+	if isPositionInWaterTerrain(
+		root.Position - Vector3.new(0, 1.75, 0),
+		2.4,
+		3.0
+	) then
+		return false
+	end
+
+	if waterPart
+		and waterPart:IsA("BasePart")
+		and state.drinkMainWaterSurface then
+
+		local exposedWater =
+			state.drinkMainWaterSurface(
+				waterPart,
+				root.Position.X,
+				root.Position.Z
+			)
+
+		if exposedWater then
+			return false
+		end
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { character }
+	params.IgnoreWater = false
+
+	local hit =
+		workspace:Raycast(
+			root.Position + Vector3.new(0, 8, 0),
+			Vector3.new(0, -64, 0),
+			params
+		)
+
+	return hit ~= nil
+		and hit.Material ~= Enum.Material.Water
+		and hit.Normal.Y >= 0.12
+end
+
+function state.findAquaticDryTerrainExit(character, root, preferredTarget)
 	if not character or not root then
 		return nil
 	end
 
-	local waterPart =
-		workspace:FindFirstChild(
-			"MainWaterPart"
-		)
-
+	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	local waterY =
 		waterPart
 		and waterPart:IsA("BasePart")
-		and (
-			waterPart.Position.Y
-			+ waterPart.Size.Y * 0.5
-		)
+		and (waterPart.Position.Y + waterPart.Size.Y * 0.5)
 		or root.Position.Y
 
 	local origin =
@@ -10526,83 +10455,45 @@ function state.findAquaticDryTerrainExit(
 
 	local preferredDirection
 
-	if typeof(preferredTarget)
-		== "Vector3" then
-
+	if typeof(preferredTarget) == "Vector3" then
 		local delta =
 			Vector3.new(
-				preferredTarget.X
-					- origin.X,
+				preferredTarget.X - origin.X,
 				0,
-				preferredTarget.Z
-					- origin.Z
+				preferredTarget.Z - origin.Z
 			)
 
 		if delta.Magnitude > 1 then
-			preferredDirection =
-				delta.Unit
+			preferredDirection = delta.Unit
 		end
 	end
 
 	local directions = {}
 
-	local function rotateDirection(
-		direction,
-		degrees
-	)
-		local angle =
-			math.rad(degrees)
-
-		local c =
-			math.cos(angle)
-
-		local s =
-			math.sin(angle)
+	local function rotated(direction, degrees)
+		local angle = math.rad(degrees)
+		local c = math.cos(angle)
+		local s = math.sin(angle)
 
 		return Vector3.new(
-			direction.X * c
-				- direction.Z * s,
+			direction.X * c - direction.Z * s,
 			0,
-			direction.X * s
-				+ direction.Z * c
+			direction.X * s + direction.Z * c
 		).Unit
 	end
 
 	if preferredDirection then
-		-- Prefer the bank that actually advances the pending route.
 		for _, degrees in ipairs({
-			0,
-			-28,
-			28,
-			-55,
-			55,
-			-82,
-			82,
-			180,
+			0, -26, 26, -52, 52, -82, 82
 		}) do
 			table.insert(
 				directions,
-				rotateDirection(
-					preferredDirection,
-					degrees
-				)
+				rotated(preferredDirection, degrees)
 			)
 		end
 	else
-		-- Only eight directions. The old scanner used many rings * many samples
-		-- plus four extra neighbor rays for candidates, which was far too costly
-		-- when an aquatic recovery retried.
-		local offset =
-			(player.UserId % 360)
-			* math.pi / 180
-
 		for index = 0, 7 do
-			local angle =
-				offset
-				+ index / 8
-					* math.pi
-					* 2
-
+			local angle = index / 8 * math.pi * 2
 			table.insert(
 				directions,
 				Vector3.new(
@@ -10614,91 +10505,79 @@ function state.findAquaticDryTerrainExit(
 		end
 	end
 
-	local rootLift =
-		math.max(
-			2.4,
-			state.movementRootClearance(
-				character
-			) * 0.45
-		)
+	local clearance = state.movementRootClearance(character)
 
-	-- At most 48 primary rays, and normally returns after the first/second ring.
 	for _, radius in ipairs({
-		14,
-		24,
-		36,
-		52,
-		72,
-		96,
+		18, 30, 46, 66, 92, 124
 	}) do
 		local best
-		local bestScore =
-			math.huge
+		local bestScore = math.huge
 
-		for _, direction in ipairs(
-			directions
-		) do
-			local point =
-				origin
-				+ direction * radius
+		for _, direction in ipairs(directions) do
+			local point = origin + direction * radius
 
 			local hit =
 				workspace:Raycast(
 					Vector3.new(
 						point.X,
-						waterY + 110,
+						waterY + 120,
 						point.Z
 					),
-					Vector3.new(
-						0,
-						-220,
-						0
-					),
+					Vector3.new(0, -250, 0),
 					terrainParams
 				)
 
-			-- Croc/Hippo are intentionally allowed to use steep natural banks.
-			-- The bank only needs to be solid Terrain at/above the water line.
 			if hit
-				and hit.Material
-					~= Enum.Material.Water
-				and hit.Normal.Y >= 0.22
-				and hit.Position.Y
-					>= waterY - 0.30 then
+				and hit.Material ~= Enum.Material.Water
+				and hit.Normal.Y >= 0.18
+				and hit.Position.Y >= waterY - 0.75 then
 
-				local candidate =
-					hit.Position
-					+ Vector3.new(
-						0,
-						rootLift,
-						0
-					)
+				local stillExposedWater = false
 
-				local score =
-					radius
-					+ math.abs(
-						hit.Position.Y
-							- waterY
-					) * 0.12
+				if waterPart
+					and waterPart:IsA("BasePart")
+					and state.drinkMainWaterSurface then
 
-				if preferredTarget then
-					score +=
-						Vector3.new(
-							preferredTarget.X
-								- candidate.X,
-							0,
-							preferredTarget.Z
-								- candidate.Z
-						).Magnitude
-						* 0.015
+					stillExposedWater =
+						state.drinkMainWaterSurface(
+							waterPart,
+							point.X,
+							point.Z
+						) ~= nil
 				end
 
-				if score < bestScore then
-					bestScore =
-						score
+				if not stillExposedWater then
+					local candidate =
+						hit.Position
+						+ Vector3.new(
+							0,
+							math.clamp(
+								clearance * 0.38,
+								1.8,
+								3.2
+							),
+							0
+						)
 
-					best =
-						candidate
+					local score =
+						radius
+						+ math.abs(
+							hit.Position.Y - waterY
+						) * 0.15
+
+					if typeof(preferredTarget) == "Vector3" then
+						score +=
+							Vector3.new(
+								preferredTarget.X - candidate.X,
+								0,
+								preferredTarget.Z - candidate.Z
+							).Magnitude * 0.01
+					end
+
+					if score < bestScore then
+						bestScore = score
+						best = candidate
+					end
 				end
 			end
 		end
@@ -10711,132 +10590,40 @@ function state.findAquaticDryTerrainExit(
 	return nil
 end
 
-function state.moveAquaticToDryTerrain(
-	character,
-	root,
-	preferredTarget
-)
+function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 	if not character
-		or not root then
+		or not root
+		or not state.isCrocOrHippoMovementCharacter(character) then
 		return false
 	end
 
-	local controller =
-		state.aquaticRiverEscape
+	local humanoid =
+		character:FindFirstChildOfClass("Humanoid")
 
-	if controller.busy then
+	if not humanoid or humanoid.Health <= 0 then
 		return false
 	end
 
-	if tick()
-		< (controller.retryAt or 0) then
-		return false
-	end
+	local waterPart = workspace:FindFirstChild("MainWaterPart")
 
-	controller.busy = true
-
-	local function finish(
-		ok,
-		retryDelay
-	)
-		controller.busy = false
-
-		if ok then
-			controller.retryAt = 0
-		else
-			controller.retryAt =
-				tick()
-				+ (
-					tonumber(
-						retryDelay
-					) or 1.75
-				)
-		end
-
-		return ok
-	end
-
-	state.releaseMovementNow(
+	if state.aquaticFlyDryGroundReached(
 		character,
-		true
-	)
-
-	local waterPart =
-		workspace:FindFirstChild(
-			"MainWaterPart"
-		)
-
-	local waterY =
+		root,
 		waterPart
-		and waterPart:IsA("BasePart")
-		and (
-			waterPart.Position.Y
-			+ waterPart.Size.Y * 0.5
+	) then
+		pcall(
+			humanoid.ChangeState,
+			humanoid,
+			Enum.HumanoidStateType.GettingUp
 		)
-		or nil
-
-	-- Phase 1: if Croc/Hippo is on the river bottom, rise vertically first.
-	-- Do NOT try to walk diagonally from the bottom through the water.
-	if waterY
-		and state.isCrocOrHippoMovementCharacter(
-			character
-		)
-		and state.isBodyActuallyInWater(
-			character,
-			root
-		)
-		and root.Position.Y
-			< waterY
-				+ state.movementRootClearance(
-					character
-				) * 0.60 then
-
-		runtimeMessage =
-			CROC.isCharacter(character)
-				and "Croc river recovery: lifting to surface"
-				or "Hippo river recovery: lifting to surface"
-
-		if not state.aquaticRiverLiftToSurface(
-			character,
-			root,
-			waterPart,
-			waterY
-		) then
-
-			if waterPart
-				and waterPart:IsA(
-					"BasePart"
-				) then
-				waterPart.CanCollide =
-					true
-			end
-
-			return finish(
-				false,
-				1.5
-			)
-		end
-
-		character, root =
-			characterParts()
-
-		if not character
-			or not root then
-			return finish(
-				false,
-				1.5
-			)
-		end
+		return true
 	end
 
-	-- Keep a solid surface under these large aquatic rigs while they cross from
-	-- the water plane to the actual bank.
-	setAquaticWaterCollision(
-		character,
-		true
-	)
+	-- Fly is created ONLY if Croc/Hippo is actually still in water.
+	if not state.isBodyActuallyInWater(character, root) then
+		return false
+	end
 
-	-- Phase 2: cheap local bank search only AFTER reaching the surface.
 	local target =
 		state.findAquaticDryTerrainExit(
 			character,
@@ -10847,94 +10634,342 @@ function state.moveAquaticToDryTerrain(
 	if not target then
 		runtimeMessage =
 			CROC.isCharacter(character)
-				and "Croc river recovery: no local bank found; retrying later"
-				or "Hippo river recovery: no local bank found; retrying later"
-
-		return finish(
-			false,
-			2.0
-		)
+				and "Croc water Fly: no local dry bank found"
+				or "Hippo water Fly: no local dry bank found"
+		return false
 	end
 
-	runtimeMessage =
-		CROC.isCharacter(character)
-			and "Croc river recovery: moving from surface to dry bank"
-			or "Hippo river recovery: moving from surface to dry bank"
+	state.releaseMovementNow(character, true)
+
+	local fly = state.aquaticRiverEscape
+
+	pcall(function()
+		local old = root:FindFirstChild("MMB_AquaticFlyVelocity")
+		if old then old:Destroy() end
+	end)
+
+	pcall(function()
+		local old = root:FindFirstChild("MMB_AquaticFlyGyro")
+		if old then old:Destroy() end
+	end)
+
+	local oldAutoRotate = humanoid.AutoRotate
+	local oldWaterCollision =
+		waterPart
+		and waterPart:IsA("BasePart")
+		and waterPart.CanCollide
+		or false
+
+	state.aquaticFlyEnableFallGuard(character)
+
+	if waterPart and waterPart:IsA("BasePart") then
+		-- Do not let the water collision plane trap the rig below the surface.
+		waterPart.CanCollide = false
+	end
+
+	local BG = Instance.new("BodyGyro")
+	local BV = Instance.new("BodyVelocity")
+
+	BG.Name = "MMB_AquaticFlyGyro"
+	BV.Name = "MMB_AquaticFlyVelocity"
+
+	-- Same core constants used by Infinite Yield Fly.
+	BG.P = 9e4
+	BG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+	BG.CFrame = root.CFrame
+
+	BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+	BV.Velocity = Vector3.zero
+
+	BG.Parent = root
+	BV.Parent = root
+
+	fly.bodyGyro = BG
+	fly.bodyVelocity = BV
+
+	pcall(function()
+		humanoid.PlatformStand = true
+		humanoid.AutoRotate = false
+	end)
+
+	character:SetAttribute("MovementDisabled", false)
+
+	local waterY =
+		waterPart
+		and waterPart:IsA("BasePart")
+		and (waterPart.Position.Y + waterPart.Size.Y * 0.5)
+		or root.Position.Y
+
+	local clearance = state.movementRootClearance(character)
+
+	-- Low flight only: enough to rise from the river and cross the bank lip.
+	local cruiseY =
+		waterY
+		+ math.clamp(
+			clearance * 0.30,
+			0.75,
+			2.25
+		)
+
+	local bankY =
+		math.min(
+			target.Y,
+			waterY
+				+ math.clamp(
+					clearance * 0.48,
+					1.25,
+					3.25
+				)
+		)
+
+	-- Match the plain Infinite Yield `fly` command: NO numeric argument is
+	-- supplied and no multiplier is introduced here. sFLY() itself uses its
+	-- internal active base SPEED of 50 when movement is requested.
+	-- This remains completely independent from Acceleration / WalkSpeed.
+	local IY_FLY_SPEED = 50
+
+	local flatDistance =
+		Vector3.new(
+			target.X - root.Position.X,
+			0,
+			target.Z - root.Position.Z
+		).Magnitude
+
+	local deadline =
+		tick()
+		+ math.clamp(
+			flatDistance / IY_FLY_SPEED + 2.0,
+			2.5,
+			7.0
+		)
+
+	local success = false
+
+	local callOk, callError =
+		pcall(function()
+			while state.alive
+				and character.Parent
+				and root.Parent
+				and humanoid.Parent
+				and humanoid.Health > 0
+				and tick() < deadline do
+
+				-- First dry-ground frame = immediate UNFLY.
+				if state.aquaticFlyDryGroundReached(
+					character,
+					root,
+					waterPart
+				) then
+					success = true
+					break
+				end
+
+				local horizontal =
+					Vector3.new(
+						target.X - root.Position.X,
+						0,
+						target.Z - root.Position.Z
+					)
+
+				local remaining = horizontal.Magnitude
+
+				local desiredY =
+					remaining > 18
+						and cruiseY
+						or bankY
+
+				local hardCeiling =
+					waterY
+					+ math.clamp(
+						clearance * 0.55,
+						1.5,
+						3.75
+					)
+
+				desiredY = math.min(desiredY, hardCeiling)
+
+				if root.Position.Y > hardCeiling + 0.35 then
+					desiredY = cruiseY
+				end
+
+				local flyDelta =
+					Vector3.new(
+						horizontal.X,
+						desiredY - root.Position.Y,
+						horizontal.Z
+					)
+
+				if flyDelta.Magnitude <= 0.10 then
+					BV.Velocity = Vector3.zero
+				else
+					BV.Velocity =
+						flyDelta.Unit * IY_FLY_SPEED
+				end
+
+				if horizontal.Magnitude > 0.25 then
+					BG.CFrame =
+						CFrame.lookAt(
+							root.Position,
+							root.Position + horizontal.Unit,
+							Vector3.yAxis
+						)
+				end
+
+				root.AssemblyAngularVelocity = Vector3.zero
+
+				runtimeMessage =
+					CROC.isCharacter(character)
+						and string.format(
+							"Croc water Fly: exiting river (%.0f studs)",
+							remaining
+						)
+						or string.format(
+							"Hippo water Fly: exiting river (%.0f studs)",
+							remaining
+						)
+
+				RunService.Heartbeat:Wait()
+			end
+		end)
+
+	-- UNFLY immediately removes both Infinite-Yield-style force objects.
+	pcall(function()
+		if BV and BV.Parent then BV:Destroy() end
+	end)
+
+	pcall(function()
+		if BG and BG.Parent then BG:Destroy() end
+	end)
+
+	fly.bodyVelocity = nil
+	fly.bodyGyro = nil
+
+	if root and root.Parent then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	pcall(function()
+		humanoid.PlatformStand = false
+		humanoid.AutoRotate = oldAutoRotate ~= false
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end)
+
+	character:SetAttribute("MovementDisabled", false)
+
+	if success then
+		if waterPart and waterPart:IsA("BasePart") then
+			waterPart.CanCollide = false
+		end
+
+		-- Keep the anti-fall guard for two landing frames only.
+		for _ = 1, 2 do
+			RunService.Heartbeat:Wait()
+		end
+
+		state.aquaticFlyDisableFallGuard()
+
+		runtimeMessage =
+			CROC.isCharacter(character)
+				and "Croc water Fly OFF: dry Terrain reached"
+				or "Hippo water Fly OFF: dry Terrain reached"
+
+		return true
+	end
+
+	if waterPart and waterPart:IsA("BasePart") then
+		waterPart.CanCollide = oldWaterCollision
+	end
+
+	state.aquaticFlyDisableFallGuard()
+
+	if not callOk then
+		runtimeMessage =
+			"Aquatic Fly error: " .. tostring(callError)
+	end
+
+	return false
+end
+
+function state.moveAquaticToDryTerrain(character, root, preferredTarget)
+	if not character or not root then
+		return false
+	end
+
+	local controller = state.aquaticRiverEscape
+
+	if controller.busy then
+		return false
+	end
+
+	if tick() < (controller.retryAt or 0) then
+		return false
+	end
+
+	-- Crocodile/Hippo: Fly is allowed ONLY while escaping water.
+	if state.isCrocOrHippoMovementCharacter(character) then
+		controller.busy = true
+
+		local ok =
+			state.aquaticRiverInfinityFlyExit(
+				character,
+				root,
+				preferredTarget
+			)
+
+		controller.busy = false
+		controller.retryAt = ok and 0 or tick() + 1.25
+		return ok
+	end
+
+	-- Other aquatic animals keep the prior physical bank movement.
+	local target =
+		state.findAquaticDryTerrainExit(
+			character,
+			root,
+			preferredTarget
+		)
+
+	if not target then
+		return false
+	end
+
+	setAquaticWaterCollision(character, true)
 
 	local moved =
 		safeMoveToPosition(
 			target,
-			5,
+			7,
 			nil,
 			{
 				purpose = "safety",
 				tolerance =
 					math.clamp(
-						state.movementFootprint(
-							character
-						) * 0.55,
-						6,
-						11
+						state.movementFootprint(character) * 0.65,
+						8,
+						15
 					),
-
-				-- This is now a terrestrial MoveTo from the water surface.
 				vertical = false,
 				forceMoveToLand = true,
 				constantSpeed = true,
-
-				-- Do not stop merely because MainWaterPart is collidable beneath
-				-- the animal. Reach the actual bank target.
-				stopOnDryGround = false,
-				speedScale = 0.70,
-				maxDuration = 45,
+				stopOnDryGround = true,
+				maxDuration = 180,
 			}
 		)
 
-	character, root =
-		characterParts()
+	character, root = characterParts()
 
-	local confirmed =
-		character
+	if moved
+		and character
 		and root
-		and state.normalizeDryLandState(
-			character,
-			root
-		)
+		and state.normalizeDryLandState(character, root) then
 
-	if moved and confirmed then
-		setAquaticWaterCollision(
-			character,
-			false
-		)
-
-		state.releaseMovementNow(
-			character,
-			true
-		)
-
-		runtimeMessage =
-			CROC.isCharacter(character)
-				and "Croc river recovery: dry Terrain confirmed"
-				or "Hippo river recovery: dry Terrain confirmed"
-
-		return finish(
-			true
-		)
+		setAquaticWaterCollision(character, false)
+		state.releaseMovementNow(character, true)
+		return true
 	end
 
-	-- Leave the water plane solid between lightweight retries so the animal
-	-- cannot immediately sink all the way back to the river bottom.
-	if character then
-		setAquaticWaterCollision(
-			character,
-			true
-		)
-	end
-
-	return finish(
-		false,
-		1.75
-	)
+	return false
 end
 
 local function isNearSavedSwimLocation(root, radius)
