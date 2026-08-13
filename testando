@@ -2163,6 +2163,16 @@ function state.releaseMovementNow(character, zeroHorizontal)
 end
 
 function state.applySurvivalDefaults(forceEnable)
+	-- Croc/Hippo underwater Fly is an exclusive movement transaction.
+	-- No other subsystem may silently re-enable Survival while it is active.
+	if state.aquaticRiverEscape
+		and state.aquaticRiverEscape.survivalSuspended then
+
+		state.autoEat = false
+		state.autoDrink = false
+		return
+	end
+
 	if forceEnable then
 		state.autoEatManualDisabled = false
 		state.autoDrinkManualDisabled = false
@@ -3102,6 +3112,460 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 
 	local lastMoveWReassertAt = 0
 
+	local waterBridgeDone = false
+
+	local function mainWaterRouteCrossing(
+		fromPosition,
+		toPosition
+	)
+		if not aquaticBankClimber
+			or purpose == "water"
+			or purpose == "safety"
+			or swimApproach
+			or forceVertical
+			or rawVerticalTransit then
+
+			return nil
+		end
+
+		local waterPart =
+			workspace:FindFirstChild(
+				"MainWaterPart"
+			)
+
+		if not waterPart
+			or not waterPart:IsA(
+				"BasePart"
+			) then
+
+			return nil
+		end
+
+		local a =
+			waterPart.CFrame:PointToObjectSpace(
+				fromPosition
+			)
+
+		local b =
+			waterPart.CFrame:PointToObjectSpace(
+				toPosition
+			)
+
+		local halfX =
+			waterPart.Size.X * 0.5
+
+		local halfZ =
+			waterPart.Size.Z * 0.5
+
+		local insideA =
+			math.abs(a.X) <= halfX
+			and math.abs(a.Z) <= halfZ
+
+		local insideB =
+			math.abs(b.X) <= halfX
+			and math.abs(b.Z) <= halfZ
+
+		-- Water destinations are handled by Auto Drink, never by this bridge.
+		if insideA or insideB then
+			return nil
+		end
+
+		local dx = b.X - a.X
+		local dz = b.Z - a.Z
+		local tEnter = 0
+		local tExit = 1
+
+		local function clipAxis(
+			origin,
+			delta,
+			minimum,
+			maximum
+		)
+			if math.abs(delta) < 0.0001 then
+				return origin >= minimum
+					and origin <= maximum
+			end
+
+			local t1 =
+				(minimum - origin)
+				/ delta
+
+			local t2 =
+				(maximum - origin)
+				/ delta
+
+			if t1 > t2 then
+				t1, t2 = t2, t1
+			end
+
+			tEnter =
+				math.max(
+					tEnter,
+					t1
+				)
+
+			tExit =
+				math.min(
+					tExit,
+					t2
+				)
+
+			return tEnter <= tExit
+		end
+
+		if not clipAxis(
+			a.X,
+			dx,
+			-halfX,
+			halfX
+		) then
+			return nil
+		end
+
+		if not clipAxis(
+			a.Z,
+			dz,
+			-halfZ,
+			halfZ
+		) then
+			return nil
+		end
+
+		if tExit <= 0
+			or tEnter >= 1
+			or tEnter > tExit then
+
+			return nil
+		end
+
+		local entryLocal =
+			Vector3.new(
+				a.X + dx * tEnter,
+				0,
+				a.Z + dz * tEnter
+			)
+
+		local exitLocal =
+			Vector3.new(
+				a.X + dx * tExit,
+				0,
+				a.Z + dz * tExit
+			)
+
+		local entryDistance =
+			Vector2.new(
+				entryLocal.X - a.X,
+				entryLocal.Z - a.Z
+			).Magnitude
+
+		return {
+			part = waterPart,
+			entryLocal = entryLocal,
+			exitLocal = exitLocal,
+			entryDistance = entryDistance,
+		}
+	end
+
+	local function runMainWaterElevatedBridge(
+		bridge,
+		maximumSpeed
+	)
+		if not bridge
+			or not bridge.part
+			or not bridge.part.Parent then
+
+			return false
+		end
+
+		local waterPart =
+			bridge.part
+
+		state.heavyWalkStop(
+			character
+		)
+
+		local oldAutoRotate =
+			humanoid.AutoRotate
+
+		local BG =
+			Instance.new(
+				"BodyGyro"
+			)
+
+		local BV =
+			Instance.new(
+				"BodyVelocity"
+			)
+
+		BG.Name =
+			"MMB_MainWaterBridgeGyro"
+
+		BV.Name =
+			"MMB_MainWaterBridgeVelocity"
+
+		BG.P = 9e4
+		BG.MaxTorque =
+			Vector3.new(
+				9e9,
+				9e9,
+				9e9
+			)
+
+		BV.MaxForce =
+			Vector3.new(
+				9e9,
+				9e9,
+				9e9
+			)
+
+		BG.CFrame =
+			root.CFrame
+
+		BV.Velocity =
+			Vector3.zero
+
+		BG.Parent =
+			root
+
+		BV.Parent =
+			root
+
+		pcall(function()
+			humanoid.PlatformStand = true
+			humanoid.AutoRotate = false
+		end)
+
+		local currentLocal =
+			waterPart.CFrame:PointToObjectSpace(
+				root.Position
+			)
+
+		local halfY =
+			waterPart.Size.Y * 0.5
+
+		local clearance =
+			state.movementRootClearance(
+				character
+			)
+
+		local cruiseLocalY =
+			math.max(
+				currentLocal.Y,
+				halfY
+					+ clearance
+					+ 2.0
+			)
+
+		local routeDirection =
+			Vector3.new(
+				bridge.exitLocal.X
+					- bridge.entryLocal.X,
+				0,
+				bridge.exitLocal.Z
+					- bridge.entryLocal.Z
+			)
+
+		if routeDirection.Magnitude <= 0.01 then
+			routeDirection =
+				Vector3.new(
+					1,
+					0,
+					0
+				)
+		else
+			routeDirection =
+				routeDirection.Unit
+		end
+
+		local outsideMargin =
+			math.clamp(
+				state.movementFootprint(
+					character
+				) * 0.22,
+				3,
+				5
+			)
+
+		local exitLocal =
+			bridge.exitLocal
+			+ routeDirection
+				* outsideMargin
+
+		local liftTarget =
+			waterPart.CFrame:PointToWorldSpace(
+				Vector3.new(
+					currentLocal.X,
+					cruiseLocalY,
+					currentLocal.Z
+				)
+			)
+
+		local exitTarget =
+			waterPart.CFrame:PointToWorldSpace(
+				Vector3.new(
+					exitLocal.X,
+					cruiseLocalY,
+					exitLocal.Z
+				)
+			)
+
+		local bridgeSpeed =
+			math.clamp(
+				tonumber(maximumSpeed)
+					or 36,
+				24,
+				50
+			)
+
+		local function bridgeFlyTo(
+			goal,
+			timeout
+		)
+			local deadline =
+				tick()
+				+ timeout
+
+			while state.alive
+				and character.Parent
+				and root.Parent
+				and humanoid.Parent
+				and humanoid.Health > 0
+				and token
+					== state.safeMove.cancelToken
+				and tick() < deadline do
+
+				local delta =
+					goal - root.Position
+
+				if delta.Magnitude <= 1.5 then
+					return true
+				end
+
+				local speed =
+					math.clamp(
+						delta.Magnitude * 1.5,
+						14,
+						bridgeSpeed
+					)
+
+				BV.Velocity =
+					delta.Unit
+					* speed
+
+				local flat =
+					Vector3.new(
+						delta.X,
+						0,
+						delta.Z
+					)
+
+				if flat.Magnitude > 0.25 then
+					BG.CFrame =
+						CFrame.lookAt(
+							root.Position,
+							root.Position
+								+ flat.Unit,
+							Vector3.yAxis
+						)
+				end
+
+				root.AssemblyAngularVelocity =
+					Vector3.zero
+
+				runtimeMessage =
+					CROC.isCharacter(
+						character
+					)
+						and "Croc MoveTo: flying above MainWaterPart"
+						or "Hippo MoveTo: flying above MainWaterPart"
+
+				RunService.Heartbeat:Wait()
+			end
+
+			return false
+		end
+
+		local liftDistance =
+			(liftTarget - root.Position).Magnitude
+
+		local lifted =
+			bridgeFlyTo(
+				liftTarget,
+				math.clamp(
+					liftDistance
+						/ bridgeSpeed
+						+ 1.5,
+					1.5,
+					5
+				)
+			)
+
+		local crossed = false
+
+		if lifted then
+			local crossDistance =
+				(exitTarget - root.Position).Magnitude
+
+			crossed =
+				bridgeFlyTo(
+					exitTarget,
+					math.clamp(
+						crossDistance
+							/ bridgeSpeed
+							+ 2.0,
+						2.0,
+						12
+					)
+				)
+		end
+
+		pcall(function()
+			if BV and BV.Parent then
+				BV:Destroy()
+			end
+		end)
+
+		pcall(function()
+			if BG and BG.Parent then
+				BG:Destroy()
+			end
+		end)
+
+		if root and root.Parent then
+			root.AssemblyLinearVelocity =
+				Vector3.zero
+
+			root.AssemblyAngularVelocity =
+				Vector3.zero
+		end
+
+		pcall(function()
+			humanoid.PlatformStand = false
+			humanoid.AutoRotate =
+				oldAutoRotate ~= false
+
+			humanoid:ChangeState(
+				Enum.HumanoidStateType.GettingUp
+			)
+		end)
+
+		character:SetAttribute(
+			"MovementDisabled",
+			false
+		)
+
+		if crossed then
+			runtimeMessage =
+				CROC.isCharacter(
+					character
+				)
+					and "Croc MoveTo: crossed water above surface"
+					or "Hippo MoveTo: crossed water above surface"
+		end
+
+		return crossed
+	end
+
 	local function terrainHeightAt(worldPosition, referenceY)
 		local params = RaycastParams.new()
 		params.FilterType = Enum.RaycastFilterType.Include
@@ -3592,6 +4056,50 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			end
 
 			local current = root.Position
+
+			if aquaticBankClimber
+				and not waterBridgeDone
+				and purpose ~= "water"
+				and purpose ~= "safety"
+				and not forceVertical
+				and not swimApproach
+				and not rawVerticalTransit then
+
+				local bridge =
+					mainWaterRouteCrossing(
+						current,
+						position
+					)
+
+				if bridge
+					and bridge.entryDistance
+						<= math.max(
+							18,
+							state.movementFootprint(
+								character
+							) + 8
+						) then
+
+					local crossed =
+						runMainWaterElevatedBridge(
+							bridge,
+							maximumSpeed
+						)
+
+					if not crossed then
+						runtimeMessage =
+							"Elevated water crossing failed; land route postponed"
+
+						return false
+					end
+
+					waterBridgeDone = true
+					current = root.Position
+					lastProgressAt = tick()
+					lastDistance = math.huge
+				end
+			end
+
 			local flatDelta = Vector3.new(
 				position.X - current.X,
 				0,
@@ -4022,26 +4530,88 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				)
 				and not verticalMovement
 				and flatDistance > tolerance * 1.5
-				and not isAquaticCharacter(character) then
-
-				local terrainProbe = RaycastParams.new()
-				terrainProbe.FilterType = Enum.RaycastFilterType.Include
-				terrainProbe.FilterDescendantsInstances = { workspace.Terrain }
-				terrainProbe.IgnoreWater = false
+				and (
+					not isAquaticCharacter(
+						character
+					)
+					or aquaticBankClimber
+				) then
 
 				local aheadDistance =
-					math.clamp(maximumSpeed * 0.28, 10, 34)
+					math.clamp(
+						maximumSpeed * 0.28,
+						10,
+						34
+					)
 
-				local ahead = root.Position + desired * aheadDistance
-				local groundAhead = workspace:Raycast(
-					ahead + Vector3.new(0, 90, 0),
-					Vector3.new(0, -180, 0),
-					terrainProbe
-				)
+				local ahead =
+					root.Position
+					+ desired
+						* aheadDistance
 
-				local waterAhead =
-					groundAhead
-					and groundAhead.Material == Enum.Material.Water
+				local waterAhead = false
+
+				if aquaticBankClimber then
+					-- Croc/Hippo land routes use only the known MainWaterPart
+					-- rectangle here: zero Terrain raycasts and no accidental
+					-- re-entry after the underwater escape.
+					local waterPart =
+						workspace:FindFirstChild(
+							"MainWaterPart"
+						)
+
+					if waterPart
+						and waterPart:IsA(
+							"BasePart"
+						) then
+
+						local localAhead =
+							waterPart.CFrame:PointToObjectSpace(
+								ahead
+							)
+
+						waterAhead =
+							math.abs(
+								localAhead.X
+							) <= waterPart.Size.X * 0.5
+							and math.abs(
+								localAhead.Z
+							) <= waterPart.Size.Z * 0.5
+					end
+				else
+					local terrainProbe =
+						RaycastParams.new()
+
+					terrainProbe.FilterType =
+						Enum.RaycastFilterType.Include
+
+					terrainProbe.FilterDescendantsInstances = {
+						workspace.Terrain,
+					}
+
+					terrainProbe.IgnoreWater = false
+
+					local groundAhead =
+						workspace:Raycast(
+							ahead
+								+ Vector3.new(
+									0,
+									90,
+									0
+								),
+							Vector3.new(
+								0,
+								-180,
+								0
+							),
+							terrainProbe
+						)
+
+					waterAhead =
+						groundAhead
+						and groundAhead.Material
+							== Enum.Material.Water
+				end
 
 				local mayApproachWater =
 					purpose == "water"
@@ -9742,6 +10312,11 @@ function state.survivalForceWaterHandoff(
 end
 
 local function autoEatStep()
+	if state.aquaticRiverEscape
+		and state.aquaticRiverEscape.survivalSuspended then
+		return
+	end
+
 	if state.questGrowthReset.exclusive then return end
 	-- v65: Swim quests do not disable survival. If Food is low, eating pauses
 	-- the Swim route; after feeding, the quest returns to the saved Swim point.
@@ -10671,7 +11246,133 @@ state.aquaticRiverEscape =
 		fallDamageConfigOld = nil,
 		bodyVelocity = nil,
 		bodyGyro = nil,
+		survivalSuspended = false,
 	}
+
+function state.aquaticSurvivalSuspend(
+	character
+)
+	local fly =
+		state.aquaticRiverEscape
+
+	if fly.survivalSuspended then
+		state.autoEat = false
+		state.autoDrink = false
+		return
+	end
+
+	fly.survivalSuspended = true
+
+	-- Turn the actual toggles OFF, not merely the worker loops. This prevents
+	-- any Eat/Drink movement transaction from fighting BodyVelocity/BodyGyro.
+	state.autoEat = false
+	state.autoDrink = false
+
+	eatingToFull = false
+	drinkingToFull = false
+	activeCarcass = nil
+	eatingSourcePosition = nil
+	eatingTargetReachedAt = nil
+	drinkingSourcePosition = nil
+	drinkingStuckSince = nil
+	lastDrinkWatchdogWater = nil
+
+	state.questCarnivoreFeeding = false
+	state.questBaboonFeeding = false
+	state.questGiraffeFeeding = false
+
+	pcall(BABOON.cancel)
+	pcall(GIRAFFE.cancel)
+
+	if state.safeMove
+		and state.safeMove.active
+		and (
+			state.safeMove.reason == "food"
+			or state.safeMove.reason == "water"
+		) then
+
+		state.safeMove.cancelToken += 1
+	end
+
+	if state.survivalArbiterReset then
+		state.survivalArbiterReset(
+			"aquatic Fly exclusive movement"
+		)
+	end
+
+	if state.drinkProgressReset then
+		state.drinkProgressReset()
+	end
+
+	if renders then
+		if renders.autoEat then
+			pcall(renders.autoEat)
+		end
+
+		if renders.autoDrink then
+			pcall(renders.autoDrink)
+		end
+	end
+end
+
+function state.aquaticSurvivalResume(
+	character
+)
+	local fly =
+		state.aquaticRiverEscape
+
+	if not fly.survivalSuspended then
+		return
+	end
+
+	fly.survivalSuspended = false
+
+	-- User requested both Survival systems to come back automatically after
+	-- the Croc/Hippo is fully outside the water-exit transaction.
+	state.autoEatManualDisabled = false
+	state.autoDrinkManualDisabled = false
+	state.autoEat = true
+	state.autoDrink = true
+
+	eatingToFull = false
+	drinkingToFull = false
+	activeCarcass = nil
+	eatingSourcePosition = nil
+	eatingTargetReachedAt = nil
+	drinkingSourcePosition = nil
+	drinkingStuckSince = nil
+
+	if state.survivalArbiterReset then
+		state.survivalArbiterReset(
+			"aquatic Fly completed"
+		)
+	end
+
+	local water =
+		character
+		and tonumber(
+			character:GetAttribute(
+				"Water"
+			)
+		)
+		or 100
+
+	-- If we came out still thirsty, Drink gets the first transaction. Auto Eat
+	-- remains ON but cannot start a competing route while drinkingToFull is true.
+	if water <= 75 then
+		drinkingToFull = true
+	end
+
+	if renders then
+		if renders.autoEat then
+			pcall(renders.autoEat)
+		end
+
+		if renders.autoDrink then
+			pcall(renders.autoDrink)
+		end
+	end
+end
 
 function state.aquaticFlyEnableFallGuard(character)
 	local fly = state.aquaticRiverEscape
@@ -10860,9 +11561,9 @@ function state.mainWaterNearestExitTarget(
 	-- the exact boundary.
 	local outsideMargin =
 		math.clamp(
-			footprint * 0.45,
-			7,
-			12
+			footprint * 0.20,
+			3,
+			5
 		)
 
 	local lift =
@@ -10943,9 +11644,9 @@ function state.mainWaterExitReached(
 
 	local outsideXZ =
 		math.abs(p.X)
-			> halfX + 0.75
+			> halfX + 0.25
 		or math.abs(p.Z)
-			> halfZ + 0.75
+			> halfZ + 0.25
 
 	if not outsideXZ then
 		return false
@@ -11040,10 +11741,19 @@ function state.aquaticRiverInfinityFlyExit(
 
 	-- Already outside the water-part condition: nothing to recover.
 	if not under then
-		return state.mainWaterExitReached(
-			root,
-			info.part
-		)
+		local outside =
+			state.mainWaterExitReached(
+				root,
+				info.part
+			)
+
+		if outside then
+			state.aquaticSurvivalResume(
+				character
+			)
+		end
+
+		return outside
 	end
 
 	local target =
@@ -11058,6 +11768,12 @@ function state.aquaticRiverInfinityFlyExit(
 
 	local waterPart =
 		info.part
+
+	-- Exclusive transaction: Eat + Drink are physically OFF until UNFLY has
+	-- completed outside MainWaterPart.
+	state.aquaticSurvivalSuspend(
+		character
+	)
 
 	state.releaseMovementNow(
 		character,
@@ -11204,9 +11920,16 @@ function state.aquaticRiverInfinityFlyExit(
 					BV.Velocity =
 						Vector3.zero
 				else
+					local flySpeed =
+						math.clamp(
+							delta.Magnitude * 1.65,
+							14,
+							IY_FLY_SPEED
+						)
+
 					BV.Velocity =
 						delta.Unit
-						* IY_FLY_SPEED
+						* flySpeed
 				end
 
 				local flat =
@@ -11301,6 +12024,10 @@ function state.aquaticRiverInfinityFlyExit(
 	state.aquaticFlyDisableFallGuard()
 
 	if success then
+		state.aquaticSurvivalResume(
+			character
+		)
+
 		runtimeMessage =
 			CROC.isCharacter(
 				character
@@ -11357,6 +12084,11 @@ function state.moveAquaticToDryTerrain(character, root, preferredTarget)
 				root,
 				info.part
 			) then
+
+			state.aquaticSurvivalResume(
+				character
+			)
+
 			return true
 		end
 
@@ -15349,6 +16081,11 @@ local function virtualDrinkKick()
 end
 
 local function autoDrinkStep()
+	if state.aquaticRiverEscape
+		and state.aquaticRiverEscape.survivalSuspended then
+		return
+	end
+
 	if state.questGrowthReset.exclusive then return end
 	if not state.autoDrink or criticalRecoveryActive then return end
 
@@ -27477,6 +28214,22 @@ local function toggle(parent, label, key, order)
 	row.MouseEnter:Connect(function() hovering = true; applyVisual() end)
 	row.MouseLeave:Connect(function() hovering = false; applyVisual() end)
 	row.Activated:Connect(function()
+		if (
+			key == "autoEat"
+			or key == "autoDrink"
+		)
+			and state.aquaticRiverEscape
+			and state.aquaticRiverEscape.survivalSuspended then
+
+			state[key] = false
+			render()
+
+			runtimeMessage =
+				"Water Fly active: Auto Eat/Drink locked OFF until exit"
+
+			return
+		end
+
 		state[key] = not state[key]
 
 		if key == "autoEat" then
