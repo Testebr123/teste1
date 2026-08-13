@@ -2299,6 +2299,33 @@ function state.releaseMovementNow(character, zeroHorizontal)
 	end
 end
 
+function state.enableSurvivalForAutomation(reason)
+	-- Clicking an automation that depends on long unattended play should always
+	-- arm Survival. If Croc/Hippo Water Exit currently owns movement, keep the
+	-- visible toggles OFF only until that transaction finishes; its normal resume
+	-- path will then turn both back ON automatically.
+	state.autoEatManualDisabled = false
+	state.autoDrinkManualDisabled = false
+
+	if state.aquaticRiverEscape
+		and state.aquaticRiverEscape.survivalSuspended then
+
+		state.autoEat = false
+		state.autoDrink = false
+
+		runtimeMessage =
+			(reason or "Automation")
+			.. ": Auto Eat/Drink armed; they will resume after Water Exit"
+
+		return false
+	end
+
+	state.autoEat = true
+	state.autoDrink = true
+
+	return true
+end
+
 function state.applySurvivalDefaults(forceEnable)
 	-- Croc/Hippo underwater Fly is an exclusive movement transaction.
 	-- No other subsystem may silently re-enable Survival while it is active.
@@ -2445,17 +2472,44 @@ function state.dynamicMovementSpeed(character, mode)
 	if acceleration
 		and acceleration > 0 then
 
-		-- Acceleration is treated as a ceiling, never copied directly to speed.
-		-- This is recalculated continuously, so a baby speeds up as it grows.
+		local specialMovementCeiling =
+			state.isFlyingMovementCharacter(
+				character
+			)
+			or CROC.isCharacter(
+				character
+			)
+
+		if specialMovementCeiling then
+			-- Preserve the existing conservative rule for flyers and Croc. Their
+			-- advertised Acceleration represents flight/swimming, not normal land.
+			local target =
+				acceleration
+				* growthScale
+				* modeScale
+				* 0.90
+
+			return math.min(
+				target,
+				acceleration * 0.92
+			),
+				acceleration,
+				growth
+		end
+
+		-- Normal terrestrial animals already expose a LIVE Acceleration value.
+		-- Applying GrowthPercentage again here was a second speed penalty and
+		-- could leave a growing animal at barely half of its current safe ceiling.
+		-- Run just below the live limit so we gain the available speed without
+		-- intentionally crossing the value advertised by the game.
 		local target =
 			acceleration
-			* growthScale
 			* modeScale
-			* 0.90
+			* 0.98
 
 		return math.min(
 			target,
-			acceleration * 0.92
+			acceleration * 0.985
 		),
 			acceleration,
 			growth
@@ -31081,6 +31135,10 @@ local function toggle(parent, label, key, order)
 			state.growExistingAutomaticAll = false
 			if state[key] then
 				state.growAllSlots = false
+
+				state.enableSurvivalForAutomation(
+					"Grow Existing Slots"
+				)
 			end
 
 		elseif key == "growAllSlots" and state[key] then
@@ -31129,7 +31187,10 @@ local function toggle(parent, label, key, order)
 			state.growExistingAutomaticAll = false
 			state.growAllSlots = false
 			state.growExisting, state.growNew, state.autoQuests = false, false, false
-			state.applySurvivalDefaults(true)
+
+			state.enableSurvivalForAutomation(
+				"AFK Coin Farm"
+			)
 			runtimeMessage = state.coinFarmPreferredAnimal
 				and (
 					"AFK Coin Farm active; preferred animal queued: "
