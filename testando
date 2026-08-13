@@ -20822,7 +20822,77 @@ local function trySwitchToGrowingSlot(
 		return false
 	end
 
-	if questSwitchingAnimal or state.busy or criticalRecoveryActive then
+	-- Growth + Zone must start on the Growth slot FIRST. Zone movement resumes
+	-- immediately after the slot is active, so both timers can progress together.
+	-- Keep Zone priority unresolved during the switch so the Pride Rock leash can
+	-- never steal the freshly spawned herbivore before the next quest scan.
+	local zoneQuestPending = false
+	for _, quest in ipairs(quests or {}) do
+		if quest.props
+			and quest.props.QuestType == "ZoneTime"
+			and not state.questGroup.questComplete(quest) then
+			zoneQuestPending = true
+			break
+		end
+	end
+
+	if zoneQuestPending and state.questZonePriority then
+		state.questZonePriority.active = false
+		state.questZonePriority.zone = nil
+		state.questZonePriority.resolved = false
+	end
+
+	if questSwitchingAnimal or criticalRecoveryActive then
+		return false
+	end
+
+	-- A Zone route may already own SafeMove from the previous scan. That must not
+	-- postpone a Growth slot switch until the animal reaches the zone. Cancel only
+	-- quest/Pride movement here; Food, Water, damage recovery and other survival
+	-- owners remain non-preemptible. The cancelled SafeMove unwinds this frame and
+	-- the forced fast scan performs the slot switch immediately afterwards.
+	if state.busy then
+		local moveReason = state.safeMove
+			and state.safeMove.active
+			and state.safeMove.reason
+
+		local survivalBusy =
+			drinkingToFull
+			or eatingToFull
+			or carcassEatBusy
+			or BABOON.busy
+			or GIRAFFE.busy
+			or CROC.approachBusy
+			or forcingPostDrinkMove
+			or DAMAGE.active
+			or (state.drinkTest and state.drinkTest.active)
+
+		if not survivalBusy
+			and (moveReason == "quest" or moveReason == "growth_home") then
+
+			state.safeMove.cancelToken += 1
+			state.growthPride.returning = false
+			state.growthPride.returnRequested = false
+			state.questZoneLastMoveAt = 0
+			state.questZoneLastTarget = nil
+			state.questForceFastRecheckUntil = tick() + 12
+
+			if state.questSetW then
+				pcall(state.questSetW, false)
+			end
+
+			state.releaseMovementNow(player.Character, true)
+
+			questStatusText = zoneQuestPending
+				and "Growth + Zone: switching Growth slot before Zone movement"
+				or "Growth priority: stopping quest movement before slot switch"
+
+			runtimeMessage =
+				"Growth priority preempted the current quest route; slot switch queued"
+
+			return true
+		end
+
 		return false
 	end
 
@@ -20892,13 +20962,21 @@ local function trySwitchToGrowingSlot(
 		state.questMotionMoving = false
 		state.questMotionMode = nil
 
-		questStatusText = "Growth priority: existing <100% -> "
-			.. tostring(incompleteSlot.AnimalName)
+		questStatusText = zoneQuestPending
+			and ("Growth + Zone first: <100% -> " .. tostring(incompleteSlot.AnimalName))
+			or ("Growth priority: existing <100% -> " .. tostring(incompleteSlot.AnimalName))
 
-		runtimeMessage = string.format(
-			"Using existing growing slot (%s); mature reset blocked",
-			tostring(incompleteReason or "available")
-		)
+		runtimeMessage = zoneQuestPending
+			and "Switching to the Growth slot first; ZoneTime will run on the same slot"
+			or string.format(
+				"Using existing growing slot (%s); mature reset blocked",
+				tostring(incompleteReason or "available")
+			)
+
+		if zoneQuestPending then
+			state.questZoneLastMoveAt = 0
+			state.questZoneLastTarget = nil
+		end
 
 		task.spawn(function()
 			if not state.prepareCurrentSlotForSwitch(
@@ -20920,11 +20998,51 @@ local function trySwitchToGrowingSlot(
 			if spawned then
 				state.questGrowthOwnsCurrent = true
 				state.questForceFastRecheckUntil = tick() + 25
-				runtimeMessage = "Existing <100% Growth slot active; compatible quests resumed"
+
+				if zoneQuestPending then
+					state.questZoneLastMoveAt = 0
+					state.questZoneLastTarget = nil
+					state.questZonePriority.active = false
+					state.questZonePriority.zone = nil
+					state.questZonePriority.resolved = false
+					runtimeMessage =
+						"Growth slot active; moving to Zone on next immediate quest scan"
+				else
+					runtimeMessage =
+						"Existing <100% Growth slot active; compatible quests resumed"
+				end
 			end
 		end)
 
 		return true
+	end
+
+	-- If an existing <100% slot exists but it is a flyer currently blocked by a
+	-- terrestrial Run quest, WAIT for Run. Never reset some other mature grounded
+	-- slot just because the real Growth debt is temporarily deferred.
+	local deferredFlyingGrowth
+	if state.questBlockFlying or (state.questPendingLandCount or 0) > 0 then
+		for _, entry in ipairs(records) do
+			if type(entry) == "table"
+				and type(entry.AnimalName) == "string"
+				and state.questIsFlyingAnimalName(entry.AnimalName)
+				and not isGrowthComplete(entry.GrowthPercentage) then
+
+				deferredFlyingGrowth = entry
+				break
+			end
+		end
+	end
+
+	if deferredFlyingGrowth then
+		questStatusText = string.format(
+			"Run first: Growth slot %s is flying (%d Run pending)",
+			tostring(deferredFlyingGrowth.AnimalName),
+			state.questPendingLandCount or 0
+		)
+		runtimeMessage =
+			"Existing flying Growth slot deferred; no mature grounded slot will be reset"
+		return false
 	end
 
 	-- There is now NO eligible existing slot below 100%.
@@ -20949,6 +21067,14 @@ local function trySwitchToGrowingSlot(
 	end
 
 	state.questGrowthReset.pendingResetName = nil
+
+	if zoneQuestPending then
+		state.questZoneLastMoveAt = 0
+		state.questZoneLastTarget = nil
+		state.questZonePriority.active = false
+		state.questZonePriority.zone = nil
+		state.questZonePriority.resolved = false
+	end
 
 	if resetReason == "protected_play_covers_growth" then
 		questStatusText = string.format(
