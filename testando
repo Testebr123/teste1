@@ -8239,8 +8239,27 @@ local function exploreSavannahCarcassSpawns()
 		end
 	else
 		if reason == "water_priority" then
-			runtimeMessage =
-				"Carcass route paused: Water priority"
+			local character =
+				player.Character
+
+			if character
+				and state.survivalForceWaterHandoff(
+					character,
+					"Carcass route yielded to Water"
+				) then
+
+				drinkingToFull = true
+				eatingToFull = false
+				eatingSourcePosition = nil
+				eatingTargetReachedAt = nil
+				activeCarcass = nil
+
+				runtimeMessage =
+					"Carcass route paused: Auto Drink now owns survival"
+			else
+				runtimeMessage =
+					"Carcass route paused: Water priority"
+			end
 
 			nextCarnivoreExploreCheck =
 				tick() + 1.0
@@ -9674,6 +9693,51 @@ function state.survivalArbiterComplete(kind)
 	arbiter.lastProgressAt = tick()
 	arbiter.lastValue = nil
 	arbiter.handoffNotBefore = tick() + 1.1
+	return true
+end
+
+function state.survivalForceWaterHandoff(
+	character,
+	reason
+)
+	if not character
+		or not state.autoDrink then
+		return false
+	end
+
+	local water =
+		tonumber(
+			character:GetAttribute(
+				"Water"
+			)
+		) or 100
+
+	if water > 75 then
+		return false
+	end
+
+	local food =
+		tonumber(
+			character:GetAttribute(
+				"Food"
+			)
+		) or 100
+
+	-- A subsystem has already stopped Food specifically because Water now has
+	-- priority. Do not leave stale owner="food" behind or Eat/Drink deadlock.
+	state.survivalArbiterReset(
+		reason
+			or "explicit water handoff"
+	)
+
+	state.survivalArbiterAcquire(
+		"water",
+		food,
+		water,
+		reason
+			or "explicit water handoff"
+	)
+
 	return true
 end
 
@@ -13239,8 +13303,31 @@ local function forcePostDrinkMove(wasUnderground)
 		state.questForceFastRecheckUntil =
 			tick() + 25
 
-		runtimeMessage =
-			"Dry Terrain + body outside water confirmed; quests resumed"
+		local currentWater =
+			dryCharacter
+			and tonumber(
+				dryCharacter:GetAttribute(
+					"Water"
+				)
+			)
+			or 100
+
+		if dryCharacter
+			and state.autoDrink
+			and currentWater <= 75
+			and state.survivalForceWaterHandoff(
+				dryCharacter,
+				"Water Fly completed while still thirsty"
+			) then
+
+			drinkingToFull = true
+			runtimeMessage =
+				"Water Fly complete; Auto Drink resumed"
+		else
+			runtimeMessage =
+				"Dry Terrain + body outside water confirmed; quests resumed"
+		end
+
 		return
 	end
 
@@ -13385,9 +13472,32 @@ local function forcePostDrinkMove(wasUnderground)
 		forcingPostDrinkMove = false
 		state.questForceFastRecheckUntil = tick() + 25
 
-		runtimeMessage = wasUnderground
-			and "Saiu do Terrain CONFIRMADO; Auto Run liberado"
-			or "Saiu da agua; quests liberadas"
+		local currentWater =
+			dryCharacter
+			and tonumber(
+				dryCharacter:GetAttribute(
+					"Water"
+				)
+			)
+			or 100
+
+		if dryCharacter
+			and state.autoDrink
+			and currentWater <= 75
+			and state.survivalForceWaterHandoff(
+				dryCharacter,
+				"Water Fly completed while still thirsty"
+			) then
+
+			drinkingToFull = true
+			runtimeMessage =
+				"Water Fly complete; Auto Drink resumed"
+		else
+			runtimeMessage = wasUnderground
+				and "Saiu do Terrain CONFIRMADO; Auto Run liberado"
+				or "Saiu da agua; quests liberadas"
+		end
+
 		return
 	end
 
@@ -13402,8 +13512,31 @@ local function forcePostDrinkMove(wasUnderground)
 		state.questForceFastRecheckUntil =
 			tick() + 25
 
-		runtimeMessage =
-			"Body outside water + dry Terrain confirmed; quests resumed"
+		local currentWater =
+			dryCharacter
+			and tonumber(
+				dryCharacter:GetAttribute(
+					"Water"
+				)
+			)
+			or 100
+
+		if dryCharacter
+			and state.autoDrink
+			and currentWater <= 75
+			and state.survivalForceWaterHandoff(
+				dryCharacter,
+				"Water Fly completed while still thirsty"
+			) then
+
+			drinkingToFull = true
+			runtimeMessage =
+				"Water Fly complete; Auto Drink resumed"
+		else
+			runtimeMessage =
+				"Body outside water + dry Terrain confirmed; quests resumed"
+		end
+
 		return
 	end
 
@@ -13508,6 +13641,26 @@ function state.noIdleWaterSafetyStep()
 	state.questGiraffeFeeding = false
 	BABOON.cancel()
 	GIRAFFE.cancel()
+
+	-- If Croc/Hippo entered water while thirsty, abandoning the feeding route
+	-- must also abandon its arbiter ownership. Keep Water latched through the
+	-- short Fly escape so Auto Drink resumes immediately after landing.
+	local liveWater =
+		tonumber(
+			character:GetAttribute(
+				"Water"
+			)
+		) or 100
+
+	if state.autoDrink
+		and liveWater <= 75
+		and state.survivalForceWaterHandoff(
+			character,
+			"Water exit interrupted Food"
+		) then
+
+		drinkingToFull = true
+	end
 
 	state.questTravelActive = false
 	state.questLandInputActive = false
@@ -15216,7 +15369,31 @@ local function autoDrinkStep()
 	state.survivalArbiterNoteProgress("food", earlyFood)
 
 	local survivalOwner = state.survivalArbiter.owner
-	if survivalOwner == "food" and earlyWater > 45 then
+
+	local carnivoreWaterYield =
+		survivalOwner == "food"
+		and state.autoEat
+		and isCarnivoreCharacter(
+			character
+		)
+		and earlyWater <= 72
+		and not carcassEatBusy
+		and activeCarcass == nil
+
+	if carnivoreWaterYield then
+		state.survivalForceWaterHandoff(
+			character,
+			"Carnivore search yielded to Water"
+		)
+
+		drinkingToFull = true
+		survivalOwner =
+			state.survivalArbiter.owner
+	end
+
+	if survivalOwner == "food"
+		and earlyWater > 45 then
+
 		-- Food has a committed route. Normal thirst must wait instead of making
 		-- the animal abandon grass, walk to water, abandon water, and repeat.
 		return
@@ -18487,17 +18664,14 @@ function state.questGroup.assistMMBForCurrentAnimal()
 		return false
 	end
 
-	local automationActive =
-		state.autoQuests
-		or state.farmCoins
-		or state.growExisting
-		or state.growAllSlots
-		or state.growNew
-
-	if not automationActive then
-		return false
-	end
-
+	-- Passive MMB help is ALWAYS available when we are already using the
+	-- species required by another MMB Hub pack. It does not depend on
+	-- Auto Quests / AFK Coin / Auto Grow being enabled.
+	--
+	-- IMPORTANT:
+	--   * Outside AFK Coin this helper NEVER changes species.
+	--   * AFK Coin cross-species help is handled separately by
+	--     coopLifecycleStep/beginAFKHelp and may switch/restore slots.
 	local handler = state.questGroup.resolveHandler()
 	if not handler then return false end
 
