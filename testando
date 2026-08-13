@@ -127,6 +127,12 @@ local state = {
 	coinFarmSwitchReason = nil,
 	coinFarmRetryAt = 0,
 
+	-- AFK Coin unexpected-menu recovery.
+	coinFarmLastSlot = nil,
+	coinFarmCharacterMissingSince = nil,
+	coinFarmMenuRecovering = false,
+	coinFarmMenuRetryAt = 0,
+
 	coinFarmAllowAutoQuests =
 		resumeState.coinFarmAllowAutoQuests == true,
 
@@ -372,6 +378,35 @@ local state = {
 		},
 	},
 	newSlotGender = "Female",
+
+	-- Global Slot Guardian:
+	-- protects the exact active saved slot whenever Eat/Drink/Grow/Quests/AFK
+	-- is active. Planned script resets are ignored; real death/menu loss is
+	-- recovered automatically with the SAME slot.
+	slotGuardian = {
+		lastSlot = nil,
+		lastCharacter = nil,
+		lastCharacterName = nil,
+		lastAnimalName = nil,
+		lastModes = nil,
+
+		missingSince = nil,
+		recovering = false,
+		retryAt = 0,
+
+		plannedUntil = 0,
+		plannedReason = nil,
+
+		lastDeathCharacter = nil,
+		lastDeathAt = 0,
+
+		deathReports =
+			type(resumeState.deathReports) == "table"
+				and resumeState.deathReports
+				or {},
+		maxReports = 30,
+		reportVersion = 0,
+	},
 	busy = false,
 	alive = true,
 }
@@ -382,6 +417,7 @@ local criticalRecoveryActive
 local completionSpawnParts = {}
 local selectedMoveToSpawn
 local INFO = {}
+local DEATH_REPORT = {}
 local DAMAGE = {
 	active = false,
 	connection = nil,
@@ -18384,6 +18420,14 @@ local function spawnSlot(
 
 	runtimeMessage = "Trocando para " .. tostring(expectedName)
 
+	if state.slotGuardianMarkPlanned then
+		state.slotGuardianMarkPlanned(
+			"script spawn -> "
+				.. tostring(expectedName),
+			24
+		)
+	end
+
 	local mother = motherNameFor(entry)
 	local oldCharacter = player.Character
 	local ok = pcall(function()
@@ -18422,7 +18466,12 @@ local function spawnSlot(
 			local animalMatches = type(expectedAnimal) == "string"
 				and state.questAnimalKey(animalName) == state.questAnimalKey(expectedAnimal)
 
-			if nameMatches or animalMatches then
+			if nameMatches
+				or (
+					not strictExpected
+					and animalMatches
+				) then
+
 				matched = candidate
 				break
 			end
@@ -18476,6 +18525,21 @@ local function spawnSlot(
 				tolerance = prideGrowthSpawn and 55 or 18,
 				maxDuration = 300,
 			}
+		)
+	end
+
+	if state.slotGuardian then
+		state.slotGuardian.plannedUntil =
+			0
+
+		state.slotGuardian.plannedReason =
+			nil
+	end
+
+	if state.slotGuardianRemember then
+		pcall(
+			state.slotGuardianRemember,
+			matched
 		)
 	end
 
@@ -18719,6 +18783,932 @@ local questTravelWanted = false
 local questStatusText = "Ready"
 local questLastAnimalSwitch = 0
 local questSwitchingAnimal = false
+
+function state.slotGuardianProtectionActive()
+	local aquaticSurvivalLocked =
+		state.aquaticRiverEscape
+		and state.aquaticRiverEscape.survivalSuspended
+			== true
+
+	return state.autoEat == true
+		or state.autoDrink == true
+		or aquaticSurvivalLocked
+		or state.growExisting == true
+		or state.growExistingAutomaticAll == true
+		or state.growAllSlots == true
+		or state.growNew == true
+		or state.autoQuests == true
+		or state.farmCoins == true
+end
+
+function state.slotGuardianMarkPlanned(
+	reason,
+	seconds
+)
+	local guardian =
+		state.slotGuardian
+
+	if not guardian then
+		return
+	end
+
+	guardian.plannedUntil =
+		math.max(
+			guardian.plannedUntil or 0,
+			tick()
+				+ (
+					tonumber(seconds)
+						or 20
+				)
+		)
+
+	guardian.plannedReason =
+		reason
+			or "script slot transition"
+
+	guardian.missingSince =
+		nil
+end
+
+function state.slotGuardianPlannedActive()
+	local guardian =
+		state.slotGuardian
+
+	return guardian
+		and tick()
+			< (
+				guardian.plannedUntil
+					or 0
+			)
+end
+
+function state.slotGuardianCaptureModes()
+	return {
+		growExisting =
+			state.growExisting == true,
+
+		growExistingAutomaticAll =
+			state.growExistingAutomaticAll == true,
+
+		growAllSlots =
+			state.growAllSlots == true,
+
+		growNew =
+			state.growNew == true,
+
+		autoQuests =
+			state.autoQuests == true,
+
+		autoClaimQuests =
+			state.autoClaimQuests == true,
+
+		farmCoins =
+			state.farmCoins == true,
+
+		coinFarmAllowAutoQuests =
+			state.coinFarmAllowAutoQuests == true,
+
+		growthPrideEnabled =
+			state.growthPrideEnabled ~= false,
+	}
+end
+
+function state.slotGuardianRestoreModes(
+	snapshot
+)
+	if type(snapshot)
+		~= "table" then
+		return
+	end
+
+	-- Only restore modes that were ON. Never turn off something the user may
+	-- have enabled manually while recovery was running.
+	for _, key in ipairs({
+		"growExisting",
+		"growExistingAutomaticAll",
+		"growAllSlots",
+		"growNew",
+		"autoQuests",
+		"autoClaimQuests",
+		"farmCoins",
+		"coinFarmAllowAutoQuests",
+	}) do
+		if snapshot[key] == true then
+			state[key] = true
+		end
+	end
+
+	if snapshot.growthPrideEnabled
+		~= nil then
+
+		state.growthPrideEnabled =
+			snapshot.growthPrideEnabled
+				== true
+	end
+end
+
+function state.slotGuardianResolveCurrentSlot(
+	character,
+	records
+)
+	if not character then
+		return nil
+	end
+
+	records =
+		records
+		or savedCharacters()
+
+	local characterName =
+		character:GetAttribute(
+			"CharacterName"
+		)
+
+	local uniqueName =
+		character:GetAttribute(
+			"UniqueCharacterName"
+		)
+		or character:GetAttribute(
+			"CharacterUniqueName"
+		)
+
+	for _, entry in ipairs(
+		records
+	) do
+		if type(entry)
+			== "table" then
+
+			local sameCharacter =
+				type(characterName)
+					== "string"
+				and (
+					entry.CharacterName
+						== characterName
+					or entry.UniqueCharacterName
+						== characterName
+				)
+
+			local sameUnique =
+				type(uniqueName)
+					== "string"
+				and (
+					entry.UniqueCharacterName
+						== uniqueName
+					or entry.CharacterName
+						== uniqueName
+				)
+
+			if sameCharacter
+				or sameUnique then
+				return entry
+			end
+		end
+	end
+
+	return nil
+end
+
+function state.slotGuardianRemember(
+	character
+)
+	local guardian =
+		state.slotGuardian
+
+	if not guardian
+		or not character
+		or not character.Parent then
+		return false
+	end
+
+	local root =
+		character:FindFirstChild(
+			"HumanoidRootPart"
+		)
+
+	local humanoid =
+		character:FindFirstChildOfClass(
+			"Humanoid"
+		)
+
+	if not root
+		or not humanoid
+		or humanoid.Health <= 0 then
+		return false
+	end
+
+	local entry =
+		state.slotGuardianResolveCurrentSlot(
+			character,
+			savedCharacters()
+		)
+
+	if not entry then
+		return false
+	end
+
+	guardian.lastSlot = {
+		CharacterName =
+			entry.CharacterName,
+
+		UniqueCharacterName =
+			entry.UniqueCharacterName,
+
+		AnimalName =
+			entry.AnimalName,
+
+		Gender =
+			entry.Gender,
+
+		Skin =
+			entry.Skin,
+	}
+
+	guardian.lastCharacter =
+		character
+
+	guardian.lastCharacterName =
+		entry.CharacterName
+			or character:GetAttribute(
+				"CharacterName"
+			)
+
+	guardian.lastAnimalName =
+		entry.AnimalName
+			or character:GetAttribute(
+				"AnimalName"
+			)
+
+	guardian.lastModes =
+		state.slotGuardianCaptureModes()
+
+	return true
+end
+
+function state.slotGuardianFindRememberedSlot()
+	local guardian =
+		state.slotGuardian
+
+	local remembered =
+		guardian
+		and guardian.lastSlot
+
+	if type(remembered)
+		~= "table" then
+		return nil
+	end
+
+	local records =
+		savedCharacters()
+
+	for _, entry in ipairs(
+		records
+	) do
+		if type(entry)
+			== "table" then
+
+			local sameUnique =
+				type(
+					remembered.UniqueCharacterName
+				) == "string"
+				and remembered.UniqueCharacterName
+					~= ""
+				and entry.UniqueCharacterName
+					== remembered.UniqueCharacterName
+
+			local sameName =
+				type(
+					remembered.CharacterName
+				) == "string"
+				and remembered.CharacterName
+					~= ""
+				and entry.CharacterName
+					== remembered.CharacterName
+
+			if sameUnique
+				or sameName then
+				return entry
+			end
+		end
+	end
+
+	return nil
+end
+
+function state.slotGuardianTimestamp()
+	local ok,
+		value =
+			pcall(function()
+				return DateTime.now():FormatLocalTime(
+					"DD/MM/YYYY HH:mm:ss",
+					"pt-br"
+				)
+			end)
+
+	if ok
+		and type(value)
+			== "string"
+		and value ~= "" then
+
+		return value
+	end
+
+	return os.date(
+		"%d/%m/%Y %H:%M:%S"
+	)
+end
+
+function state.slotGuardianRecordDeath(
+	character,
+	reason
+)
+	local guardian =
+		state.slotGuardian
+
+	if not guardian
+		or not state.slotGuardianProtectionActive()
+		or state.slotGuardianPlannedActive() then
+		return false
+	end
+
+	local now =
+		tick()
+
+	if guardian.lastDeathCharacter
+			== character
+		and now
+			- (
+				guardian.lastDeathAt
+					or 0
+			) < 8 then
+
+		return false
+	end
+
+	guardian.lastDeathCharacter =
+		character
+
+	guardian.lastDeathAt =
+		now
+
+	local slotName =
+		guardian.lastCharacterName
+
+	local animalName =
+		guardian.lastAnimalName
+
+	if character then
+		slotName =
+			character:GetAttribute(
+				"CharacterName"
+			)
+			or slotName
+
+		animalName =
+			character:GetAttribute(
+				"AnimalName"
+			)
+			or animalName
+	end
+
+	slotName =
+		tostring(
+			slotName
+				or "Unknown slot"
+		)
+
+	animalName =
+		tostring(
+			animalName
+				or "Unknown animal"
+		)
+
+	local report = {
+		slot =
+			slotName,
+
+		animal =
+			animalName,
+
+		when =
+			state.slotGuardianTimestamp(),
+
+		reason =
+			reason
+				or "Death detected",
+	}
+
+	table.insert(
+		guardian.deathReports,
+		1,
+		report
+	)
+
+	while #guardian.deathReports
+		> (
+			guardian.maxReports
+				or 30
+		) do
+
+		table.remove(
+			guardian.deathReports
+		)
+	end
+
+	guardian.reportVersion += 1
+
+	if DEATH_REPORT.render then
+		pcall(
+			DEATH_REPORT.render
+		)
+	end
+
+	return true
+end
+
+function state.slotGuardianPrepareRecovery()
+	-- Stop only competing movement transactions. Automation toggles themselves
+	-- stay alive; Grow/Quests/AFK are NOT disabled.
+	if state.safeMove then
+		state.safeMove.cancelToken += 1
+	end
+
+	questTravelWanted =
+		false
+
+	state.questTravelActive =
+		false
+
+	state.questLandInputActive =
+		false
+
+	state.questSwimActive =
+		false
+
+	state.questSwimReady =
+		false
+
+	if state.questSetW then
+		pcall(
+			state.questSetW,
+			false
+		)
+	end
+
+	state.releaseMovementNow(
+		player.Character,
+		true
+	)
+
+	eatingToFull =
+		false
+
+	drinkingToFull =
+		false
+
+	activeCarcass =
+		nil
+
+	eatingSourcePosition =
+		nil
+
+	drinkingSourcePosition =
+		nil
+
+	if state.survivalArbiterReset then
+		state.survivalArbiterReset(
+			"slot guardian recovery"
+		)
+	end
+end
+
+function state.slotGuardianRecoveryStep()
+	local guardian =
+		state.slotGuardian
+
+	if not guardian
+		or not state.slotGuardianProtectionActive() then
+		if guardian then
+			guardian.missingSince =
+				nil
+		end
+		return
+	end
+
+	local character =
+		player.Character
+
+	local root =
+		character
+		and character:FindFirstChild(
+			"HumanoidRootPart"
+		)
+
+	local humanoid =
+		character
+		and character:FindFirstChildOfClass(
+			"Humanoid"
+		)
+
+	local aliveCharacter =
+		character
+		and character.Parent
+		and root
+		and humanoid
+		and humanoid.Health > 0
+
+	if aliveCharacter then
+		guardian.missingSince =
+			nil
+
+		guardian.recovering =
+			false
+
+		state.slotGuardianRemember(
+			character
+		)
+
+		return
+	end
+
+	if state.slotGuardianPlannedActive() then
+		guardian.missingSince =
+			nil
+		return
+	end
+
+	if character
+		and humanoid
+		and humanoid.Health <= 0 then
+
+		state.slotGuardianRecordDeath(
+			character,
+			"Humanoid died"
+		)
+	end
+
+	if guardian.recovering
+		or tick()
+			< (
+				guardian.retryAt
+					or 0
+			) then
+		return
+	end
+
+	guardian.missingSince =
+		guardian.missingSince
+		or tick()
+
+	local waitTime =
+		character
+			and humanoid
+			and humanoid.Health <= 0
+				and 1.0
+				or 2.25
+
+	if tick()
+		- guardian.missingSince
+		< waitTime then
+		return
+	end
+
+	local target =
+		state.slotGuardianFindRememberedSlot()
+
+	if not target then
+		guardian.retryAt =
+			tick() + 4
+
+		runtimeMessage =
+			"Slot Guardian: saved slot not found; retrying"
+
+		return
+	end
+
+	local snapshot =
+		guardian.lastModes
+			or state.slotGuardianCaptureModes()
+
+	guardian.recovering =
+		true
+
+	guardian.missingSince =
+		nil
+
+	state.slotGuardianMarkPlanned(
+		"Slot Guardian same-slot respawn",
+		28
+	)
+
+	state.slotGuardianPrepareRecovery()
+
+	local targetName =
+		tostring(
+			target.CharacterName
+				or target.UniqueCharacterName
+				or "slot"
+		)
+
+	local targetAnimal =
+		tostring(
+			target.AnimalName
+				or guardian.lastAnimalName
+				or "animal"
+		)
+
+	runtimeMessage =
+		"Slot Guardian: respawning "
+		.. targetName
+		.. " ("
+		.. targetAnimal
+		.. ")"
+
+	questStatusText =
+		"Recovering same slot: "
+		.. targetName
+
+	task.spawn(function()
+		local oldQuestSwitch =
+			questSwitchingAnimal
+
+		questSwitchingAnimal =
+			true
+
+		local deadCharacter =
+			player.Character
+
+		local deadHumanoid =
+			deadCharacter
+			and deadCharacter:FindFirstChildOfClass(
+				"Humanoid"
+			)
+
+		if deadCharacter
+			and deadCharacter.Parent
+			and deadHumanoid
+			and deadHumanoid.Health <= 0
+			and ResetRemote then
+
+			state.slotGuardianMarkPlanned(
+				"Slot Guardian clearing dead character",
+				12
+			)
+
+			pcall(
+				ResetRemote.InvokeServer,
+				ResetRemote
+			)
+
+			task.wait(
+				1.0
+			)
+		end
+
+		local spawned =
+			spawnSlot(
+				target,
+				true,
+				true
+			)
+
+		questSwitchingAnimal =
+			oldQuestSwitch
+
+		guardian.recovering =
+			false
+
+		if spawned then
+			guardian.retryAt =
+				0
+
+			guardian.plannedUntil =
+				0
+
+			guardian.plannedReason =
+				nil
+
+			guardian.missingSince =
+				nil
+
+			-- Restore every automation that was active before the loss.
+			state.slotGuardianRestoreModes(
+				snapshot
+			)
+
+			-- Survival ALWAYS comes back after a death/menu recovery.
+			state.autoEatManualDisabled =
+				false
+
+			state.autoDrinkManualDisabled =
+				false
+
+			state.autoEat =
+				true
+
+			state.autoDrink =
+				true
+
+			eatingToFull =
+				false
+
+			drinkingToFull =
+				false
+
+			if state.aquaticRiverEscape then
+				state.aquaticRiverEscape.busy =
+					false
+
+				state.aquaticRiverEscape.retryAt =
+					0
+
+				state.aquaticRiverEscape.survivalSuspended =
+					false
+			end
+
+			state.applySurvivalDefaults(
+				false
+			)
+
+			state.questForceFastRecheckUntil =
+				tick() + 25
+
+			DAMAGE.cooldownUntil =
+				math.max(
+					DAMAGE.cooldownUntil
+						or 0,
+					tick() + 3
+				)
+
+			local live =
+				player.Character
+
+			if live then
+				state.releaseMovementNow(
+					live,
+					true
+				)
+
+				state.oxygenGuardApply(
+					live
+				)
+
+				state.staminaGuardApply(
+					live
+				)
+
+				if state.questSlotsNormalizeControl then
+					state.questSlotsNormalizeControl(
+						live
+					)
+				end
+
+				if state.enforceCrocHippoMainWaterCollision then
+					state.enforceCrocHippoMainWaterCollision(
+						live
+					)
+				end
+
+				state.slotGuardianRemember(
+					live
+				)
+			end
+
+			runtimeMessage =
+				"Slot Guardian: same slot restored; automations resumed"
+
+			questStatusText =
+				state.autoQuests
+					and "Auto Quests resumed after slot recovery"
+					or (
+						state.growExisting
+						or state.growAllSlots
+						or state.growNew
+						or state.growExistingAutomaticAll
+					)
+						and "Auto Grow resumed after slot recovery"
+					or state.farmCoins
+						and "AFK Coin resumed after slot recovery"
+					or "Slot restored; Survival resumed"
+
+			if renders then
+				for _, key in ipairs({
+					"autoEat",
+					"autoDrink",
+					"growExisting",
+					"growAllSlots",
+					"growNew",
+					"autoQuests",
+					"autoClaimQuests",
+					"farmCoins",
+				}) do
+
+					if renders[key] then
+						pcall(
+							renders[key]
+						)
+					end
+				end
+			end
+		else
+			guardian.retryAt =
+				tick() + 4
+
+			guardian.plannedUntil =
+				0
+
+			runtimeMessage =
+				"Slot Guardian: respawn not confirmed; retrying same slot"
+		end
+	end)
+end
+
+function state.slotGuardianBindCharacter(
+	character
+)
+	if not character then
+		return
+	end
+
+	local humanoid =
+		character:FindFirstChildOfClass(
+			"Humanoid"
+		)
+		or character:WaitForChild(
+			"Humanoid",
+			5
+		)
+
+	if not humanoid then
+		return
+	end
+
+	mmbTaskDelay(
+		0.55,
+		function()
+			if state.alive
+				and character
+					== player.Character then
+
+				state.slotGuardianRemember(
+					character
+				)
+			end
+		end
+	)
+
+	local diedConnection
+
+	diedConnection =
+		humanoid.Died:Connect(function()
+			if not state.alive
+				or state.slotGuardianPlannedActive()
+				or not state.slotGuardianProtectionActive() then
+				return
+			end
+
+			state.slotGuardianRecordDeath(
+				character,
+				"Humanoid died"
+			)
+
+			state.slotGuardian.missingSince =
+				tick()
+		end)
+
+	table.insert(
+		connections,
+		diedConnection
+	)
+end
+
+table.insert(
+	connections,
+	player.CharacterAdded:Connect(function(
+		character
+	)
+		state.slotGuardianBindCharacter(
+			character
+		)
+	end)
+)
+
+if player.Character then
+	state.slotGuardianBindCharacter(
+		player.Character
+	)
+end
+
+task.spawn(function()
+	while state.alive do
+		pcall(
+			state.slotGuardianRecoveryStep
+		)
+
+		task.wait(
+			0.35
+		)
+	end
+end)
 
 local function normalizeQuestBucket(bucket)
 	local result = {}
@@ -20195,6 +21185,12 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 					end
 
 					if ResetRemote then
+								if state.slotGuardianMarkPlanned then
+									state.slotGuardianMarkPlanned(
+										"intentional script reset",
+										24
+									)
+								end
 							pcall(
 								ResetRemote.InvokeServer,
 								ResetRemote
@@ -20313,6 +21309,12 @@ function state.questGroup.ensureForCurrentAnimal(records, allowAnimalSwitch)
 					end
 
 					if ResetRemote then
+								if state.slotGuardianMarkPlanned then
+									state.slotGuardianMarkPlanned(
+										"intentional script reset",
+										24
+									)
+								end
 							pcall(
 								ResetRemote.InvokeServer,
 								ResetRemote
@@ -20858,6 +21860,12 @@ function state.questGroup.restoreAFKAfterHelp()
 				end
 
 				if ResetRemote then
+						if state.slotGuardianMarkPlanned then
+							state.slotGuardianMarkPlanned(
+								"intentional script reset",
+								24
+							)
+						end
 					pcall(
 						ResetRemote.InvokeServer,
 						ResetRemote
@@ -20991,6 +21999,12 @@ function state.questGroup.beginAFKHelp(handler, target)
 		end
 
 		if ResetRemote then
+				if state.slotGuardianMarkPlanned then
+					state.slotGuardianMarkPlanned(
+						"intentional script reset",
+						24
+					)
+				end
 			pcall(
 				ResetRemote.InvokeServer,
 				ResetRemote
@@ -22048,6 +23062,12 @@ function state.questSlots.deleteTempForNext(nextAnimal)
 		if currentName == temp.characterName
 			and ResetRemote then
 
+				if state.slotGuardianMarkPlanned then
+					state.slotGuardianMarkPlanned(
+						"intentional script reset",
+						24
+					)
+				end
 			pcall(
 				ResetRemote.InvokeServer,
 				ResetRemote
@@ -22296,6 +23316,12 @@ function state.questSlots.createForQuest(
 			.. targetAnimal
 
 		if ResetRemote then
+				if state.slotGuardianMarkPlanned then
+					state.slotGuardianMarkPlanned(
+						"intentional script reset",
+						24
+					)
+				end
 			pcall(
 				ResetRemote.InvokeServer,
 				ResetRemote
@@ -23217,6 +24243,12 @@ function state.questGrowthResetLeaveGame()
 	if not ResetRemote then return false end
 
 	local oldCharacter = player.Character
+	if state.slotGuardianMarkPlanned then
+		state.slotGuardianMarkPlanned(
+			"intentional script reset",
+			24
+		)
+	end
 	local ok = pcall(ResetRemote.InvokeServer, ResetRemote)
 	if not ok then return false end
 
@@ -24266,6 +25298,12 @@ local function trySwitchToQuestAnimal(quest, records, resolvedTarget)
 		end
 
 		if ResetRemote then
+			if state.slotGuardianMarkPlanned then
+				state.slotGuardianMarkPlanned(
+					"intentional script reset",
+					24
+				)
+			end
 			pcall(ResetRemote.InvokeServer, ResetRemote)
 			task.wait(1.5)
 		end
@@ -24862,6 +25900,12 @@ local function trySwitchToGrowingSlot(
 			end
 
 			if ResetRemote then
+				if state.slotGuardianMarkPlanned then
+					state.slotGuardianMarkPlanned(
+						"intentional script reset",
+						24
+					)
+				end
 				pcall(ResetRemote.InvokeServer, ResetRemote)
 				task.wait(1.15)
 			end
@@ -26044,6 +27088,12 @@ local function updateQuestAutomation()
 					end
 
 					if ResetRemote then
+						if state.slotGuardianMarkPlanned then
+							state.slotGuardianMarkPlanned(
+								"intentional script reset",
+								24
+							)
+						end
 						pcall(ResetRemote.InvokeServer, ResetRemote)
 						task.wait(1.3)
 					end
@@ -27281,6 +28331,12 @@ local function createNextSlot()
 		Skin = character:GetAttribute("Skin") or "Default",
 		GrowthPercentage = 0,
 	}
+	if state.slotGuardianMarkPlanned then
+		state.slotGuardianMarkPlanned(
+			"intentional script reset",
+			24
+		)
+	end
 	pcall(ResetRemote.InvokeServer, ResetRemote)
 	task.wait(2)
 	local ok = pcall(CreateRemote.InvokeServer, CreateRemote, entry.CharacterName, entry.AnimalName, entry.Gender, entry.Skin)
@@ -27290,6 +28346,294 @@ local function createNextSlot()
 end
 
 local growthBusy = false
+function state.coinFarmRememberCurrentSlot()
+	if not state.farmCoins then
+		return
+	end
+
+	local character =
+		player.Character
+
+	local root =
+		character
+		and character:FindFirstChild(
+			"HumanoidRootPart"
+		)
+
+	if not character
+		or not character.Parent
+		or not root then
+		return
+	end
+
+	local current =
+		state.questFindCurrentSavedEntry(
+			savedCharacters(),
+			character
+		)
+
+	if not current then
+		return
+	end
+
+	state.coinFarmLastSlot = {
+		CharacterName =
+			current.CharacterName,
+		UniqueCharacterName =
+			current.UniqueCharacterName,
+		AnimalName =
+			current.AnimalName,
+		Gender =
+			current.Gender,
+		Skin =
+			current.Skin,
+	}
+
+	state.coinFarmCharacterMissingSince =
+		nil
+end
+
+function state.coinFarmFindRememberedSlot(records)
+	local remembered =
+		state.coinFarmLastSlot
+
+	if type(remembered)
+		~= "table" then
+		return nil
+	end
+
+	records =
+		records
+		or savedCharacters()
+
+	for _, entry in ipairs(
+		records
+	) do
+		if type(entry)
+			== "table" then
+
+			local sameUnique =
+				type(
+					remembered.UniqueCharacterName
+				) == "string"
+				and remembered.UniqueCharacterName
+					~= ""
+				and entry.UniqueCharacterName
+					== remembered.UniqueCharacterName
+
+			local sameName =
+				type(
+					remembered.CharacterName
+				) == "string"
+				and remembered.CharacterName
+					~= ""
+				and entry.CharacterName
+					== remembered.CharacterName
+
+			if sameUnique
+				or sameName then
+				return entry
+			end
+		end
+	end
+
+	return nil
+end
+
+function state.coinFarmIntentionalCharacterSwitch()
+	local coop =
+		state.questGroup
+		and state.questGroup.coop
+
+	return state.coinFarmSwitching
+		or questSwitchingAnimal
+		or growthBusy
+		or state.questGrowthReset.exclusive
+		or state.questGrowthReset.busy
+		or (
+			coop
+			and coop.helperSwitching
+		)
+end
+
+function state.coinFarmMenuRecoveryStep()
+	if not state.farmCoins then
+		state.coinFarmCharacterMissingSince =
+			nil
+
+		state.coinFarmMenuRecovering =
+			false
+
+		return
+	end
+
+	if state.coinFarmIntentionalCharacterSwitch() then
+		state.coinFarmCharacterMissingSince =
+			nil
+		return
+	end
+
+	local character =
+		player.Character
+
+	local root =
+		character
+		and character:FindFirstChild(
+			"HumanoidRootPart"
+		)
+
+	local humanoid =
+		character
+		and character:FindFirstChildOfClass(
+			"Humanoid"
+		)
+
+	local liveCharacter =
+		character
+		and character.Parent
+		and root
+		and humanoid
+		and humanoid.Health > 0
+
+	if liveCharacter then
+		state.coinFarmCharacterMissingSince =
+			nil
+
+		state.coinFarmMenuRecovering =
+			false
+
+		state.coinFarmRememberCurrentSlot()
+		return
+	end
+
+	if state.coinFarmMenuRecovering
+		or tick()
+			< (
+				state.coinFarmMenuRetryAt
+				or 0
+			) then
+		return
+	end
+
+	state.coinFarmCharacterMissingSince =
+		state.coinFarmCharacterMissingSince
+		or tick()
+
+	-- Ignore short normal replication gaps. A real menu state has to persist.
+	if tick()
+		- state.coinFarmCharacterMissingSince
+		< 2.75 then
+		return
+	end
+
+	local records =
+		savedCharacters()
+
+	local target =
+		state.coinFarmFindRememberedSlot(
+			records
+		)
+
+	if not target
+		and type(
+			state.coinFarmPreferredAnimal
+		) == "string"
+		and state.coinFarmPreferredAnimal
+			~= ""
+		and state.coinFarmFindPreferredSlot then
+
+		target =
+			state.coinFarmFindPreferredSlot(
+				records,
+				state.coinFarmPreferredAnimal
+			)
+	end
+
+	if not target then
+		state.coinFarmMenuRetryAt =
+			tick() + 5
+
+		runtimeMessage =
+			"AFK Coin: character missing; previous saved slot not resolved"
+
+		return
+	end
+
+	state.coinFarmMenuRecovering =
+		true
+
+	state.coinFarmCharacterMissingSince =
+		nil
+
+	local targetName =
+		tostring(
+			target.CharacterName
+				or target.UniqueCharacterName
+				or target.AnimalName
+				or "slot"
+		)
+
+	runtimeMessage =
+		"AFK Coin: unexpected menu detected; restoring same slot -> "
+		.. targetName
+
+	questStatusText =
+		"AFK Coin Farm: restoring "
+		.. targetName
+
+	task.spawn(function()
+		-- We are already on/missing the character. Do NOT call ResetRemote here.
+		local spawned =
+			spawnSlot(
+				target,
+				true
+			)
+
+		state.coinFarmMenuRecovering =
+			false
+
+		if spawned then
+			state.coinFarmMenuRetryAt =
+				0
+
+			state.coinFarmCharacterMissingSince =
+				nil
+
+			state.applySurvivalDefaults(
+				false
+			)
+
+			state.coinFarmRememberCurrentSlot()
+
+			runtimeMessage =
+				"AFK Coin: same slot restored after unexpected menu"
+
+			questStatusText =
+				"AFK Coin Farm: slot restored"
+		else
+			state.coinFarmMenuRetryAt =
+				tick() + 5
+
+			runtimeMessage =
+				"AFK Coin: menu recovery spawn not confirmed; retrying"
+		end
+
+		if renders then
+			if renders.autoEat then
+				pcall(
+					renders.autoEat
+				)
+			end
+
+			if renders.autoDrink then
+				pcall(
+					renders.autoDrink
+				)
+			end
+		end
+	end)
+end
+
 function state.coinFarmUniqueAnimals(records)
 	records = records or savedCharacters()
 
@@ -27525,6 +28869,12 @@ function state.coinFarmTryPreferredSwitch()
 		end
 
 		if ResetRemote then
+			if state.slotGuardianMarkPlanned then
+				state.slotGuardianMarkPlanned(
+					"intentional script reset",
+					24
+				)
+			end
 			pcall(ResetRemote.InvokeServer, ResetRemote)
 			task.wait(1.35)
 		end
@@ -27548,6 +28898,10 @@ function state.coinFarmTryPreferredSwitch()
 		end
 
 		if spawned then
+			if state.farmCoins then
+				state.coinFarmRememberCurrentSlot()
+			end
+
 			if state.farmCoins
 				and type(state.coinFarmPreferredAnimal) == "string"
 				and state.questAnimalKey(state.coinFarmPreferredAnimal)
@@ -28114,6 +29468,12 @@ local function growthStep()
 				"Abrindo lista de " .. tostring(completedAnimal or "animais")
 		end
 
+		if state.slotGuardianMarkPlanned then
+			state.slotGuardianMarkPlanned(
+				"intentional script reset",
+				24
+			)
+		end
 		if ResetRemote then pcall(ResetRemote.InvokeServer, ResetRemote) end
 		task.wait(2.5)
 
@@ -28508,7 +29868,7 @@ titleMark.Parent = header
 corner(titleMark, 14)
 
 local titleLabel = Instance.new("TextLabel")
-titleLabel.Size = UDim2.new(1, -120, 1, 0)
+titleLabel.Size = UDim2.new(1, -154, 1, 0)
 titleLabel.Position = UDim2.fromOffset(46, 0)
 titleLabel.BackgroundTransparency = 1
 titleLabel.Font = Enum.Font.GothamBlack
@@ -28520,7 +29880,7 @@ titleLabel.Parent = header
 
 local statusDot = Instance.new("Frame")
 statusDot.Size = UDim2.fromOffset(7, 7)
-statusDot.Position = UDim2.new(1, -110, 0.5, -3)
+statusDot.Position = UDim2.new(1, -144, 0.5, -3)
 statusDot.BackgroundColor3 = Color3.fromRGB(90, 220, 130)
 statusDot.BorderSizePixel = 0
 statusDot.Parent = header
@@ -28538,6 +29898,382 @@ minimizeButton.TextSize = 18
 minimizeButton.AutoButtonColor = false
 minimizeButton.Parent = header
 corner(minimizeButton, 8)
+
+-- ============================================================
+-- Death Report
+-- ============================================================
+DEATH_REPORT.button = Instance.new("TextButton")
+DEATH_REPORT.button.Size = UDim2.fromOffset(30, 30)
+DEATH_REPORT.button.Position = UDim2.new(1, -106, 0.5, -15)
+DEATH_REPORT.button.BackgroundColor3 = COLOR_CARD
+DEATH_REPORT.button.BorderSizePixel = 0
+DEATH_REPORT.button.Font = Enum.Font.GothamBlack
+DEATH_REPORT.button.Text = "☠"
+DEATH_REPORT.button.TextColor3 = COLOR_ACCENT
+DEATH_REPORT.button.TextSize = 15
+DEATH_REPORT.button.AutoButtonColor = false
+DEATH_REPORT.button.Parent = header
+corner(DEATH_REPORT.button, 8)
+
+DEATH_REPORT.overlay = Instance.new("Frame")
+DEATH_REPORT.overlay.Size = UDim2.new(1, 0, 1, 0)
+DEATH_REPORT.overlay.Position = UDim2.fromOffset(0, 0)
+DEATH_REPORT.overlay.BackgroundColor3 = Color3.fromRGB(3, 2, 4)
+DEATH_REPORT.overlay.BackgroundTransparency = 0.18
+DEATH_REPORT.overlay.BorderSizePixel = 0
+DEATH_REPORT.overlay.Visible = false
+DEATH_REPORT.overlay.ZIndex = 50
+DEATH_REPORT.overlay.Parent = window
+
+DEATH_REPORT.panel = Instance.new("Frame")
+DEATH_REPORT.panel.Size = UDim2.new(1, -34, 0, 366)
+DEATH_REPORT.panel.Position = UDim2.new(0, 17, 0.5, -183)
+DEATH_REPORT.panel.BackgroundColor3 = COLOR_HEADER
+DEATH_REPORT.panel.BorderSizePixel = 0
+DEATH_REPORT.panel.ZIndex = 51
+DEATH_REPORT.panel.Parent = DEATH_REPORT.overlay
+corner(DEATH_REPORT.panel, 12)
+stroke(DEATH_REPORT.panel, COLOR_ACCENT, 1).Transparency = 0.35
+
+DEATH_REPORT.accent = Instance.new("Frame")
+DEATH_REPORT.accent.Size = UDim2.new(0, 3, 1, -28)
+DEATH_REPORT.accent.Position = UDim2.fromOffset(0, 14)
+DEATH_REPORT.accent.BackgroundColor3 = COLOR_ACCENT
+DEATH_REPORT.accent.BorderSizePixel = 0
+DEATH_REPORT.accent.ZIndex = 52
+DEATH_REPORT.accent.Parent = DEATH_REPORT.panel
+corner(DEATH_REPORT.accent, 2)
+
+DEATH_REPORT.title = Instance.new("TextLabel")
+DEATH_REPORT.title.Size = UDim2.new(1, -70, 0, 30)
+DEATH_REPORT.title.Position = UDim2.fromOffset(18, 12)
+DEATH_REPORT.title.BackgroundTransparency = 1
+DEATH_REPORT.title.Font = Enum.Font.GothamBlack
+DEATH_REPORT.title.Text = "DEATH REPORT"
+DEATH_REPORT.title.TextColor3 = COLOR_TEXT
+DEATH_REPORT.title.TextSize = 17
+DEATH_REPORT.title.TextXAlignment = Enum.TextXAlignment.Left
+DEATH_REPORT.title.ZIndex = 52
+DEATH_REPORT.title.Parent = DEATH_REPORT.panel
+
+DEATH_REPORT.close = Instance.new("TextButton")
+DEATH_REPORT.close.Size = UDim2.fromOffset(28, 28)
+DEATH_REPORT.close.Position = UDim2.new(1, -40, 0, 10)
+DEATH_REPORT.close.BackgroundColor3 = COLOR_CARD
+DEATH_REPORT.close.BorderSizePixel = 0
+DEATH_REPORT.close.Font = FONT_BUTTON
+DEATH_REPORT.close.Text = "×"
+DEATH_REPORT.close.TextColor3 = COLOR_TEXT
+DEATH_REPORT.close.TextSize = 19
+DEATH_REPORT.close.AutoButtonColor = false
+DEATH_REPORT.close.ZIndex = 52
+DEATH_REPORT.close.Parent = DEATH_REPORT.panel
+corner(DEATH_REPORT.close, 8)
+
+DEATH_REPORT.subtitle = Instance.new("TextLabel")
+DEATH_REPORT.subtitle.Size = UDim2.new(1, -36, 0, 28)
+DEATH_REPORT.subtitle.Position = UDim2.fromOffset(18, 44)
+DEATH_REPORT.subtitle.BackgroundTransparency = 1
+DEATH_REPORT.subtitle.Font = FONT_BODY
+DEATH_REPORT.subtitle.Text = "Unexpected animal deaths detected while Slot Guardian was active."
+DEATH_REPORT.subtitle.TextColor3 = COLOR_SUBTEXT
+DEATH_REPORT.subtitle.TextSize = 10
+DEATH_REPORT.subtitle.TextWrapped = true
+DEATH_REPORT.subtitle.TextXAlignment = Enum.TextXAlignment.Left
+DEATH_REPORT.subtitle.ZIndex = 52
+DEATH_REPORT.subtitle.Parent = DEATH_REPORT.panel
+
+DEATH_REPORT.list = Instance.new("ScrollingFrame")
+DEATH_REPORT.list.Size = UDim2.new(1, -36, 0, 272)
+DEATH_REPORT.list.Position = UDim2.fromOffset(18, 78)
+DEATH_REPORT.list.BackgroundTransparency = 1
+DEATH_REPORT.list.BorderSizePixel = 0
+DEATH_REPORT.list.ScrollBarThickness = 4
+DEATH_REPORT.list.ScrollBarImageColor3 = COLOR_ACCENT
+DEATH_REPORT.list.CanvasSize = UDim2.fromOffset(0, 0)
+DEATH_REPORT.list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+DEATH_REPORT.list.ZIndex = 52
+DEATH_REPORT.list.Parent = DEATH_REPORT.panel
+
+DEATH_REPORT.layout = Instance.new("UIListLayout")
+DEATH_REPORT.layout.Padding = UDim.new(0, 7)
+DEATH_REPORT.layout.SortOrder = Enum.SortOrder.LayoutOrder
+DEATH_REPORT.layout.Parent = DEATH_REPORT.list
+
+DEATH_REPORT.padding = Instance.new("UIPadding")
+DEATH_REPORT.padding.PaddingBottom = UDim.new(0, 4)
+DEATH_REPORT.padding.Parent = DEATH_REPORT.list
+
+function DEATH_REPORT.render()
+	if not DEATH_REPORT.list
+		or not DEATH_REPORT.list.Parent then
+		return
+	end
+
+	for _, child in ipairs(
+		DEATH_REPORT.list:GetChildren()
+	) do
+		if child ~= DEATH_REPORT.layout
+			and child ~= DEATH_REPORT.padding then
+
+			child:Destroy()
+		end
+	end
+
+	local reports =
+		state.slotGuardian
+		and state.slotGuardian.deathReports
+		or {}
+
+	if #reports == 0 then
+		local empty =
+			Instance.new(
+				"TextLabel"
+			)
+
+		empty.Size =
+			UDim2.new(
+				1,
+				0,
+				0,
+				54
+			)
+
+		empty.BackgroundColor3 =
+			COLOR_CARD
+
+		empty.BorderSizePixel =
+			0
+
+		empty.Font =
+			FONT_BODY
+
+		empty.Text =
+			"No deaths recorded."
+
+		empty.TextColor3 =
+			COLOR_SUBTEXT
+
+		empty.TextSize =
+			12
+
+		empty.ZIndex =
+			53
+
+		empty.Parent =
+			DEATH_REPORT.list
+
+		corner(
+			empty,
+			9
+		)
+
+		return
+	end
+
+	for index, report in ipairs(
+		reports
+	) do
+		local card =
+			Instance.new(
+				"Frame"
+			)
+
+		card.Size =
+			UDim2.new(
+				1,
+				-2,
+				0,
+				62
+			)
+
+		card.LayoutOrder =
+			index
+
+		card.BackgroundColor3 =
+			COLOR_CARD
+
+		card.BorderSizePixel =
+			0
+
+		card.ZIndex =
+			53
+
+		card.Parent =
+			DEATH_REPORT.list
+
+		corner(
+			card,
+			9
+		)
+
+		local mark =
+			Instance.new(
+				"TextLabel"
+			)
+
+		mark.Size =
+			UDim2.fromOffset(
+				30,
+				30
+			)
+
+		mark.Position =
+			UDim2.fromOffset(
+				10,
+				16
+			)
+
+		mark.BackgroundColor3 =
+			COLOR_CARD_ON
+
+		mark.BorderSizePixel =
+			0
+
+		mark.Font =
+			Enum.Font.GothamBlack
+
+		mark.Text =
+			"☠"
+
+		mark.TextColor3 =
+			COLOR_ACCENT
+
+		mark.TextSize =
+			14
+
+		mark.ZIndex =
+			54
+
+		mark.Parent =
+			card
+
+		corner(
+			mark,
+			7
+		)
+
+		local line1 =
+			Instance.new(
+				"TextLabel"
+			)
+
+		line1.Size =
+			UDim2.new(
+				1,
+				-56,
+				0,
+				22
+			)
+
+		line1.Position =
+			UDim2.fromOffset(
+				48,
+				8
+			)
+
+		line1.BackgroundTransparency =
+			1
+
+		line1.Font =
+			FONT_BUTTON
+
+		line1.Text =
+			tostring(
+				report.slot
+					or "Unknown slot"
+			)
+			.. "  ·  "
+			.. tostring(
+				report.animal
+					or "Unknown animal"
+			)
+
+		line1.TextColor3 =
+			COLOR_TEXT
+
+		line1.TextSize =
+			11
+
+		line1.TextXAlignment =
+			Enum.TextXAlignment.Left
+
+		line1.TextTruncate =
+			Enum.TextTruncate.AtEnd
+
+		line1.ZIndex =
+			54
+
+		line1.Parent =
+			card
+
+		local line2 =
+			Instance.new(
+				"TextLabel"
+			)
+
+		line2.Size =
+			UDim2.new(
+				1,
+				-56,
+				0,
+				22
+			)
+
+		line2.Position =
+			UDim2.fromOffset(
+				48,
+				31
+			)
+
+		line2.BackgroundTransparency =
+			1
+
+		line2.Font =
+			FONT_BODY
+
+		line2.Text =
+			tostring(
+				report.when
+					or "Unknown time"
+			)
+
+		line2.TextColor3 =
+			COLOR_SUBTEXT
+
+		line2.TextSize =
+			10
+
+		line2.TextXAlignment =
+			Enum.TextXAlignment.Left
+
+		line2.ZIndex =
+			54
+
+		line2.Parent =
+			card
+	end
+end
+
+DEATH_REPORT.button.MouseEnter:Connect(function()
+	DEATH_REPORT.button.BackgroundColor3 = COLOR_CARD_ON
+end)
+
+DEATH_REPORT.button.MouseLeave:Connect(function()
+	DEATH_REPORT.button.BackgroundColor3 = COLOR_CARD
+end)
+
+DEATH_REPORT.button.Activated:Connect(function()
+	INFO.overlay.Visible = false
+	DEATH_REPORT.render()
+	DEATH_REPORT.overlay.Visible = not DEATH_REPORT.overlay.Visible
+end)
+
+DEATH_REPORT.close.Activated:Connect(function()
+	DEATH_REPORT.overlay.Visible = false
+end)
+
+DEATH_REPORT.render()
 
 -- ============================================================
 -- Info / Update panel
@@ -28752,6 +30488,7 @@ INFO.button.MouseLeave:Connect(function()
 end)
 
 INFO.button.Activated:Connect(function()
+	DEATH_REPORT.overlay.Visible = false
 	INFO.overlay.Visible = not INFO.overlay.Visible
 end)
 
@@ -29383,6 +31120,11 @@ local function toggle(parent, label, key, order)
 		end
 
 		if key == "farmCoins" and state[key] then
+			state.coinFarmCharacterMissingSince = nil
+			state.coinFarmMenuRecovering = false
+			state.coinFarmMenuRetryAt = 0
+			state.coinFarmRememberCurrentSlot()
+
 			state.questPostGrowAll = false
 			state.growExistingAutomaticAll = false
 			state.growAllSlots = false
@@ -30652,7 +32394,12 @@ task.spawn(function()
 		wasFarmCoins = active
 
 		if active then
-			pcall(state.coinFarmTryPreferredSwitch)
+			pcall(
+				state.coinFarmTryPreferredSwitch
+			)
+
+			-- Global Slot Guardian now owns death/menu recovery for AFK Coin,
+			-- Auto Grow, Auto Quests and Survival-only use.
 		end
 
 		task.wait(0.5)
@@ -33383,6 +35130,11 @@ shared.__uiRootCleanup = function()
 
 		growthPrideEnabled =
 			state.growthPrideEnabled ~= false,
+
+		deathReports =
+			state.slotGuardian
+				and state.slotGuardian.deathReports
+				or {},
 
 		autoEatManualDisabled = state.autoEatManualDisabled == true,
 		autoDrinkManualDisabled = state.autoDrinkManualDisabled == true,
