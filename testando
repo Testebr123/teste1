@@ -842,11 +842,53 @@ function state.gameSwimmingExitConfirmed(
 end
 
 local function setAquaticWaterCollision(character, enabled)
-	if not isAquaticCharacter(character) then return end
+	if not character then
+		return
+	end
 
-	local waterPart = workspace:FindFirstChild("MainWaterPart")
-	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = enabled == true
+	local aquatic =
+		isAquaticCharacter(
+			character
+		)
+
+	local crocHippo =
+		state.isCrocOrHippoMovementCharacter
+		and state.isCrocOrHippoMovementCharacter(
+			character
+		)
+
+	if not aquatic
+		and not crocHippo then
+		return
+	end
+
+	local waterPart =
+		workspace:FindFirstChild(
+			"MainWaterPart"
+		)
+
+	if waterPart
+		and waterPart:IsA(
+			"BasePart"
+		) then
+
+		if crocHippo then
+			-- Croc/Hippo normally REQUIRE the solid water surface.
+			-- Collision is disabled ONLY while the dedicated underwater-exit
+			-- transaction owns the animal.
+			local exitActive =
+				state.aquaticRiverEscape
+				and (
+					state.aquaticRiverEscape.busy
+						or state.aquaticRiverEscape.survivalSuspended
+				)
+
+			waterPart.CanCollide =
+				not exitActive
+		else
+			waterPart.CanCollide =
+				enabled == true
+		end
 	end
 end
 
@@ -1536,6 +1578,63 @@ function state.isCrocOrHippoMovementCharacter(character)
 	return key == "hippo"
 		or key:find("croc", 1, true) ~= nil
 end
+
+function state.enforceCrocHippoMainWaterCollision(
+	character
+)
+	if not character
+		or not state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+		return
+	end
+
+	local controller =
+		state.aquaticRiverEscape
+
+	local exitActive =
+		controller
+		and (
+			controller.busy
+				or controller.survivalSuspended
+		)
+
+	local waterPart =
+		workspace:FindFirstChild(
+			"MainWaterPart"
+		)
+
+	if waterPart
+		and waterPart:IsA(
+			"BasePart"
+		) then
+
+		waterPart.CanCollide =
+			not exitActive
+	end
+end
+
+task.spawn(function()
+	while state.alive do
+		task.wait(0.35)
+
+		local character =
+			player.Character
+				or workspace:FindFirstChild(
+					player.Name
+				)
+
+		if character
+			and state.isCrocOrHippoMovementCharacter(
+				character
+			) then
+
+			state.enforceCrocHippoMainWaterCollision(
+				character
+			)
+		end
+	end
+end)
 
 function state.movementBodySize(character)
 	if not character then
@@ -3320,6 +3419,15 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		local waterPart =
 			bridge.part
 
+		-- This is a normal ABOVE-water traversal, not an underwater exit.
+		-- Keep the physical water surface solid for Croc/Hippo.
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+			waterPart.CanCollide =
+				true
+		end
+
 		state.heavyWalkStop(
 			character
 		)
@@ -3669,6 +3777,16 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				"MovementDisabled",
 				oldMovementDisabled
 			)
+		end
+
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		)
+			and waterPart
+			and waterPart.Parent then
+
+			waterPart.CanCollide =
+				true
 		end
 
 		if crossed then
@@ -9128,9 +9246,12 @@ function CROC.approachDrink()
 	removeSwimBarrier()
 	drinkingSourcePosition = nil
 
-	-- v77: Croc has no fixed drinking spawn anymore.
-	-- Any exposed water found by the normal scanner is valid.
-	setAquaticWaterCollision(character, true)
+	-- Normal drinking uses the solid MainWaterPart. Only underwater exit
+	-- temporarily disables this collision.
+	setAquaticWaterCollision(
+		character,
+		true
+	)
 
 	local spot =
 		state.drinkFindAccessibleSpot(
@@ -12730,10 +12851,20 @@ function state.aquaticRiverInfinityFlyExit(
 		)
 	end
 
-	-- Restore exactly what the water part had before this Fly.
-	if waterPart and waterPart.Parent then
-		waterPart.CanCollide =
-			oldWaterCollision
+	-- Underwater exit is the ONLY Croc/Hippo phase with collision disabled.
+	-- UNFLY is complete here, so immediately restore the normal solid surface.
+	if waterPart
+		and waterPart.Parent then
+
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+			waterPart.CanCollide =
+				true
+		else
+			waterPart.CanCollide =
+				oldWaterCollision
+		end
 	end
 
 	-- Keep fall protection for only two landing frames.
@@ -14163,7 +14294,29 @@ function DAMAGE.moveToSafety()
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = isAquaticCharacter(character)
+		local crocHippo =
+			state.isCrocOrHippoMovementCharacter(
+				character
+			)
+
+		local exitActive =
+			crocHippo
+			and state.aquaticRiverEscape
+			and (
+				state.aquaticRiverEscape.busy
+					or state.aquaticRiverEscape.survivalSuspended
+			)
+
+		if exitActive then
+			waterPart.CanCollide = false
+		elseif crocHippo then
+			waterPart.CanCollide = true
+		else
+			waterPart.CanCollide =
+				isAquaticCharacter(
+					character
+				)
+		end
 	end
 
 	local crocHippoUnderWater =
@@ -14697,7 +14850,30 @@ local function forcePostDrinkMove(wasUnderground)
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	local aquaticExit = isAquaticCharacter(player.Character)
 	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = aquaticExit == true
+		local crocHippo =
+			player.Character
+			and state.isCrocOrHippoMovementCharacter(
+				player.Character
+			)
+
+		local exitActive =
+			crocHippo
+			and state.aquaticRiverEscape
+			and (
+				state.aquaticRiverEscape.busy
+					or state.aquaticRiverEscape.survivalSuspended
+			)
+
+		if exitActive then
+			waterPart.CanCollide =
+				false
+		elseif crocHippo then
+			waterPart.CanCollide =
+				true
+		else
+			waterPart.CanCollide =
+				aquaticExit == true
+		end
 	end
 
 	local function confirmedOutside()
@@ -15546,7 +15722,31 @@ function state.drinkEmergencyEscape(character, root, reason)
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = isAquaticCharacter(character)
+		local crocHippo =
+			state.isCrocOrHippoMovementCharacter(
+				character
+			)
+
+		local exitActive =
+			crocHippo
+			and state.aquaticRiverEscape
+			and (
+				state.aquaticRiverEscape.busy
+					or state.aquaticRiverEscape.survivalSuspended
+			)
+
+		if exitActive then
+			waterPart.CanCollide =
+				false
+		elseif crocHippo then
+			waterPart.CanCollide =
+				true
+		else
+			waterPart.CanCollide =
+				isAquaticCharacter(
+					character
+				)
+		end
 	end
 
 	runtimeMessage = reason or "ANTI-AFOGAMENTO: escapando para cima do Terrain"
@@ -16869,7 +17069,10 @@ local function virtualDrinkKick()
 			drinkingSourcePosition = nil
 			removeSwimBarrier()
 			local _, waterPart = CROC.getWaterSurfaceY()
-			if waterPart then waterPart.CanCollide = true end
+			if waterPart then
+				waterPart.CanCollide =
+					true
+			end
 			CROC.approachDrink()
 		elseif drinkingSourcePosition then
 			state.drinkAbandonCurrent("Watchdog: fonte sem progresso; trocando de agua")
@@ -16986,11 +17189,24 @@ local function autoDrinkStep()
 		return
 	end
 
-	-- Hippo/Croc need solid MainWaterPart BEFORE the approach. Enabling it
-	-- after arrival is too late for their large body physics.
+	-- Croc/Hippo approach water from REAL Terrain. MainWaterPart collision
+	-- must stay OFF; other aquatic animals keep their existing behavior.
 	if isAquaticCharacter(character)
 		and (earlyWater <= 75 or drinkingToFull) then
-		setAquaticWaterCollision(character, true)
+
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+			setAquaticWaterCollision(
+				character,
+				false
+			)
+		else
+			setAquaticWaterCollision(
+				character,
+				true
+			)
+		end
 	end
 
 	-- Crocodile can NEVER use Underground Drink. Its low body/physics make the
@@ -17138,10 +17354,17 @@ local function autoDrinkStep()
 	end
 
 	if currentAnimalName ~= CROC.lastDrinkAnimalName then
-		-- Never leave MainWaterPart solid after switching away from Hippo/Croc.
 		local waterPart = workspace:FindFirstChild("MainWaterPart")
 		if waterPart and waterPart:IsA("BasePart") then
-			waterPart.CanCollide = false
+			if state.isCrocOrHippoMovementCharacter(
+				character
+			) then
+				waterPart.CanCollide =
+					true
+			else
+				waterPart.CanCollide =
+					false
+			end
 		end
 
 		drinkingToFull = false
@@ -17494,12 +17717,17 @@ local function autoDrinkStep()
 	end
 
 
-	local isCroc = CROC.isCharacter(character)
+	local isCrocHippo =
+		state.isCrocOrHippoMovementCharacter(
+			character
+		)
 
-	if isCroc then
-		-- Croc uses the normal exposed-water scanner and keeps MainWaterPart
-		-- collidable so it can drink at the lip without entering the water.
-		setAquaticWaterCollision(character, true)
+	if isCrocHippo then
+		-- Croc/Hippo drink from the Terrain lip with normal water collision.
+		setAquaticWaterCollision(
+			character,
+			true
+		)
 	end
 
 	local isAquatic = isAquaticCharacter(character)
@@ -17532,7 +17760,10 @@ local function autoDrinkStep()
 			runtimeMessage = "Bebendo ate encher"
 
 			if isAquatic then
-				setAquaticWaterCollision(character, true)
+				setAquaticWaterCollision(
+					character,
+					true
+				)
 			end
 
 			if state.drinkIsUpsideDown(root) then
