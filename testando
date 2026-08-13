@@ -11498,6 +11498,308 @@ function state.isUnderMainWaterPart(root)
 		info
 end
 
+function state.mainWaterDryBankReached(
+	character,
+	root,
+	waterPart
+)
+	if not character
+		or not root then
+		return false
+	end
+
+	waterPart =
+		waterPart
+		or workspace:FindFirstChild(
+			"MainWaterPart"
+		)
+
+	if not waterPart
+		or not waterPart:IsA(
+			"BasePart"
+		) then
+		return false
+	end
+
+	local localPosition =
+		waterPart.CFrame:PointToObjectSpace(
+			root.Position
+		)
+
+	local halfY =
+		waterPart.Size.Y * 0.5
+
+	local topWorld =
+		waterPart.CFrame:PointToWorldSpace(
+			Vector3.new(
+				localPosition.X,
+				halfY,
+				localPosition.Z
+			)
+		)
+
+	local params =
+		RaycastParams.new()
+
+	params.FilterType =
+		Enum.RaycastFilterType.Include
+
+	params.FilterDescendantsInstances = {
+		workspace.Terrain,
+	}
+
+	params.IgnoreWater = true
+
+	-- Short local proof only. River bottom is rejected because its surface is
+	-- below MainWaterPart's top; a nearby bank/hill rises to that level.
+	local hit =
+		workspace:Raycast(
+			root.Position
+				+ Vector3.new(
+					0,
+					8,
+					0
+				),
+			Vector3.new(
+				0,
+				-24,
+				0
+			),
+			params
+		)
+
+	if not hit
+		or hit.Material
+			== Enum.Material.Water
+		or hit.Normal.Y < 0.10 then
+		return false
+	end
+
+	return hit.Position.Y
+		>= topWorld.Y - 0.35
+end
+
+function state.findNearbyMainWaterBankTarget(
+	character,
+	root,
+	preferredTarget
+)
+	local under, info =
+		state.isUnderMainWaterPart(
+			root
+		)
+
+	if not info then
+		return nil
+	end
+
+	local waterPart =
+		info.part
+
+	local waterTopY =
+		info.topY
+
+	local baseDirection
+
+	if typeof(preferredTarget)
+		== "Vector3" then
+
+		baseDirection =
+			Vector3.new(
+				preferredTarget.X
+					- root.Position.X,
+				0,
+				preferredTarget.Z
+					- root.Position.Z
+			)
+	end
+
+	if not baseDirection
+		or baseDirection.Magnitude
+			< 0.1 then
+
+		baseDirection =
+			root.CFrame.LookVector
+
+		baseDirection =
+			Vector3.new(
+				baseDirection.X,
+				0,
+				baseDirection.Z
+			)
+	end
+
+	if baseDirection.Magnitude
+		< 0.1 then
+
+		baseDirection =
+			Vector3.new(
+				1,
+				0,
+				0
+			)
+	else
+		baseDirection =
+			baseDirection.Unit
+	end
+
+	local function rotated(
+		direction,
+		degrees
+	)
+		local angle =
+			math.rad(
+				degrees
+			)
+
+		local cosA =
+			math.cos(
+				angle
+			)
+
+		local sinA =
+			math.sin(
+				angle
+			)
+
+		return Vector3.new(
+			direction.X * cosA
+				- direction.Z * sinA,
+			0,
+			direction.X * sinA
+				+ direction.Z * cosA
+		)
+	end
+
+	-- Prefer the requested route direction, then progressively fan around it.
+	local directions = {}
+
+	for _, degrees in ipairs({
+		0,
+		45,
+		-45,
+		90,
+		-90,
+		135,
+		-135,
+		180,
+	}) do
+
+		table.insert(
+			directions,
+			rotated(
+				baseDirection,
+				degrees
+			)
+		)
+	end
+
+	local params =
+		RaycastParams.new()
+
+	params.FilterType =
+		Enum.RaycastFilterType.Include
+
+	params.FilterDescendantsInstances = {
+		workspace.Terrain,
+	}
+
+	params.IgnoreWater = true
+
+	local clearance =
+		math.clamp(
+			state.movementRootClearance(
+				character
+			) * 0.24,
+			0.75,
+			1.8
+		)
+
+	-- One-time, progressive local scan. It stops on the FIRST radius that has
+	-- any usable bank, so nearby rises win over distant MainWaterPart edges.
+	for _, radius in ipairs({
+		12,
+		22,
+		36,
+		54,
+	}) do
+
+		local best
+		local bestScore =
+			math.huge
+
+		for directionIndex,
+			direction in ipairs(
+				directions
+			) do
+
+			local candidateXZ =
+				root.Position
+				+ direction
+					* radius
+
+			local hit =
+				workspace:Raycast(
+					Vector3.new(
+						candidateXZ.X,
+						waterTopY + 28,
+						candidateXZ.Z
+					),
+					Vector3.new(
+						0,
+						-56,
+						0
+					),
+					params
+				)
+
+			if hit
+				and hit.Material
+					~= Enum.Material.Water
+				and hit.Normal.Y
+					>= 0.10
+				and hit.Position.Y
+					>= waterTopY - 0.35 then
+
+				local heightPenalty =
+					math.max(
+						0,
+						hit.Position.Y
+							- waterTopY
+					) * 0.08
+
+				local directionPenalty =
+					(directionIndex - 1)
+						* 0.08
+
+				local score =
+					radius
+					+ heightPenalty
+					+ directionPenalty
+
+				if score < bestScore then
+					bestScore =
+						score
+
+					best =
+						hit.Position
+						+ Vector3.new(
+							0,
+							clearance,
+							0
+						)
+				end
+			end
+		end
+
+		if best then
+			return best
+		end
+	end
+
+	return nil
+end
+
 function state.mainWaterNearestExitTarget(
 	character,
 	root
@@ -11561,9 +11863,9 @@ function state.mainWaterNearestExitTarget(
 	-- the exact boundary.
 	local outsideMargin =
 		math.clamp(
-			footprint * 0.20,
-			3,
-			5
+			footprint * 0.14,
+			2.5,
+			4
 		)
 
 	local lift =
@@ -11620,7 +11922,8 @@ end
 
 function state.mainWaterExitReached(
 	root,
-	waterPart
+	waterPart,
+	character
 )
 	if not root
 		or not waterPart
@@ -11628,44 +11931,19 @@ function state.mainWaterExitReached(
 		return false
 	end
 
-	local p =
-		waterPart.CFrame:PointToObjectSpace(
-			root.Position
-		)
+	character =
+		character
+		or root.Parent
 
-	local halfX =
-		waterPart.Size.X * 0.5
-
-	local halfY =
-		waterPart.Size.Y * 0.5
-
-	local halfZ =
-		waterPart.Size.Z * 0.5
-
-	local outsideXZ =
-		math.abs(p.X)
-			> halfX + 0.25
-		or math.abs(p.Z)
-			> halfZ + 0.25
-
-	if not outsideXZ then
+	if not character then
 		return false
 	end
 
-	local topWorld =
-		waterPart.CFrame:PointToWorldSpace(
-			Vector3.new(
-				p.X,
-				halfY,
-				p.Z
-			)
-		)
-
-	-- No Terrain proof: by design the water part boundary is authoritative.
-	-- We only require the animal to have risen close to the water plane before
-	-- ending Fly, so a very deep Croc cannot cross the side boundary underground.
-	return root.Position.Y
-		>= topWorld.Y - 0.75
+	return state.mainWaterDryBankReached(
+		character,
+		root,
+		waterPart
+	)
 end
 
 function state.aquaticFlyDryGroundReached(
@@ -11688,7 +11966,8 @@ function state.aquaticFlyDryGroundReached(
 
 	return state.mainWaterExitReached(
 		root,
-		info.part
+		info.part,
+		character
 	)
 end
 
@@ -11739,28 +12018,47 @@ function state.aquaticRiverInfinityFlyExit(
 		return false
 	end
 
-	-- Already outside the water-part condition: nothing to recover.
-	if not under then
-		local outside =
-			state.mainWaterExitReached(
-				root,
-				info.part
-			)
+	-- If the previous Fly already placed us on a real nearby bank, recover
+	-- Survival immediately even if the prior transaction timed out.
+	if state.mainWaterDryBankReached(
+		character,
+		root,
+		info.part
+	) then
 
-		if outside then
-			state.aquaticSurvivalResume(
-				character
-			)
-		end
+		state.aquaticSurvivalResume(
+			character
+		)
 
-		return outside
+		return true
+	end
+
+	-- A running/suspended water-exit transaction may already have lifted the
+	-- HRP above MainWaterPart while still over open water. Do NOT interpret
+	-- that as land; continue toward a real bank.
+	if not under
+		and not (
+			state.aquaticRiverEscape
+			and state.aquaticRiverEscape.survivalSuspended
+		) then
+
+		return false
 	end
 
 	local target =
-		state.mainWaterNearestExitTarget(
+		state.findNearbyMainWaterBankTarget(
 			character,
-			root
+			root,
+			_preferredTarget
 		)
+
+	if typeof(target) ~= "Vector3" then
+		target =
+			state.mainWaterNearestExitTarget(
+				character,
+				root
+			)
+	end
 
 	if typeof(target) ~= "Vector3" then
 		return false
@@ -11894,6 +12192,9 @@ function state.aquaticRiverInfinityFlyExit(
 	local success =
 		false
 
+	local nextDryBankCheckAt =
+		0
+
 	local callOk, callError =
 		pcall(function()
 			while state.alive
@@ -11903,14 +12204,27 @@ function state.aquaticRiverInfinityFlyExit(
 				and humanoid.Health > 0
 				and tick() < deadline do
 
-				-- O(1) geometry only. No raycast, voxels, MovementState or
-				-- SwimHeightAttachment checks while Fly is active.
-				if state.mainWaterExitReached(
-					root,
-					waterPart
-				) then
-					success = true
-					break
+				-- Only one short Terrain ray every 0.125 s. This catches the
+				-- FIRST nearby rise/bank we pass over, so the Croc/Hippo does not
+				-- continue flying toward some distant MainWaterPart edge.
+				local now =
+					tick()
+
+				if now
+					>= nextDryBankCheckAt then
+
+					nextDryBankCheckAt =
+						now + 0.125
+
+					if state.mainWaterDryBankReached(
+						character,
+						root,
+						waterPart
+					) then
+
+						success = true
+						break
+					end
 				end
 
 				local delta =
@@ -11957,17 +12271,31 @@ function state.aquaticRiverInfinityFlyExit(
 						character
 					)
 						and string.format(
-							"Croc water Fly: MainWaterPart above -> nearest edge (%.0f)",
+							"Croc water Fly: moving to nearby dry bank (%.0f)",
 							delta.Magnitude
 						)
 						or string.format(
-							"Hippo water Fly: MainWaterPart above -> nearest edge (%.0f)",
+							"Hippo water Fly: moving to nearby dry bank (%.0f)",
 							delta.Magnitude
 						)
 
 				RunService.Heartbeat:Wait()
 			end
 		end)
+
+	-- One final proof before UNFLY. This also catches a bank reached on the
+	-- exact timeout frame.
+	if not success
+		and root
+		and root.Parent
+		and state.mainWaterDryBankReached(
+			character,
+			root,
+			waterPart
+		) then
+
+		success = true
+	end
 
 	-- UNFLY
 	pcall(function()
@@ -12079,8 +12407,8 @@ function state.moveAquaticToDryTerrain(character, root, preferredTarget)
 			)
 
 		if info
-			and not under
-			and state.mainWaterExitReached(
+			and state.mainWaterDryBankReached(
+				character,
 				root,
 				info.part
 			) then
@@ -12089,10 +12417,16 @@ function state.moveAquaticToDryTerrain(character, root, preferredTarget)
 				character
 			)
 
+			controller.retryAt = 0
 			return true
 		end
 
-		if not under then
+		local suspended =
+			controller.survivalSuspended
+				== true
+
+		if not under
+			and not suspended then
 			return false
 		end
 
@@ -14129,6 +14463,42 @@ local function forcePostDrinkMove(wasUnderground)
 		-- finish yet, keep the transaction pending and let the aquatic cooldown
 		-- retry it instead of mistaking the solid river bottom for dry land.
 		if crocHippo and not escaped then
+			local waterPart =
+				workspace:FindFirstChild(
+					"MainWaterPart"
+				)
+
+			if waterPart
+				and waterPart:IsA(
+					"BasePart"
+				)
+				and state.mainWaterDryBankReached(
+					aquaticCharacter,
+					aquaticRoot,
+					waterPart
+				) then
+
+				state.aquaticRiverEscape.busy =
+					false
+
+				state.aquaticRiverEscape.retryAt =
+					0
+
+				state.aquaticSurvivalResume(
+					aquaticCharacter
+				)
+
+				resetEatingSearch(nil)
+				drinkingSourcePosition = nil
+				forcingPostDrinkMove = false
+				criticalRecoveryActive = false
+
+				runtimeMessage =
+					"Dry bank confirmed after Fly; Auto Eat + Auto Drink restored"
+
+				return
+			end
+
 			resetEatingSearch(nil)
 			drinkingSourcePosition = nil
 			forcingPostDrinkMove = false
@@ -14138,8 +14508,8 @@ local function forcePostDrinkMove(wasUnderground)
 				CROC.isCharacter(
 					aquaticCharacter
 				)
-					and "Croc aquatic Fly pending; generic Terrain exit blocked"
-					or "Hippo aquatic Fly pending; generic Terrain exit blocked"
+					and "Croc aquatic Fly pending; waiting for nearby bank"
+					or "Hippo aquatic Fly pending; waiting for nearby bank"
 
 			return
 		end
@@ -14326,9 +14696,49 @@ function state.noIdleWaterSafetyStep()
 	if state.isCrocOrHippoMovementCharacter(
 		character
 	) then
-		if not state.isUnderMainWaterPart(
-			root
-		) then
+		local controller =
+			state.aquaticRiverEscape
+
+		local waterPart =
+			workspace:FindFirstChild(
+				"MainWaterPart"
+			)
+
+		if controller
+			and controller.survivalSuspended
+			and waterPart
+			and waterPart:IsA(
+				"BasePart"
+			)
+			and state.mainWaterDryBankReached(
+				character,
+				root,
+				waterPart
+			) then
+
+			controller.busy = false
+			controller.retryAt = 0
+
+			state.aquaticSurvivalResume(
+				character
+			)
+
+			runtimeMessage =
+				"Croc/Hippo dry bank confirmed; Auto Eat + Auto Drink restored"
+
+			return
+		end
+
+		local under =
+			state.isUnderMainWaterPart(
+				root
+			)
+
+		if not under
+			and not (
+				controller
+				and controller.survivalSuspended
+			) then
 			return
 		end
 	elseif not state.isBodyActuallyInWater(
