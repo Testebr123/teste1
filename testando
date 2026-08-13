@@ -10386,13 +10386,12 @@ function state.drinkTestSetTransitPhysics(
 				freefallEnabled = freefallEnabled,
 				fallingDownEnabled = fallingDownEnabled,
 				ragdollEnabled = ragdollEnabled,
-				rootAnchored = root and root.Anchored or false,
 			}
 		end
 
-		-- Underground Drink must NEVER use Physics/PlatformStand as a movement
-		-- mode. Physics is visually a ragdoll on Savannah custom rigs. Instead we
-		-- freeze the root assembly and move the complete model only with PivotTo.
+		-- Underground Drink must NEVER use Physics, PlatformStand OR Anchored.
+		-- Anchoring can stop Savannah from accepting Eating/Drinking. Keep the
+		-- assembly live, disable ragdoll/fall states, and pin CFrame every frame.
 		pcall(function()
 			humanoid:SetStateEnabled(
 				Enum.HumanoidStateType.Freefall,
@@ -10424,7 +10423,7 @@ function state.drinkTestSetTransitPhysics(
 
 		if root then
 			pcall(function()
-				root.Anchored = true
+				root.Anchored = false
 				root.AssemblyLinearVelocity = Vector3.zero
 				root.AssemblyAngularVelocity = Vector3.zero
 			end)
@@ -10444,13 +10443,13 @@ function state.drinkTestSetTransitPhysics(
 	if snapshot then
 		local root = character:FindFirstChild("HumanoidRootPart")
 
-		-- Restore anchoring only after the controlled surface exit has completed.
-		-- This avoids one physics frame in which the animal could fall/ragdoll.
+		-- Underground Drink never anchors the character. Keep it unanchored on
+		-- restore as well; the surface exit already places it at supported height.
 		if root then
 			pcall(function()
 				root.AssemblyLinearVelocity = Vector3.zero
 				root.AssemblyAngularVelocity = Vector3.zero
-				root.Anchored = snapshot.rootAnchored == true
+				root.Anchored = false
 			end)
 		end
 
@@ -10562,10 +10561,10 @@ function state.drinkTestMaintainTransit(
 		true
 	)
 
-	-- Reassert a rigid, upright underground hold. No Physics state, no
-	-- PlatformStand and no velocity are allowed to accumulate between frames.
+	-- Reassert an upright LIVE assembly. Position locking is done by CFrame/PivotTo
+	-- every frame; never Anchor because Savannah can reject Drinking/Eating then.
 	pcall(function()
-		root.Anchored = true
+		root.Anchored = false
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
 		humanoid.PlatformStand = false
@@ -13017,7 +13016,7 @@ function state.runUndergroundDrinkTest()
 					)
 				end
 
-				-- Underground crossing uses rigid PivotTo translation with the root anchored.
+				-- Underground crossing uses fast PivotTo translation while fully UNANCHORED.
 				-- No SafeMove, Freefall, Physics state or ragdoll is used.
 				local descended, descentMoveReason =
 					state.drinkTestSmoothMove(
@@ -13157,6 +13156,7 @@ function state.runUndergroundDrinkTest()
 					end)
 				end
 
+				root.Anchored = false
 				root.AssemblyLinearVelocity = Vector3.zero
 				root.AssemblyAngularVelocity = Vector3.zero
 
@@ -13299,8 +13299,9 @@ function state.runUndergroundDrinkTest()
 						)
 					end
 
-					-- Hard pin: while Drinking is active below Terrain the model stays in
-					-- exactly one pose. Do not use upright impulses or any physics movement.
+					-- Unanchored hard pin: keep exactly one pose while the server still sees
+					-- a normal live character. Reapply every Heartbeat; no ragdoll/impulses.
+					root.Anchored = false
 					if rigidPivotCFrame then
 						pcall(function()
 							character:PivotTo(rigidPivotCFrame)
@@ -13376,7 +13377,9 @@ function state.runUndergroundDrinkTest()
 						)
 					end
 
-					task.wait(0.10)
+					-- Pin every physics frame without Anchored. This is the old fixed-position
+					-- behavior, but with the complete rig kept upright and non-collidable.
+					RunService.Heartbeat:Wait()
 				end
 			end,
 			function(err)
