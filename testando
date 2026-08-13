@@ -10393,7 +10393,10 @@ function state.drinkTestSetTransitPhysics(
 				Enum.HumanoidStateType.FallingDown,
 				false
 			)
-			humanoid.PlatformStand = true
+			-- Keep the rig upright. PlatformStand=true makes large Savannah rigs
+			-- (especially Elephant) fold/compress against Terrain before the root
+			-- can cross it. Physics + disabled Freefall/FallingDown is sufficient.
+			humanoid.PlatformStand = false
 			humanoid.AutoRotate = false
 			humanoid:ChangeState(
 				Enum.HumanoidStateType.Physics
@@ -10528,66 +10531,97 @@ function state.drinkTestSmoothMove(
 		or not root
 		or not humanoid
 		or humanoid.Health <= 0 then
-
 		return false, "character"
 	end
 
-	if not state.drinkTestGhostCharacter(
-		character,
-		true
-	) then
+	if not state.drinkTestGhostCharacter(character, true) then
 		return false, "collision"
 	end
 
-	-- CFrame owns movement; keep Humanoid in Physics so this vertical
-	-- displacement never accumulates Freefall/fall distance.
-	state.drinkTestMaintainTransit(
-		character,
-		root,
-		humanoid
-	)
+	state.drinkTestMaintainTransit(character, root, humanoid)
 
 	if state.questSetW then
 		pcall(state.questSetW, false)
 	end
 
-	local startCFrame =
-		root.CFrame
-
-	local goalCFrame =
+	local startRootCFrame = root.CFrame
+	local goalRootCFrame =
 		CFrame.new(targetPosition)
-		* startCFrame.Rotation
+		* startRootCFrame.Rotation
+
+	-- Preserve the complete rig relative to HRP. Moving only HRP can visually
+	-- compress large custom rigs against Terrain; PivotTo translates the whole
+	-- animal as one assembly while collision is disabled.
+	local rootToPivot
+	pcall(function()
+		rootToPivot =
+			startRootCFrame:ToObjectSpace(
+				character:GetPivot()
+			)
+	end)
+
+	local function placeWholeRig(desiredRootCFrame)
+		if not character.Parent or not root.Parent then
+			return false
+		end
+
+		state.drinkTestGhostCharacter(character, true)
+		state.drinkTestMaintainTransit(character, root, humanoid)
+
+		local placed = false
+		if rootToPivot then
+			placed = pcall(function()
+				character:PivotTo(
+					desiredRootCFrame * rootToPivot
+				)
+			end)
+		end
+
+		if not placed then
+			pcall(function()
+				root.CFrame = desiredRootCFrame
+			end)
+		end
+
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
+		return true
+	end
 
 	local distance =
-		(
-			targetPosition
-			- root.Position
-		).Magnitude
+		(targetPosition - root.Position).Magnitude
 
-	-- Cross Terrain in a few frames. The previous multi-second descent could
-	-- be interpreted by game-side fall trackers as a real long fall.
 	local transitSpeed =
 		math.max(
-			220,
-			state.safeMovementSpeed(character) * 4
+			260,
+			state.safeMovementSpeed(character) * 5
 		)
 
-	local duration =
-		math.clamp(
+	local duration
+	if label == "descent" then
+		-- Crossing Terrain must be decisive. A long interpolation lets the game
+		-- controller keep pushing a huge animal back onto the surface.
+		duration = math.clamp(
 			distance / transitSpeed,
-			0.08,
-			0.40
+			0.05,
+			0.18
 		)
+	else
+		duration = math.clamp(
+			distance / transitSpeed,
+			0.06,
+			0.32
+		)
+	end
+
+	if tonumber(maxDuration) then
+		duration = math.min(duration, math.max(0.05, tonumber(maxDuration)))
+	end
 
 	local startedAt = tick()
-	local lastActualPosition =
-		root.Position
-
-	local lastActualProgressAt =
-		tick()
-
-	local lastDistance =
-		distance
+	local lastActualPosition = root.Position
+	local lastActualProgressAt = tick()
+	local lastDistance = distance
 
 	while state.alive
 		and character.Parent
@@ -10595,8 +10629,7 @@ function state.drinkTestSmoothMove(
 		and humanoid.Parent
 		and humanoid.Health > 0 do
 
-		if test.cancelRequested
-			and not ignoreCancel then
+		if test.cancelRequested and not ignoreCancel then
 			return false, "cancel"
 		end
 
@@ -10608,92 +10641,41 @@ function state.drinkTestSmoothMove(
 			)
 
 		if abort
-			and not (
-				ignoreCancel
-				and abort == "cancel"
-			) then
+			and not (ignoreCancel and abort == "cancel") then
 			return false, abort
 		end
 
-		-- The game may restore collisions between frames.
-		for _, object in ipairs(
-			character:GetDescendants()
-		) do
-			if object:IsA("BasePart")
-				and object.CanCollide then
-				object.CanCollide = false
-			end
-		end
-
-		character:SetAttribute(
-			"MovementDisabled",
-			true
-		)
-
-		state.drinkTestMaintainTransit(
-			character,
-			root,
-			humanoid
-		)
-
 		local alpha =
 			math.clamp(
-				(tick() - startedAt)
-					/ duration,
+				(tick() - startedAt) / duration,
 				0,
 				1
 			)
 
-		-- This is the same movement style found in the uploaded old script:
-		-- interpolate the root every Heartbeat instead of trying to push it
-		-- through Terrain with AssemblyLinearVelocity.
-		root.CFrame =
-			startCFrame:Lerp(
-				goalCFrame,
+		local desired =
+			startRootCFrame:Lerp(
+				goalRootCFrame,
 				alpha
 			)
 
-		root.AssemblyLinearVelocity =
-			Vector3.zero
-
-		root.AssemblyAngularVelocity =
-			Vector3.zero
-
-		local actualDistance =
-			(
-				targetPosition
-				- root.Position
-			).Magnitude
-
-		if actualDistance
-			< lastDistance - 0.35 then
-
-			lastDistance =
-				actualDistance
-
-			lastActualProgressAt =
-				tick()
-
-			lastActualPosition =
-				root.Position
-		elseif (
-			root.Position
-				- lastActualPosition
-			).Magnitude >= 0.75 then
-
-			lastActualPosition =
-				root.Position
-
-			lastActualProgressAt =
-				tick()
+		if not placeWholeRig(desired) then
+			return false, "character"
 		end
 
-		if tick()
-			- lastActualProgressAt
-			>= 2.5 then
+		local actualDistance =
+			(targetPosition - root.Position).Magnitude
 
-			return false,
-				"cframe_move_no_progress"
+		if actualDistance < lastDistance - 0.35 then
+			lastDistance = actualDistance
+			lastActualProgressAt = tick()
+			lastActualPosition = root.Position
+		elseif (root.Position - lastActualPosition).Magnitude >= 0.75 then
+			lastActualPosition = root.Position
+			lastActualProgressAt = tick()
+		end
+
+		if tick() - lastActualProgressAt >= 1.25 then
+			break
 		end
 
 		if alpha >= 1 then
@@ -10703,36 +10685,39 @@ function state.drinkTestSmoothMove(
 		RunService.Heartbeat:Wait()
 	end
 
-	-- Hold the already-reached endpoint briefly so the replicated animal
-	-- controller does not immediately snap back to the Terrain surface.
-	for _ = 1, 8 do
-		if not character.Parent
-			or not root.Parent
-			or not humanoid.Parent then
+	-- Endpoint authority: reassert the entire rig for several frames. This is
+	-- important for Elephant because its custom controller may correct one frame
+	-- back toward the Terrain surface.
+	for _ = 1, 12 do
+		if not character.Parent or not root.Parent or not humanoid.Parent then
 			break
 		end
-
-		root.CFrame = goalCFrame
-		root.AssemblyLinearVelocity =
-			Vector3.zero
-		root.AssemblyAngularVelocity =
-			Vector3.zero
-
+		placeWholeRig(goalRootCFrame)
 		RunService.Heartbeat:Wait()
 	end
 
 	local finalDistance =
 		root.Parent
-		and (
-			root.Position
-				- targetPosition
-		).Magnitude
+		and (root.Position - targetPosition).Magnitude
 		or math.huge
+
+	if finalDistance > 4 then
+		-- One final hard reassertion before declaring failure. Never remain half
+		-- embedded at the Terrain surface.
+		for _ = 1, 10 do
+			if not placeWholeRig(goalRootCFrame) then break end
+			RunService.Heartbeat:Wait()
+		end
+		finalDistance =
+			root.Parent
+			and (root.Position - targetPosition).Magnitude
+			or math.huge
+	end
 
 	if finalDistance > 4 then
 		return false,
 			string.format(
-				"cframe_final_distance_%.1f",
+				"whole_rig_final_distance_%.1f",
 				finalDistance
 			)
 	end
@@ -10795,40 +10780,39 @@ function state.drinkTestFindLocalSpot(origin, character)
 			character
 		).Y
 
-	-- A single stable depth based on the current body. Elephant needs a much
-	-- deeper HRP than the old fixed -3 studs before Drinking is accepted.
-	local drinkDepth =
+	-- Drinking is decided around the animal's interaction/head height, not by
+	-- forcing the HRP to a generic body-depth. For Elephant the head can be many
+	-- studs above HRP, so HRP must cross Terrain decisively until the head is
+	-- actually a few studs inside MainWaterPart.
+	local interactionOffset =
+		headOffset > 0.5
+			and headOffset
+			or math.max(
+				lift,
+				bodyHeight * 0.18
+			)
+
+	local submergeDepth =
 		math.clamp(
-			math.max(
-				3.5,
-				headOffset + 1.25,
-				bodyHeight * 0.22
-			),
-			3.5,
-			14
+			waterPart.Size.Y * 0.18,
+			1.75,
+			3.5
 		)
 
-	local waterBottomY =
-		waterPart.Position.Y
-		- waterPart.Size.Y * 0.5
+	local desiredInteractionY =
+		waterY - submergeDepth
 
 	local undergroundStandY =
 		math.max(
-			waterY - drinkDepth,
-			config.dangerY + 12,
-			waterBottomY + 3
+			desiredInteractionY - interactionOffset,
+			config.dangerY + 16
 		)
 
-	-- v98: the old minimum could leave the HRP only ~2 studs under Terrain.
-	-- drinkIsBuriedUnderTerrain requires >=4 studs of actual cover, so keep a
-	-- real safety margin for animation/physics.
-	local minimumCover =
-		math.max(
-			8,
-			lift + 6.5
-		)
-
-	local maximumCover = 95
+	-- Collision is disabled during the transaction, so large HipHeight must NOT
+	-- increase the required Terrain cover. That old rule rejected the local point
+	-- for adult Elephant and made the controller appear to press into the floor.
+	local minimumCover = 6
+	local maximumCover = 110
 	local angleOffset =
 		(player.UserId % 360)
 		* math.pi / 180
@@ -10932,8 +10916,9 @@ function state.drinkTestFindLocalSpot(origin, character)
 			end
 		end
 
-		-- Future ZoneTime use: prefer same locality over searching far away.
-		if best and radius <= 30 then
+		-- Prefer the current locality aggressively. Direct vertical descent at the
+		-- same/near XZ is safer than a diagonal underground translation.
+		if best and radius <= 20 then
 			break
 		end
 	end
@@ -13492,6 +13477,7 @@ local function autoDrinkStep()
 	if state.autoDrinkMode == "underground"
 		and isSavannahLife
 		and not CROC.isCharacter(character)
+		and tick() >= (state.drinkTest.forceSurfaceUntil or 0)
 		and (
 			earlyWater <= 75
 			or (
@@ -13557,12 +13543,22 @@ local function autoDrinkStep()
 
 				state.drinkTest.retryAfter =
 					tick() + 20
+				state.drinkTest.forceSurfaceUntil =
+					tick() + 8
 			else
 				state.drinkTest.retryAfter = 0
+				state.drinkTest.forceSurfaceUntil = 0
 			end
 		end)
 
 		return
+	end
+
+	if state.autoDrinkMode == "underground"
+		and isSavannahLife
+		and tick() < (state.drinkTest.forceSurfaceUntil or 0) then
+		runtimeMessage =
+			"Underground recovery: trying exposed surface water during cooldown"
 	end
 
 	-- If this mode is selected in another game, keep existing surface behavior
@@ -13659,7 +13655,12 @@ local function autoDrinkStep()
 
 	if not state.questSwimActive
 		and tick() < (state.drinkSearch.retryAfter or 0) then
-		drinkingToFull = false
+		-- Comfortable Water can honor the normal cooldown. At dangerous Water,
+		-- keep ownership latched so SurvivalBrain can clear/retry the source rather
+		-- than leaving the animal idle and allowing quests to steal control.
+		if water > 60 then
+			drinkingToFull = false
+		end
 		return
 	end
 
@@ -19831,6 +19832,273 @@ task.spawn(function()
 end)
 
 
+-- ============================================================
+-- SURVIVAL DECISION WATCHDOG
+-- Food/Water must never sit low while unrelated controllers trade messages.
+-- This watchdog measures ACTUAL attribute progress and physical movement. When
+-- neither is happening, it cancels stale ownership and restarts the need that
+-- is currently more urgent.
+-- ============================================================
+state.survivalBrain = state.survivalBrain or {
+	mode = nil,
+	modeSince = 0,
+	lastForceAt = 0,
+	lastUndergroundRetryOverrideAt = 0,
+}
+
+function state.survivalBrainTakeover(kind, reason)
+	local brain = state.survivalBrain
+	local now = tick()
+
+	if now - (brain.lastForceAt or 0) < 2.5 then
+		return false
+	end
+
+	local character, root, humanoid = characterParts()
+	if not character or not root or not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+
+	local food = tonumber(character:GetAttribute("Food")) or 100
+	local water = tonumber(character:GetAttribute("Water")) or 100
+
+	if kind == "water" and (not state.autoDrink or water > 75) then
+		return false
+	end
+	if kind == "food" and (not state.autoEat or food > 70) then
+		return false
+	end
+
+	-- A real underground transaction already has full ownership and its own
+	-- hard-exit watchdog. Never interrupt it from the general decision brain.
+	if state.drinkTest.active then
+		return false
+	end
+
+	-- Water gets final priority before the takeover timestamp is committed.
+	-- This avoids a recursive food->water handoff being blocked by our own cooldown.
+	if kind == "food" and state.autoDrink and water <= 60 then
+		kind = "water"
+	end
+
+	brain.lastForceAt = now
+	brain.mode = kind
+	brain.modeSince = brain.modeSince > 0 and brain.modeSince or now
+
+	questTravelWanted = false
+	state.questTravelActive = false
+	state.questLandInputActive = false
+	state.questMotionMoving = false
+	state.questMotionMode = nil
+	state.autoRunMoveOwnsInput = false
+	if state.questSetW then pcall(state.questSetW, false) end
+
+	-- Cancel any path that is not successfully servicing the current need.
+	if state.safeMove and state.safeMove.active then
+		state.safeMove.cancelToken += 1
+		state.safeMove.active = false
+		state.safeMove.reason = nil
+		state.busy = false
+	end
+
+	state.releaseMovementNow(character, true)
+
+	if kind == "water" then
+		eatingToFull = false
+		eatingSourcePosition = nil
+		eatingTargetReachedAt = nil
+		eatingStuckSince = nil
+		activeCarcass = nil
+		state.questCarnivoreFeeding = false
+		state.questBaboonFeeding = false
+		state.questGiraffeFeeding = false
+		BABOON.cancel()
+		GIRAFFE.cancel()
+
+		drinkingToFull = true
+		drinkingSourcePosition = nil
+		drinkingStuckSince = nil
+		lastDrinkWatchdogWater = water
+		state.drinkProgressReset()
+
+		-- If a previous failed source imposed a long cooldown while thirst keeps
+		-- falling, allow the brain to retry instead of standing still for 20s.
+		if water <= 60 then
+			state.drinkSearch.retryAfter = 0
+			if now - (brain.lastUndergroundRetryOverrideAt or 0) >= 12 then
+				brain.lastUndergroundRetryOverrideAt = now
+				state.drinkTest.retryAfter = 0
+				if water <= 45 then
+					state.drinkTest.forceSurfaceUntil = 0
+				end
+			end
+		end
+
+		runtimeMessage =
+			string.format(
+				"SURVIVAL RECOVERY: Water %d%%; taking control (%s)",
+				math.floor(water),
+				tostring(reason or "no progress")
+			)
+
+		task.defer(function()
+			task.wait(0.12)
+			pcall(autoDrinkStep)
+		end)
+	else
+		drinkingToFull = false
+		drinkingSourcePosition = nil
+		drinkingStuckSince = nil
+		state.drinkProgressReset()
+		blockClientSubState = false
+
+		eatingToFull = true
+		activeCarcass = nil
+		eatingStuckSince = nil
+		resetEatingSearch(food)
+
+		-- If a special food controller was alive but made no progress, reacquire a
+		-- fresh target rather than remaining locked on a bad tree/carcass/AntHill.
+		BABOON.cancel()
+		GIRAFFE.cancel()
+		-- Do not forge carcassEatBusy=false while its coroutine is still unwinding;
+		-- cancelling SafeMove is enough and prevents two carcass workers overlapping.
+
+		runtimeMessage =
+			string.format(
+				"SURVIVAL RECOVERY: Food %d%%; reacquiring food (%s)",
+				math.floor(food),
+				tostring(reason or "no progress")
+			)
+
+		task.defer(function()
+			task.wait(0.12)
+			pcall(autoEatStep)
+		end)
+	end
+
+	return true
+end
+
+
+task.spawn(function()
+	local lastCharacter
+	local lastFood
+	local lastWater
+	local lastPosition
+	local foodProgressAt = tick()
+	local waterProgressAt = tick()
+	local motionAt = tick()
+
+	while state.alive do
+		pcall(function()
+			local now = tick()
+			local character, root, humanoid = characterParts()
+
+			if not character or not root or not humanoid or humanoid.Health <= 0 then
+				return
+			end
+
+			local food = tonumber(character:GetAttribute("Food")) or 100
+			local water = tonumber(character:GetAttribute("Water")) or 100
+
+			if character ~= lastCharacter then
+				lastCharacter = character
+				lastFood = food
+				lastWater = water
+				lastPosition = root.Position
+				foodProgressAt = now
+				waterProgressAt = now
+				motionAt = now
+				state.survivalBrain.mode = nil
+				state.survivalBrain.modeSince = 0
+				return
+			end
+
+			if lastFood == nil or food > lastFood + 0.05 then
+				foodProgressAt = now
+			end
+			if lastWater == nil or water > lastWater + 0.05 then
+				waterProgressAt = now
+			end
+			lastFood = food
+			lastWater = water
+
+			if not lastPosition
+				or Vector3.new(
+					root.Position.X - lastPosition.X,
+					0,
+					root.Position.Z - lastPosition.Z
+				).Magnitude >= 1.5 then
+				motionAt = now
+				lastPosition = root.Position
+			end
+
+			local waterNeed = state.autoDrink and water <= 75
+			local foodNeed = state.autoEat and food <= 70
+
+			if not waterNeed and not foodNeed then
+				state.survivalBrain.mode = nil
+				state.survivalBrain.modeSince = 0
+				return
+			end
+
+			local wanted
+			if waterNeed and foodNeed then
+				-- Thirst is the more dangerous deadlock. Give it priority once it is
+				-- clearly lower, or whenever it crosses 60%.
+				wanted = (water <= 60 or water <= food - 4) and "water" or "food"
+			elseif waterNeed then
+				wanted = "water"
+			else
+				wanted = "food"
+			end
+
+			if state.survivalBrain.mode ~= wanted then
+				state.survivalBrain.mode = wanted
+				state.survivalBrain.modeSince = now
+			end
+
+			if state.drinkTest.active
+				or forcingPostDrinkMove
+				or DAMAGE.active
+				or state.questGrowthReset.exclusive then
+				return
+			end
+
+			local progressAt = wanted == "water" and waterProgressAt or foodProgressAt
+			local sameNeedOwner =
+				wanted == "water"
+					and (drinkingToFull or (state.safeMove.active and state.safeMove.reason == "water") or CROC.approachBusy)
+				or wanted == "food"
+					and (eatingToFull or carcassEatBusy or BABOON.busy or GIRAFFE.busy or (state.safeMove.active and state.safeMove.reason == "food"))
+
+			local noAttributeProgress = now - progressAt
+			local noMotion = now - motionAt
+			local modeAge = now - (state.survivalBrain.modeSince or now)
+
+			-- No owner at all: react quickly. An owner that is at least moving gets a
+			-- longer chance; an owner standing still with no attribute gain is stale.
+			if (not sameNeedOwner and modeAge >= 2.0)
+				or (noAttributeProgress >= 7 and noMotion >= 3.0)
+				or (noAttributeProgress >= 22 and noMotion >= 1.5) then
+
+				state.survivalBrainTakeover(
+					wanted,
+					string.format(
+						"progress %.1fs / motion %.1fs",
+						noAttributeProgress,
+						noMotion
+					)
+				)
+			end
+		end)
+
+		task.wait(0.40)
+	end
+end)
+
+
 function state.questGrowthResetCurrent(entry)
 	if tick() < (state.questGrowthReset.failedUntil or 0) then
 		return false
@@ -21097,8 +21365,20 @@ local function updateQuestAutomation()
 
 	-- Food/Water owns the character exclusively. Opportunistic remote eating/
 	-- drinking during an Auto Run circle does not set these ownership flags.
+	local earlyWater =
+		tonumber(
+			character:GetAttribute(
+				"Water"
+			)
+		) or 100
+
+	local directSurvivalNeed =
+		(state.autoDrink and earlyWater <= 75)
+		or (state.autoEat and earlyFood <= 70)
+
 	local survivalOwnsQuestControl =
-		drinkingToFull
+		directSurvivalNeed
+		or drinkingToFull
 		or eatingToFull
 		or carcassEatBusy
 		or CROC.approachBusy
@@ -21120,7 +21400,11 @@ local function updateQuestAutomation()
 		state.questSetW(false)
 
 		questStatusText =
-			drinkingToFull
+			(state.autoDrink and earlyWater <= 75)
+				and string.format("Paused: water priority (%d%%)", math.floor(earlyWater))
+			or (state.autoEat and earlyFood <= 70)
+				and string.format("Paused: food priority (%d%%)", math.floor(earlyFood))
+			or drinkingToFull
 				and "Paused: drinking"
 			or state.questCarnivoreFeeding
 				and "Paused: carnivore feeding"
