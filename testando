@@ -2536,55 +2536,50 @@ end
 function state.rawMovementAcceleration(character)
 	character = character or player.Character
 
-	local candidates = {}
-
-	local function add(value)
-		value = tonumber(value)
-		if value and value > 0 then
-			table.insert(candidates, value)
-		end
-	end
-
-	if character then
-		add(
+	-- The ACTIVE Character is authoritative. The old code took the minimum
+	-- between this value and any same-name Workspace model, which meant a stale
+	-- old model could permanently throttle an already-adult animal.
+	local liveAcceleration =
+		character
+		and tonumber(
 			character:GetAttribute(
 				"Acceleration"
 			)
 		)
+
+	if liveAcceleration
+		and liveAcceleration > 0 then
+
+		return state.adjustMovementAcceleration(
+			character,
+			liveAcceleration
+		)
 	end
 
+	-- Fallback only while the real Character attribute has not replicated yet.
 	local model =
 		workspace:FindFirstChild(
 			player.Name
 		)
 
-	if model and model ~= character then
-		add(
+	local fallbackAcceleration =
+		model
+		and tonumber(
 			model:GetAttribute(
 				"Acceleration"
 			)
 		)
+
+	if fallbackAcceleration
+		and fallbackAcceleration > 0 then
+
+		return state.adjustMovementAcceleration(
+			character or model,
+			fallbackAcceleration
+		)
 	end
 
-	if #candidates == 0 then
-		return nil
-	end
-
-	-- After a slot reset one replication source can briefly keep the adult
-	-- Acceleration. The lower live value is always the safer current ceiling.
-	local acceleration = candidates[1]
-	for index = 2, #candidates do
-		acceleration =
-			math.min(
-				acceleration,
-				candidates[index]
-			)
-	end
-
-	return state.adjustMovementAcceleration(
-		character,
-		acceleration
-	)
+	return nil
 end
 
 function state.dynamicMovementSpeed(character, mode)
@@ -2636,19 +2631,30 @@ function state.dynamicMovementSpeed(character, mode)
 				growth
 		end
 
-		-- Normal terrestrial animals already expose a LIVE Acceleration value.
-		-- Applying GrowthPercentage again here was a second speed penalty and
-		-- could leave a growing animal at barely half of its current safe ceiling.
-		-- Run just below the live limit so we gain the available speed without
-		-- intentionally crossing the value advertised by the game.
+		-- Normal terrestrial animals expose the current live Acceleration.
+		-- Adult animals were still feeling artificially slow because we treated
+		-- that value as an absolute speed ceiling and stopped below it.
+		--
+		-- Give ONLY mature normal terrestrial animals modest headroom. Croc and
+		-- flyers never enter this branch and keep their conservative land rule.
+		local matureGroundBoost =
+			growth >= 0.95
+				and 1.10
+				or 0.985
+
 		local target =
 			acceleration
 			* modeScale
-			* 0.98
+			* matureGroundBoost
+
+		local ceiling =
+			growth >= 0.95
+				and acceleration * 1.12
+				or acceleration * 0.99
 
 		return math.min(
 			target,
-			acceleration * 0.985
+			ceiling
 		),
 			acceleration,
 			growth
@@ -9639,6 +9645,13 @@ function state.moveToCarcassSearchSpawn(
 					purpose = "food",
 					tolerance = 18,
 					speedScale = 1,
+
+					-- Passive scavenging is transit, not precision interaction.
+					-- Keep full speed through the spawn waypoint instead of the
+					-- generic SafeMove 24-stud deceleration zone.
+					constantSpeed =
+						passiveSearch == true,
+
 					maxDuration = 360,
 					routeCheckInterval = 0.35,
 
