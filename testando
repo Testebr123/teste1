@@ -11704,7 +11704,7 @@ function state.aquaticTerrainBankCandidateClear(
 	root,
 	waterPart,
 	terrainHit,
-	clearance
+	rootOffset
 )
 	if not character
 		or not root
@@ -11716,9 +11716,10 @@ function state.aquaticTerrainBankCandidateClear(
 		return false
 	end
 
-	-- Landing-column proof: raycast the actual world downward. The FIRST
-	-- collidable thing must be Terrain. If Rock3Var3 is sitting above it,
-	-- the rock wins the ray and this candidate is rejected.
+	-- Validate ONLY the landing column. The first real collidable support at
+	-- this X/Z must be Terrain. Thus Rock3Var3 / MeshPart / Part sitting on top
+	-- of the Terrain is rejected, without rejecting a perfectly valid bank just
+	-- because some unrelated object exists along the underwater travel line.
 	local supportParams =
 		RaycastParams.new()
 
@@ -11742,8 +11743,8 @@ function state.aquaticTerrainBankCandidateClear(
 			+ Vector3.new(
 				0,
 				math.max(
-					10,
-					clearance + 7
+					14,
+					rootOffset + 8
 				),
 				0
 			)
@@ -11754,8 +11755,8 @@ function state.aquaticTerrainBankCandidateClear(
 			Vector3.new(
 				0,
 				-math.max(
-					18,
-					clearance + 12
+					24,
+					rootOffset + 16
 				),
 				0
 			),
@@ -11771,68 +11772,10 @@ function state.aquaticTerrainBankCandidateClear(
 		return false
 	end
 
-	if math.abs(
+	return math.abs(
 		support.Position.Y
 			- terrainHit.Position.Y
-	) > 1.25 then
-		return false
-	end
-
-	-- Route proof: ignore Terrain itself and check only physical objects between
-	-- us and the chosen Terrain bank. A rock/tree/mesh blocking the direct exit
-	-- makes us choose a different Terrain candidate instead of climbing it.
-	local obstacleParams =
-		RaycastParams.new()
-
-	obstacleParams.FilterType =
-		Enum.RaycastFilterType.Exclude
-
-	obstacleParams.FilterDescendantsInstances = {
-		character,
-		workspace.Terrain,
-		waterPart,
-	}
-
-	obstacleParams.IgnoreWater = true
-
-	pcall(function()
-		obstacleParams.RespectCanCollide =
-			true
-	end)
-
-	local target =
-		terrainHit.Position
-			+ Vector3.new(
-				0,
-				clearance,
-				0
-			)
-
-	local route =
-		target - root.Position
-
-	if route.Magnitude > 1 then
-		local obstacle =
-			workspace:Raycast(
-				root.Position
-					+ Vector3.new(
-						0,
-						math.min(
-							2.5,
-							clearance * 0.45
-						),
-						0
-					),
-				route,
-				obstacleParams
-			)
-
-		if obstacle then
-			return false
-		end
-	end
-
-	return true
+	) <= 1.5
 end
 
 function state.findNearbyMainWaterBankTarget(
@@ -11851,9 +11794,6 @@ function state.findNearbyMainWaterBankTarget(
 
 	local waterPart =
 		info.part
-
-	local waterTopY =
-		info.topY
 
 	local baseDirection
 
@@ -11960,26 +11900,26 @@ function state.findNearbyMainWaterBankTarget(
 		workspace.Terrain,
 	}
 
-	params.IgnoreWater = true
+	params.IgnoreWater = false
 
+	-- Use the animal's REAL root-to-body clearance. The previous 0.24x
+	-- value placed a Hippo HRP almost inside the Terrain and could make the
+	-- positional controller look completely stuck.
 	local clearance =
-		math.clamp(
-			state.movementRootClearance(
-				character
-			) * 0.24,
-			0.75,
-			1.8
+		state.aquaticWaterStandOffset(
+			character
 		)
 
 	-- One-time, progressive local scan. It stops on the FIRST radius that has
 	-- any usable bank, so nearby rises win over distant MainWaterPart edges.
 	for _, radius in ipairs({
-		12,
-		22,
-		36,
-		54,
-		78,
-		108,
+		10,
+		18,
+		28,
+		42,
+		62,
+		88,
+		118,
 	}) do
 
 		local best
@@ -12018,8 +11958,6 @@ function state.findNearbyMainWaterBankTarget(
 					~= Enum.Material.Water
 				and hit.Normal.Y
 					>= 0.10
-				and hit.Position.Y
-					>= waterTopY - 0.35
 				and state.aquaticTerrainBankCandidateClear(
 					character,
 					root,
@@ -12029,11 +11967,10 @@ function state.findNearbyMainWaterBankTarget(
 				) then
 
 				local heightPenalty =
-					math.max(
-						0,
+					math.abs(
 						hit.Position.Y
-							- waterTopY
-					) * 0.08
+							- root.Position.Y
+					) * 0.025
 
 				local directionPenalty =
 					(directionIndex - 1)
@@ -12061,6 +11998,63 @@ function state.findNearbyMainWaterBankTarget(
 
 		if best then
 			return best
+		end
+	end
+
+	-- Wider sparse fallback for large Hippo bodies / broad river sections.
+	-- This runs only if the near scan found nothing.
+	for _, radius in ipairs({
+		145,
+		180,
+	}) do
+
+		for _,
+			direction in ipairs(
+				directions
+			) do
+
+			local candidateXZ =
+				root.Position
+				+ direction
+					* radius
+
+			local hit =
+				workspace:Raycast(
+					Vector3.new(
+						candidateXZ.X,
+						root.Position.Y + 110,
+						candidateXZ.Z
+					),
+					Vector3.new(
+						0,
+						-240,
+						0
+					),
+					params
+				)
+
+			if hit
+				and hit.Instance
+					== workspace.Terrain
+				and hit.Material
+					~= Enum.Material.Water
+				and hit.Normal.Y
+					>= 0.10
+				and state.aquaticTerrainBankCandidateClear(
+					character,
+					root,
+					waterPart,
+					hit,
+					clearance
+				) then
+
+				return hit.Position
+					+ Vector3.new(
+						0,
+						clearance,
+						0
+					)
+			end
 		end
 	end
 
@@ -12326,8 +12320,8 @@ function state.aquaticRiverInfinityFlyExit(
 			CROC.isCharacter(
 				character
 			)
-				and "Croc water exit: no clear Terrain bank nearby; waiting"
-				or "Hippo water exit: no clear Terrain bank nearby; waiting"
+				and "Croc water exit: no exposed Terrain bank found yet; retrying"
+				or "Hippo water exit: no exposed Terrain bank found yet; retrying"
 
 		return false
 	end
