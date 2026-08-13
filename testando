@@ -489,7 +489,11 @@ for name in pairs(CARNIVORES) do CARNIVORE_NAMES_LOWER[name:lower()] = true end
 
 -- Hippo e Crocodile bebem em água funda sem chão embaixo (a barreira normal
 -- só trava X/Z, nunca a profundidade) — sem isso eles afundam pra sempre.
-local AQUATIC_ANIMALS = { hippo = true, crocodile = true }
+local AQUATIC_ANIMALS = {
+	hippo = true,
+	croc = true,
+	crocodile = true,
+}
 local CROC = { approachBusy = false, lastDrinkAnimalName = nil }
 
 local BABOON = {
@@ -590,8 +594,27 @@ function CROC.isCharacter(character)
 end
 
 local function isAquaticCharacter(character)
-	local animal = CROC.getAnimalName(character)
-	return type(animal) == "string" and AQUATIC_ANIMALS[animal:lower()] == true
+	local animal =
+		CROC.getAnimalName(
+			character
+		)
+
+	if type(animal) ~= "string" then
+		return false
+	end
+
+	local key =
+		animal:lower()
+
+	-- Savannah currently exposes Crocodile as "Croc" on the live workspace
+	-- character in some versions/slots. Treat every Croc naming variant as
+	-- aquatic instead of depending on one exact display name.
+	return AQUATIC_ANIMALS[key] == true
+		or key:find(
+			"croc",
+			1,
+			true
+		) ~= nil
 end
 
 function state.getCharacterMovementState(character)
@@ -12466,8 +12489,13 @@ function DAMAGE.moveToSafety()
 		waterPart.CanCollide = isAquaticCharacter(character)
 	end
 
-	if isAquaticCharacter(
-		character
+	if (
+		isAquaticCharacter(
+			character
+		)
+		or state.isCrocOrHippoMovementCharacter(
+			character
+		)
 	) and state.moveAquaticToDryTerrain then
 
 		local aquaticEscaped =
@@ -12488,6 +12516,19 @@ function DAMAGE.moveToSafety()
 			)
 
 			return true, nil
+		end
+
+		-- Croc/Hippo river bottom is solid Terrain. Generic watchdog recovery
+		-- would therefore produce a false "safe/above Terrain" result.
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+			runtimeMessage =
+				CROC.isCharacter(character)
+					and "Croc aquatic escape still active; generic watchdog blocked"
+					or "Hippo aquatic escape still active; generic watchdog blocked"
+
+			return false, nil
 		end
 	end
 
@@ -13090,9 +13131,56 @@ local function forcePostDrinkMove(wasUnderground)
 		end
 	else
 		local aquaticCharacter, aquaticRoot = characterParts()
-		if aquaticCharacter and aquaticRoot and isAquaticCharacter(aquaticCharacter) then
-			runtimeMessage = "Aquatic exit: finding verified dry Terrain"
-			escaped = state.moveAquaticToDryTerrain(aquaticCharacter, aquaticRoot)
+		local crocHippo =
+			aquaticCharacter
+			and state.isCrocOrHippoMovementCharacter(
+				aquaticCharacter
+			)
+
+		if aquaticCharacter
+			and aquaticRoot
+			and (
+				isAquaticCharacter(
+					aquaticCharacter
+				)
+				or crocHippo
+			) then
+
+			runtimeMessage =
+				crocHippo
+					and (
+						CROC.isCharacter(
+							aquaticCharacter
+						)
+							and "Croc water exit: aquatic Fly owns recovery"
+							or "Hippo water exit: aquatic Fly owns recovery"
+					)
+					or "Aquatic exit: finding verified dry Terrain"
+
+			escaped =
+				state.moveAquaticToDryTerrain(
+					aquaticCharacter,
+					aquaticRoot
+				)
+		end
+
+		-- Croc/Hippo NEVER use generic dry-bank/spawn recovery. If Fly did not
+		-- finish yet, keep the transaction pending and let the aquatic cooldown
+		-- retry it instead of mistaking the solid river bottom for dry land.
+		if crocHippo and not escaped then
+			resetEatingSearch(nil)
+			drinkingSourcePosition = nil
+			forcingPostDrinkMove = false
+			criticalRecoveryActive = false
+
+			runtimeMessage =
+				CROC.isCharacter(
+					aquaticCharacter
+				)
+					and "Croc aquatic Fly pending; generic Terrain exit blocked"
+					or "Hippo aquatic Fly pending; generic Terrain exit blocked"
+
+			return
 		end
 
 		if not escaped then refreshCompletionSpawns() end
@@ -13647,8 +13735,13 @@ function state.drinkEmergencyEscape(character, root, reason)
 
 	runtimeMessage = reason or "ANTI-AFOGAMENTO: escapando para cima do Terrain"
 
-	if isAquaticCharacter(
-		character
+	if (
+		isAquaticCharacter(
+			character
+		)
+		or state.isCrocOrHippoMovementCharacter(
+			character
+		)
 	) and state.moveAquaticToDryTerrain then
 
 		local aquaticEscaped =
@@ -25983,6 +26076,184 @@ window.Parent = gui
 corner(window, 12)
 stroke(window, COLOR_ACCENT, 1).Transparency = 0.35
 
+-- ============================================================
+-- Adaptive HUD scale for SMALL screens only
+-- Medium/large screens keep the exact existing 1.0 size.
+-- ============================================================
+local HUD_BASE_SIZE = Vector2.new(380, 500)
+local HUD_NORMAL_MIN_WIDTH = 900
+local HUD_NORMAL_MIN_HEIGHT = 540
+local HUD_MIN_SCALE = 0.62
+
+local hudScale = Instance.new("UIScale")
+hudScale.Name = "AdaptiveSmallScreenScale"
+hudScale.Scale = 1
+hudScale.Parent = window
+
+local function calculateHudScale(viewport)
+	if typeof(viewport) ~= "Vector2"
+		or viewport.X <= 0
+		or viewport.Y <= 0 then
+		return 1
+	end
+
+	-- Do not touch medium/large displays.
+	if viewport.X >= HUD_NORMAL_MIN_WIDTH
+		and viewport.Y >= HUD_NORMAL_MIN_HEIGHT then
+		return 1
+	end
+
+	-- Leave room for Roblox's top controls and a small bottom/right margin.
+	-- The base HUD itself remains 380x500; UIScale shrinks it uniformly.
+	local availableWidth =
+		math.max(
+			240,
+			viewport.X - 24
+		)
+
+	local availableHeight =
+		math.max(
+			260,
+			viewport.Y - 58
+		)
+
+	local fit =
+		math.min(
+			availableWidth / HUD_BASE_SIZE.X,
+			availableHeight / HUD_BASE_SIZE.Y,
+			1
+		)
+
+	-- Keep text/buttons usable even on extremely small screens.
+	return math.clamp(
+		math.floor(fit * 100 + 0.5) / 100,
+		HUD_MIN_SCALE,
+		1
+	)
+end
+
+local function clampWindowToViewport(viewport, scale)
+	if typeof(viewport) ~= "Vector2" then
+		return
+	end
+
+	scale =
+		tonumber(scale)
+		or 1
+
+	local logicalWidth =
+		window.Size.X.Offset
+
+	local logicalHeight =
+		window.Size.Y.Offset
+
+	local renderedWidth =
+		logicalWidth * scale
+
+	local renderedHeight =
+		logicalHeight * scale
+
+	local currentX =
+		window.Position.X.Offset
+
+	local currentY =
+		window.Position.Y.Offset
+
+	local maxX =
+		math.max(
+			0,
+			viewport.X - renderedWidth
+		)
+
+	local maxY =
+		math.max(
+			0,
+			viewport.Y - renderedHeight
+		)
+
+	window.Position =
+		UDim2.fromOffset(
+			math.clamp(
+				currentX,
+				0,
+				maxX
+			),
+			math.clamp(
+				currentY,
+				0,
+				maxY
+			)
+		)
+end
+
+local function applyAdaptiveHudScale()
+	local camera =
+		workspace.CurrentCamera
+
+	if not camera then
+		hudScale.Scale = 1
+		return
+	end
+
+	local viewport =
+		camera.ViewportSize
+
+	local scale =
+		calculateHudScale(
+			viewport
+		)
+
+	hudScale.Scale =
+		scale
+
+	clampWindowToViewport(
+		viewport,
+		scale
+	)
+end
+
+local hudViewportConnection
+
+local function bindHudViewportCamera()
+	if hudViewportConnection then
+		pcall(
+			hudViewportConnection.Disconnect,
+			hudViewportConnection
+		)
+		hudViewportConnection = nil
+	end
+
+	local camera =
+		workspace.CurrentCamera
+
+	if camera then
+		hudViewportConnection =
+			camera:GetPropertyChangedSignal(
+				"ViewportSize"
+			):Connect(function()
+				applyAdaptiveHudScale()
+			end)
+
+		table.insert(
+			connections,
+			hudViewportConnection
+		)
+	end
+
+	applyAdaptiveHudScale()
+end
+
+bindHudViewportCamera()
+
+table.insert(
+	connections,
+	workspace:GetPropertyChangedSignal(
+		"CurrentCamera"
+	):Connect(function()
+		bindHudViewportCamera()
+	end)
+)
+
 local windowGradient = Instance.new("UIGradient")
 windowGradient.Rotation = 90
 windowGradient.Color = ColorSequence.new({
@@ -26411,8 +26682,11 @@ do
 			local camera = workspace.CurrentCamera
 			if camera then
 				local vp = camera.ViewportSize
-				newX = math.clamp(newX, 0, math.max(0, vp.X - window.AbsoluteSize.X))
-				newY = math.clamp(newY, 0, math.max(0, vp.Y - window.AbsoluteSize.Y))
+				local activeScale = hudScale.Scale
+				local renderedW = window.Size.X.Offset * activeScale
+				local renderedH = window.Size.Y.Offset * activeScale
+				newX = math.clamp(newX, 0, math.max(0, vp.X - renderedW))
+				newY = math.clamp(newY, 0, math.max(0, vp.Y - renderedH))
 			end
 			window.Position = UDim2.fromOffset(newX, newY)
 		end
@@ -26599,9 +26873,28 @@ do
 	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
 		if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 			local delta = input.Position - resizeStart
-			local newW = math.clamp(startSize.X.Offset + delta.X, WINDOW_MIN.X, WINDOW_MAX.X)
-			local newH = math.clamp(startSize.Y.Offset + delta.Y, WINDOW_MIN.Y, WINDOW_MAX.Y)
+			local activeScale =
+				math.max(
+					0.01,
+					hudScale.Scale
+				)
+
+			-- Input delta is in physical pixels; window dimensions are logical
+			-- pixels before UIScale, so compensate for the current HUD scale.
+			local logicalDelta =
+				delta / activeScale
+
+			local newW = math.clamp(startSize.X.Offset + logicalDelta.X, WINDOW_MIN.X, WINDOW_MAX.X)
+			local newH = math.clamp(startSize.Y.Offset + logicalDelta.Y, WINDOW_MIN.Y, WINDOW_MAX.Y)
 			window.Size = UDim2.fromOffset(newW, newH)
+
+			local camera = workspace.CurrentCamera
+			if camera then
+				clampWindowToViewport(
+					camera.ViewportSize,
+					activeScale
+				)
+			end
 		end
 	end))
 end
