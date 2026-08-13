@@ -1869,11 +1869,35 @@ function state.heavyObstacleProbe(
 	end
 
 	local right = Vector3.new(-forward.Z,0,forward.X)
-	local halfWidth = math.clamp(state.movementFootprint(character)*0.42,2.6,8.5)
-	local verticalSpread = math.clamp(state.movementBodySize(character).Y*0.20,1.4,4.5)
-	local baseOrigin = root.Position + Vector3.new(0,math.clamp(state.movementProbeHeight(character)*0.55,1.5,4.5),0)
+	local halfWidth =
+		math.clamp(
+			state.movementFootprint(character) * 0.62 + 0.75,
+			3.2,
+			12.5
+		)
+
+	local verticalSpread =
+		math.clamp(
+			state.movementBodySize(character).Y * 0.28,
+			1.8,
+			5.5
+		)
+
+	local baseOrigin =
+		root.Position
+			+ Vector3.new(
+				0,
+				math.clamp(
+					state.movementProbeHeight(character) * 0.60,
+					1.8,
+					5.2
+				),
+				0
+			)
+
 	local nearest
-	-- 3 body-width lanes x 3 vertical layers = 9 rays.
+
+	-- Still 3 x 3 = 9 rays: wider animal envelope, no per-frame ray explosion.
 	for _, lateral in ipairs({-halfWidth,0,halfWidth}) do
 		for _, vertical in ipairs({-verticalSpread,0,verticalSpread}) do
 			local hit = castBlocking(baseOrigin+right*lateral+Vector3.new(0,vertical,0),forward*probeDistance)
@@ -1882,9 +1906,9 @@ function state.heavyObstacleProbe(
 	end
 	if not nearest then state.safeMove.heavyObstacleSign=nil; return nil end
 	local function corridorClearance(sign)
-		local a=math.rad(68*sign); local c,s=math.cos(a),math.sin(a)
+		local a=math.rad(78*sign); local c,s=math.cos(a),math.sin(a)
 		local side=Vector3.new(forward.X*c-forward.Z*s,0,forward.X*s+forward.Z*c).Unit
-		local length=probeDistance*1.35; local nearestSide=length
+		local length=probeDistance*1.55; local nearestSide=length
 		for _, lateral in ipairs({-halfWidth*0.72,0,halfWidth*0.72}) do
 			local hit=castBlocking(baseOrigin+right*lateral,side*length)
 			if hit then nearestSide=math.min(nearestSide,hit.Distance) end
@@ -3410,6 +3434,9 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 	local lastBlockingInstance = nil
 	local blockingSince = 0
 
+	local lastHardStuckEscapeAt = 0
+	local hardStuckEscapeCount = 0
+
 	-- High-hill avoidance state. Lock one side briefly so the animal does not
 	-- oscillate left/right while skirting a mountain.
 	local hillAvoidUntil = 0
@@ -4269,6 +4296,532 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			or 1
 	end
 
+	local function rotateStuckHeading(
+		forward,
+		degrees
+	)
+		local angle =
+			math.rad(
+				degrees
+			)
+
+		local c =
+			math.cos(
+				angle
+			)
+
+		local s =
+			math.sin(
+				angle
+			)
+
+		return Vector3.new(
+			forward.X * c
+				- forward.Z * s,
+			0,
+			forward.X * s
+				+ forward.Z * c
+		).Unit
+	end
+
+	local function stuckCorridorScore(
+		origin,
+		direction,
+		distance
+	)
+		if typeof(origin) ~= "Vector3"
+			or typeof(direction) ~= "Vector3"
+			or direction.Magnitude <= 0.05 then
+
+			return -math.huge
+		end
+
+		direction =
+			Vector3.new(
+				direction.X,
+				0,
+				direction.Z
+			)
+
+		if direction.Magnitude <= 0.05 then
+			return -math.huge
+		end
+
+		direction =
+			direction.Unit
+
+		local right =
+			Vector3.new(
+				-direction.Z,
+				0,
+				direction.X
+			)
+
+		local halfWidth =
+			math.clamp(
+				state.movementFootprint(
+					character
+				) * 0.62,
+				3,
+				12
+			)
+
+		local params =
+			RaycastParams.new()
+
+		params.FilterType =
+			Enum.RaycastFilterType.Exclude
+
+		params.FilterDescendantsInstances = {
+			character,
+			workspace.Terrain,
+		}
+
+		params.IgnoreWater =
+			true
+
+		pcall(function()
+			params.RespectCanCollide =
+				true
+		end)
+
+		local nearest =
+			distance
+
+		local blocked =
+			0
+
+		local probeHeight =
+			math.clamp(
+				state.movementProbeHeight(
+					character
+				),
+				2.2,
+				6
+			)
+
+		-- This richer scan runs ONLY after a confirmed stall, not every frame.
+		for _, lateral in ipairs({
+			-halfWidth,
+			0,
+			halfWidth,
+		}) do
+			for _, heightScale in ipairs({
+				0.55,
+				1.25,
+			}) do
+				local hit =
+					workspace:Raycast(
+						origin
+							+ right * lateral
+							+ Vector3.new(
+								0,
+								probeHeight
+									* heightScale,
+								0
+							),
+						direction
+							* distance,
+						params
+					)
+
+				if hit then
+					blocked += 1
+
+					nearest =
+						math.min(
+							nearest,
+							hit.Distance
+						)
+				end
+			end
+		end
+
+		local endpoint =
+			origin
+				+ direction
+					* distance
+
+		if purpose ~= "water" then
+			local waterAtEnd =
+				exposedTerrainWaterAt(
+					endpoint
+				)
+
+			if waterAtEnd then
+				return -10000
+			end
+		end
+
+		local currentGround =
+			terrainHeightAt(
+				origin,
+				origin.Y
+			)
+
+		local endGround =
+			terrainHeightAt(
+				endpoint,
+				origin.Y
+			)
+
+		if not endGround then
+			return -5000
+		end
+
+		local terrainPenalty =
+			0
+
+		if currentGround then
+			local deltaY =
+				endGround
+					- currentGround
+
+			if deltaY > 18 then
+				terrainPenalty +=
+					(deltaY - 18)
+						* 5
+			elseif deltaY < -32 then
+				terrainPenalty +=
+					math.abs(
+						deltaY + 32
+					) * 4
+			end
+		end
+
+		return nearest
+			- blocked * 9
+			- terrainPenalty
+	end
+
+	local function moveStuckSegment(
+		goal,
+		maximumSpeed,
+		moveToMotor,
+		timeout
+	)
+		if typeof(goal) ~= "Vector3" then
+			return false
+		end
+
+		local startPosition =
+			root.Position
+
+		local deadline =
+			tick()
+				+ (
+					tonumber(timeout)
+						or 2
+				)
+
+		local escapeSpeed =
+			math.clamp(
+				maximumSpeed * 0.72,
+				10,
+				math.max(
+					10,
+					maximumSpeed
+				)
+			)
+
+		while state.alive
+			and character.Parent
+			and root.Parent
+			and humanoid.Parent
+			and humanoid.Health > 0
+			and token
+				== state.safeMove.cancelToken
+			and tick() < deadline do
+
+			if state.questGrowthReset.exclusive
+				or criticalRecoveryActive
+				or DAMAGE.active then
+
+				return false
+			end
+
+			local delta =
+				Vector3.new(
+					goal.X
+						- root.Position.X,
+					0,
+					goal.Z
+						- root.Position.Z
+				)
+
+			local remaining =
+				delta.Magnitude
+
+			if remaining
+				<= math.max(
+					3.5,
+					state.movementFootprint(
+						character
+					) * 0.38
+				) then
+
+				return true
+			end
+
+			local direction =
+				delta.Unit
+
+			if moveToMotor then
+				state.heavyWalkStep(
+					character,
+					root,
+					humanoid,
+					direction,
+					escapeSpeed,
+					remaining,
+					goal,
+					"safeMove",
+					token
+				)
+			else
+				pcall(
+					humanoid.Move,
+					humanoid,
+					direction,
+					false
+				)
+
+				local velocity =
+					root.AssemblyLinearVelocity
+
+				root.AssemblyLinearVelocity =
+					Vector3.new(
+						direction.X
+							* escapeSpeed,
+						velocity.Y,
+						direction.Z
+							* escapeSpeed
+					)
+			end
+
+			setSubState(
+				"Running"
+			)
+
+			RunService.Heartbeat:Wait()
+		end
+
+		local moved =
+			Vector3.new(
+				root.Position.X
+					- startPosition.X,
+				0,
+				root.Position.Z
+					- startPosition.Z
+			).Magnitude
+
+		return moved >= 4.5
+	end
+
+	local function runHardStuckEscape(
+		forward,
+		maximumSpeed,
+		moveToMotor
+	)
+		if typeof(forward) ~= "Vector3"
+			or forward.Magnitude <= 0.05 then
+
+			return false
+		end
+
+		forward =
+			Vector3.new(
+				forward.X,
+				0,
+				forward.Z
+			)
+
+		if forward.Magnitude <= 0.05 then
+			return false
+		end
+
+		forward =
+			forward.Unit
+
+		state.heavyWalkStop(
+			character
+		)
+
+		if state.questSetW then
+			pcall(
+				state.questSetW,
+				false
+			)
+		end
+
+		local footprint =
+			state.movementFootprint(
+				character
+			)
+
+		local backDistance =
+			math.clamp(
+				footprint * 1.55
+					+ 6,
+				12,
+				28
+			)
+
+		local sideDistance =
+			math.clamp(
+				footprint * 3.10
+					+ 18,
+				32,
+				64
+			)
+
+		-- STEP 1: MOVE BACK. If straight reverse is blocked, pick a rear diagonal.
+		local rearDirection
+		local rearScore =
+			-math.huge
+
+		for _, degrees in ipairs({
+			180,
+			145,
+			-145,
+		}) do
+			local candidate =
+				rotateStuckHeading(
+					forward,
+					degrees
+				)
+
+			local score =
+				stuckCorridorScore(
+					root.Position,
+					candidate,
+					backDistance
+				)
+
+			if score > rearScore then
+				rearScore =
+					score
+
+				rearDirection =
+					candidate
+			end
+		end
+
+		if not rearDirection
+			or rearScore < -1000 then
+
+			return false
+		end
+
+		runtimeMessage =
+			"Stuck watchdog: backing out of object trap"
+
+		local backed =
+			moveStuckSegment(
+				root.Position
+					+ rearDirection
+						* backDistance,
+				maximumSpeed,
+				moveToMotor,
+				2.2
+			)
+
+		if not backed then
+			return false
+		end
+
+		-- STEP 2: choose a MUCH wider side route around the object/cave.
+		local sideDirection
+		local sideScore =
+			-math.huge
+
+		local sideSign =
+			obstacleSign
+
+		for _, item in ipairs({
+			{ -88, -1 },
+			{ 88, 1 },
+			{ -112, -1 },
+			{ 112, 1 },
+		}) do
+			local candidate =
+				rotateStuckHeading(
+					forward,
+					item[1]
+				)
+
+			local score =
+				stuckCorridorScore(
+					root.Position,
+					candidate,
+					sideDistance
+				)
+
+			if score > sideScore then
+				sideScore =
+					score
+
+				sideDirection =
+					candidate
+
+				sideSign =
+					item[2]
+			end
+		end
+
+		if sideDirection
+			and sideScore > -1000 then
+
+			obstacleSign =
+				sideSign
+
+			runtimeMessage =
+				sideSign < 0
+					and "Stuck watchdog: wide LEFT detour"
+					or "Stuck watchdog: wide RIGHT detour"
+
+			moveStuckSegment(
+				root.Position
+					+ sideDirection
+						* sideDistance,
+				maximumSpeed,
+				moveToMotor,
+				3.4
+			)
+		end
+
+		-- STEP 3: once offset, move forward again to actually clear the object.
+		local rejoinDistance =
+			math.clamp(
+				sideDistance * 0.55,
+				18,
+				36
+			)
+
+		local rejoinScore =
+			stuckCorridorScore(
+				root.Position,
+				forward,
+				rejoinDistance
+			)
+
+		if rejoinScore > 5 then
+			runtimeMessage =
+				"Stuck watchdog: rejoining original route"
+
+			moveStuckSegment(
+				root.Position
+					+ forward
+						* rejoinDistance,
+				maximumSpeed,
+				moveToMotor,
+				2.4
+			)
+		end
+
+		return true
+	end
+
 	local function cleanup()
 		state.heavyWalkStop(character)
 		local _, liveRoot, liveHumanoid = characterParts()
@@ -4878,8 +5431,71 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					stallCount += 1
 					obstacleSign *= -1
 
-					-- MoveTo-driven routes (Zone/Pride/manual/heavy) recover by
-					-- re-routing, never by repeatedly virtualizing Space.
+					local persistentObjectTrap =
+						lastBlockingInstance ~= nil
+						and blockingSince > 0
+						and tick()
+							- blockingSince
+							>= 1.0
+
+					local shouldHardEscape =
+						not verticalMovement
+						and not calmRiverApproach
+						and (
+							stallCount >= 2
+								or persistentObjectTrap
+						)
+						and tick()
+							- lastHardStuckEscapeAt
+							>= 3.8
+
+					if shouldHardEscape then
+						lastHardStuckEscapeAt =
+							tick()
+
+						hardStuckEscapeCount += 1
+
+						local escapeForward =
+							flatDistance > 0.1
+								and flatDelta.Unit
+								or Vector3.new(
+									root.CFrame.LookVector.X,
+									0,
+									root.CFrame.LookVector.Z
+								).Unit
+
+						local escaped =
+							runHardStuckEscape(
+								escapeForward,
+								maximumSpeed,
+								moveToDrivenLand
+							)
+
+						if escaped then
+							stallCount =
+								0
+
+							lastDistance =
+								math.huge
+
+							lastProgressAt =
+								tick()
+
+							lastBlockingInstance =
+								nil
+
+							blockingSince =
+								0
+
+							runtimeMessage =
+								"Stuck watchdog: object trap escaped; route resumed"
+
+							RunService.Heartbeat:Wait()
+							continue
+						end
+					end
+
+					-- Jump is only a light fallback for small non-MoveTo rigs.
 					if not moveToDrivenLand
 						and not state.safeMove.heavy
 						and tick() - lastJumpAt >= 1.6 then
@@ -4887,9 +5503,12 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 						state.virtualJump(character, humanoid, "safe_move_stall", 1.5)
 					end
 
-					if stallCount >= stallBudget then
+					if stallCount >= stallBudget
+						or hardStuckEscapeCount >= 3 then
+
 						runtimeMessage =
-							"Movement blocked; route will retry later"
+							"Movement blocked after wide escape attempts; route will retry later"
+
 						return false
 					end
 				end
@@ -5276,7 +5895,11 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				params.IgnoreWater = true
 
 				local probeDistance =
-					math.clamp(maximumSpeed * 0.20, 7, 22)
+					math.clamp(
+						maximumSpeed * 0.28,
+						9,
+						28
+					)
 
 				local volumeObjectProbe =
 					moveToDrivenLand
@@ -5290,12 +5913,12 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 							math.max(
 								probeDistance,
 								math.clamp(
-									maximumSpeed * 0.42
+									maximumSpeed * 0.62
 										+ state.movementFootprint(
 											character
-										) * 0.85,
-									16,
-									46
+										) * 1.20,
+									22,
+									72
 								)
 							)
 						)
@@ -35722,11 +36345,28 @@ task.spawn(function()
 			end
 		end
 
-		-- Object avoidance uses a fixed world-space bypass point.
-		if autoAvoidReason == "object" and autoAvoidTarget and tick() < autoAvoidUntil then
-			local toBypass=Vector3.new(autoAvoidTarget.X-root.Position.X,0,autoAvoidTarget.Z-root.Position.Z)
-			if toBypass.Magnitude>5 then return toBypass.Unit end
-			autoAvoidTarget,autoAvoidReason,autoAvoidUntil=nil,nil,0
+		-- Object/stuck avoidance uses a fixed world-space bypass point.
+		if (
+			autoAvoidReason == "object"
+				or autoAvoidReason == "stuck"
+			)
+			and autoAvoidTarget
+			and tick() < autoAvoidUntil then
+
+			local toBypass =
+				Vector3.new(
+					autoAvoidTarget.X - root.Position.X,
+					0,
+					autoAvoidTarget.Z - root.Position.Z
+				)
+
+			if toBypass.Magnitude > 5 then
+				return toBypass.Unit
+			end
+
+			autoAvoidTarget = nil
+			autoAvoidReason = nil
+			autoAvoidUntil = 0
 		end
 		if tick() < autoAvoidUntil then
 			local degrees=autoAvoidReason=="stuck" and 68 or (autoAvoidReason=="hill_recenter" and 88 or 55)
@@ -35806,17 +36446,17 @@ task.spawn(function()
 		local probeDistance =
 			heavyMover
 				and math.clamp(
-					(speed or 30) * 0.42
+					(speed or 30) * 0.62
 						+ state.movementFootprint(
 							character
-						) * 0.85,
-					16,
-					46
+						) * 1.20,
+					22,
+					72
 				)
 				or math.clamp(
-					(speed or 30) * 0.24,
-					8,
-					20
+					(speed or 30) * 0.32,
+					10,
+					28
 				)
 
 		local obstacle =
@@ -35910,18 +36550,18 @@ task.spawn(function()
 					and math.clamp(
 						state.movementFootprint(
 							character
-						) * 1.35,
-						12,
-						26
+						) * 1.75,
+						15,
+						36
 					)
-					or 10
+					or 12
 
 			local forwardClearance =
 				math.clamp(
 					objectDistance
-						+ bodyClearance * 0.70,
-					10,
-					probeDistance + 18
+						+ bodyClearance * 0.90,
+					14,
+					probeDistance + 28
 				)
 
 			autoAvoidTarget =
@@ -36360,12 +37000,45 @@ task.spawn(function()
 								autoAvoidReason =
 									"stuck"
 
-								autoAvoidUntil =
-									tick() + 1.45
+								local footprint =
+									state.movementFootprint(
+										character
+									)
 
-								-- A stuck circle is a routing failure, not a jumping problem.
-								-- Flip the bypass side and ask the open-area planner for a
-								-- fresh circle if the obstruction persists.
+								local backDistance =
+									math.clamp(
+										footprint * 1.45 + 7,
+										13,
+										28
+									)
+
+								local sideDistance =
+									math.clamp(
+										footprint * 2.80 + 18,
+										30,
+										58
+									)
+
+								local side =
+									Vector3.new(
+										-direction.Z,
+										0,
+										direction.X
+									) * autoAvoidSign
+
+								-- Back away and take a wide diagonal around the trap,
+								-- instead of another small steering angle.
+								autoAvoidTarget =
+									root.Position
+										- direction * backDistance
+										+ side * sideDistance
+
+								autoAvoidUntil =
+									tick() + 4.0
+
+								runtimeMessage =
+									"Auto Run stuck watchdog: backing out + wide detour"
+
 								if autoArea then
 									autoArea.replanRequested = true
 									autoArea.replanAfter = tick() + 0.35
@@ -36387,7 +37060,10 @@ task.spawn(function()
 
 					local exactRunTarget
 
-					if autoAvoidReason == "object"
+					if (
+						autoAvoidReason == "object"
+							or autoAvoidReason == "stuck"
+						)
 						and autoAvoidTarget
 						and tick() < autoAvoidUntil then
 
