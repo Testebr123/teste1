@@ -2536,50 +2536,55 @@ end
 function state.rawMovementAcceleration(character)
 	character = character or player.Character
 
-	-- The ACTIVE Character is authoritative. The old code took the minimum
-	-- between this value and any same-name Workspace model, which meant a stale
-	-- old model could permanently throttle an already-adult animal.
-	local liveAcceleration =
-		character
-		and tonumber(
+	local candidates = {}
+
+	local function add(value)
+		value = tonumber(value)
+		if value and value > 0 then
+			table.insert(candidates, value)
+		end
+	end
+
+	if character then
+		add(
 			character:GetAttribute(
 				"Acceleration"
 			)
 		)
-
-	if liveAcceleration
-		and liveAcceleration > 0 then
-
-		return state.adjustMovementAcceleration(
-			character,
-			liveAcceleration
-		)
 	end
 
-	-- Fallback only while the real Character attribute has not replicated yet.
 	local model =
 		workspace:FindFirstChild(
 			player.Name
 		)
 
-	local fallbackAcceleration =
-		model
-		and tonumber(
+	if model and model ~= character then
+		add(
 			model:GetAttribute(
 				"Acceleration"
 			)
 		)
-
-	if fallbackAcceleration
-		and fallbackAcceleration > 0 then
-
-		return state.adjustMovementAcceleration(
-			character or model,
-			fallbackAcceleration
-		)
 	end
 
-	return nil
+	if #candidates == 0 then
+		return nil
+	end
+
+	-- After a slot reset one replication source can briefly keep the adult
+	-- Acceleration. The lower live value is always the safer current ceiling.
+	local acceleration = candidates[1]
+	for index = 2, #candidates do
+		acceleration =
+			math.min(
+				acceleration,
+				candidates[index]
+			)
+	end
+
+	return state.adjustMovementAcceleration(
+		character,
+		acceleration
+	)
 end
 
 function state.dynamicMovementSpeed(character, mode)
@@ -2631,30 +2636,19 @@ function state.dynamicMovementSpeed(character, mode)
 				growth
 		end
 
-		-- Normal terrestrial animals expose the current live Acceleration.
-		-- Adult animals were still feeling artificially slow because we treated
-		-- that value as an absolute speed ceiling and stopped below it.
-		--
-		-- Give ONLY mature normal terrestrial animals modest headroom. Croc and
-		-- flyers never enter this branch and keep their conservative land rule.
-		local matureGroundBoost =
-			growth >= 0.95
-				and 1.10
-				or 0.985
-
+		-- Normal terrestrial animals already expose a LIVE Acceleration value.
+		-- Applying GrowthPercentage again here was a second speed penalty and
+		-- could leave a growing animal at barely half of its current safe ceiling.
+		-- Run just below the live limit so we gain the available speed without
+		-- intentionally crossing the value advertised by the game.
 		local target =
 			acceleration
 			* modeScale
-			* matureGroundBoost
-
-		local ceiling =
-			growth >= 0.95
-				and acceleration * 1.12
-				or acceleration * 0.99
+			* 0.98
 
 		return math.min(
 			target,
-			ceiling
+			acceleration * 0.985
 		),
 			acceleration,
 			growth
@@ -9645,13 +9639,6 @@ function state.moveToCarcassSearchSpawn(
 					purpose = "food",
 					tolerance = 18,
 					speedScale = 1,
-
-					-- Passive scavenging is transit, not precision interaction.
-					-- Keep full speed through the spawn waypoint instead of the
-					-- generic SafeMove 24-stud deceleration zone.
-					constantSpeed =
-						passiveSearch == true,
-
 					maxDuration = 360,
 					routeCheckInterval = 0.35,
 
@@ -31709,8 +31696,8 @@ START_NOTICE.overlay.ZIndex = 70
 START_NOTICE.overlay.Parent = window
 
 START_NOTICE.panel = Instance.new("Frame")
-START_NOTICE.panel.Size = UDim2.new(1, -24, 0, 292)
-START_NOTICE.panel.Position = UDim2.new(0, 12, 0.5, -146)
+START_NOTICE.panel.Size = UDim2.new(1, -24, 0, 408)
+START_NOTICE.panel.Position = UDim2.new(0, 12, 0.5, -204)
 START_NOTICE.panel.BackgroundColor3 = COLOR_HEADER
 START_NOTICE.panel.BorderSizePixel = 0
 START_NOTICE.panel.ZIndex = 71
@@ -31762,17 +31749,20 @@ START_NOTICE.divider.ZIndex = 72
 START_NOTICE.divider.Parent = START_NOTICE.panel
 
 START_NOTICE.body = Instance.new("TextLabel")
-START_NOTICE.body.Size = UDim2.new(1, -40, 0, 132)
+START_NOTICE.body.Size = UDim2.new(1, -40, 0, 244)
 START_NOTICE.body.Position = UDim2.fromOffset(20, 82)
 START_NOTICE.body.BackgroundTransparency = 1
 START_NOTICE.body.Font = FONT_BUTTON
-START_NOTICE.body.Text = "This script has received many changes, so bugs may happen. Please report any problems to me on Discord.\n\nAquatic animal farming is currently broken."
+START_NOTICE.body.Text = "I've made several fixes and added new features. I hope everything works normally now. If something goes wrong and one of your slots dies, the script will automatically spawn that same slot again, grow it, and continue the tasks that were running before.\n\nYou can check whether any of your slots have died by opening the skull icon ☠️. Aquatic animals are now working with 100% compatibility again.\n\nIf you find any bug or have any suggestion, contact me on Discord: martusmmb"
 START_NOTICE.body.TextColor3 = COLOR_TEXT
-START_NOTICE.body.TextSize = 15
+START_NOTICE.body.TextSize =
+	UserInputService.TouchEnabled
+		and 14
+		or 15
 START_NOTICE.body.TextWrapped = true
 START_NOTICE.body.TextXAlignment = Enum.TextXAlignment.Left
 START_NOTICE.body.TextYAlignment = Enum.TextYAlignment.Top
-START_NOTICE.body.LineHeight = 1.15
+START_NOTICE.body.LineHeight = 1.10
 START_NOTICE.body.ZIndex = 72
 START_NOTICE.body.Parent = START_NOTICE.panel
 
@@ -31782,7 +31772,7 @@ START_NOTICE.discord.Position = UDim2.new(0, 20, 1, -62)
 START_NOTICE.discord.BackgroundColor3 = COLOR_CARD
 START_NOTICE.discord.BorderSizePixel = 0
 START_NOTICE.discord.Font = Enum.Font.GothamBold
-START_NOTICE.discord.Text = "Discord: martusmmb"
+START_NOTICE.discord.Text = "BUGS / SUGGESTIONS  ·  Discord: martusmmb"
 START_NOTICE.discord.TextColor3 = COLOR_ACCENT
 START_NOTICE.discord.TextSize = 14
 START_NOTICE.discord.ZIndex = 72
