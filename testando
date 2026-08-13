@@ -1078,6 +1078,72 @@ task.spawn(function()
 	end
 end)
 
+-- ============================================================
+-- STAMINA GUARD
+-- Stamina is also calculated client-side. Keep the active slot at 100 without
+-- changing MovementState, StaminaDrainOverride, per-animal multipliers, Growth
+-- scaling or any of the normal locomotion state machines.
+-- ============================================================
+state.staminaGuardEnabled = true
+state.staminaGuardLastCorrectionAt = 0
+
+function state.staminaGuardApply(character)
+	if not state.staminaGuardEnabled or not character or not character.Parent then
+		return false
+	end
+
+	local stamina = character:GetAttribute("Stamina")
+	if type(stamina) ~= "number" then
+		return false
+	end
+
+	local corrected = false
+
+	if stamina < 100 then
+		local ok = pcall(
+			character.SetAttribute,
+			character,
+			"Stamina",
+			100
+		)
+
+		if ok then
+			corrected = true
+			state.staminaGuardLastCorrectionAt = tick()
+		end
+	end
+
+	-- Do not create the attribute when the game has not created it. Only clear
+	-- an actual exhaustion latch produced by the native stamina controller.
+	if character:GetAttribute("StaminaRanOut") == true then
+		local ok = pcall(
+			character.SetAttribute,
+			character,
+			"StaminaRanOut",
+			false
+		)
+
+		if ok then
+			corrected = true
+			state.staminaGuardLastCorrectionAt = tick()
+		end
+	end
+
+	return corrected or (character:GetAttribute("Stamina") or 0) >= 100
+end
+
+task.spawn(function()
+	while state.alive do
+		pcall(function()
+			state.staminaGuardApply(player.Character)
+		end)
+
+		-- Native stamina updates every 0.15 s. A shorter guard interval prevents
+		-- Run/Sprint/Swimming/Jump checks from ever observing a sustained low bar.
+		task.wait(0.05)
+	end
+end)
+
 local function setSubState(name)
 	if state.questGrowthReset and state.questGrowthReset.exclusive then
 		return
@@ -11874,11 +11940,13 @@ table.insert(connections, player.CharacterAdded:Connect(function(character)
 	DAMAGE.cooldownUntil = tick() + 1.5
 	DAMAGE.active = false
 	state.oxygenGuardApply(character)
+	state.staminaGuardApply(character)
 	mmbTaskDefer(DAMAGE.bind, character)
 	mmbTaskDefer(function()
 		task.wait(0.35)
 		if character ~= player.Character then return end
 		state.oxygenGuardApply(character)
+		state.staminaGuardApply(character)
 		state.releaseMovementNow(character, true)
 		if CROC.isCharacter(character) then
 			state.autoDrinkMode = "surface"
