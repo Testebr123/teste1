@@ -11716,6 +11716,26 @@ function state.aquaticTerrainBankCandidateClear(
 		return false
 	end
 
+	local terrainLocal =
+		waterPart.CFrame:PointToObjectSpace(
+			terrainHit.Position
+		)
+
+	local waterTop =
+		waterPart.CFrame:PointToWorldSpace(
+			Vector3.new(
+				terrainLocal.X,
+				waterPart.Size.Y * 0.5,
+				terrainLocal.Z
+			)
+		)
+
+	-- Underwater Terrain (even a steep hill) is not a bank.
+	if terrainHit.Position.Y
+		< waterTop.Y - 0.35 then
+		return false
+	end
+
 	-- Validate ONLY the landing column. The first real collidable support at
 	-- this X/Z must be Terrain. Thus Rock3Var3 / MeshPart / Part sitting on top
 	-- of the Terrain is rejected, without rejecting a perfectly valid bank just
@@ -11794,6 +11814,11 @@ function state.findNearbyMainWaterBankTarget(
 
 	local waterPart =
 		info.part
+
+	-- Same rule that worked for Croc: Terrain below the water plane is river
+	-- bottom / underwater hill and is NEVER a valid exit bank.
+	local waterTopY =
+		info.topY
 
 	local baseDirection
 
@@ -11900,7 +11925,7 @@ function state.findNearbyMainWaterBankTarget(
 		workspace.Terrain,
 	}
 
-	params.IgnoreWater = false
+	params.IgnoreWater = true
 
 	-- Use the animal's REAL root-to-body clearance. The previous 0.24x
 	-- value placed a Hippo HRP almost inside the Terrain and could make the
@@ -11913,13 +11938,12 @@ function state.findNearbyMainWaterBankTarget(
 	-- One-time, progressive local scan. It stops on the FIRST radius that has
 	-- any usable bank, so nearby rises win over distant MainWaterPart edges.
 	for _, radius in ipairs({
-		10,
-		18,
-		28,
-		42,
-		62,
-		88,
-		118,
+		12,
+		22,
+		36,
+		54,
+		78,
+		108,
 	}) do
 
 		local best
@@ -11961,6 +11985,8 @@ function state.findNearbyMainWaterBankTarget(
 					~= Enum.Material.Water
 				and hit.Normal.Y
 					>= 0.10
+				and hit.Position.Y
+					>= waterTopY - 0.35
 				and state.aquaticTerrainBankCandidateClear(
 					character,
 					root,
@@ -11970,10 +11996,11 @@ function state.findNearbyMainWaterBankTarget(
 				) then
 
 				local heightPenalty =
-					math.abs(
+					math.max(
+						0,
 						hit.Position.Y
-							- root.Position.Y
-					) * 0.025
+							- waterTopY
+					) * 0.08
 
 				local directionPenalty =
 					(directionIndex - 1)
@@ -12043,6 +12070,8 @@ function state.findNearbyMainWaterBankTarget(
 					~= Enum.Material.Water
 				and hit.Normal.Y
 					>= 0.10
+				and hit.Position.Y
+					>= waterTopY - 0.35
 				and state.aquaticTerrainBankCandidateClear(
 					character,
 					root,
@@ -12339,8 +12368,8 @@ function state.aquaticRiverInfinityFlyExit(
 			CROC.isCharacter(
 				character
 			)
-				and "Croc water exit: no exposed Terrain bank found yet; retrying"
-				or "Hippo water exit: no exposed Terrain bank found yet; retrying"
+				and "Croc water exit: no ABOVE-WATER Terrain bank nearby; retrying"
+				or "Hippo water exit: no ABOVE-WATER Terrain bank nearby; retrying"
 
 		return false
 	end
