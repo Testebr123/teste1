@@ -885,7 +885,14 @@ function state.questCurrentZoneName()
 end
 
 function state.questRememberZoneBeforeFeeding(reason)
-	if not state.autoQuests or state.questReturnZone.name then return end
+	if not state.autoQuests
+		or state.questReturnZone.name
+		or (
+			state.questGrowthConcurrentActive
+			and state.questGrowthConcurrentActive()
+		) then
+		return
+	end
 
 	local zone = state.questCurrentZoneName()
 	if type(zone) ~= "string" or zone == "" then return end
@@ -917,6 +924,18 @@ local function isCarnivoreCharacter(character)
 	if type(animalType) == "string" and animalType:lower():find("carn", 1, true) then return true end
 	return false
 end
+function state.autoGrowModeActive()
+	return state.growExisting
+		or state.growAllSlots
+		or state.growNew
+		or state.growExistingAutomaticAll
+end
+
+function state.questGrowthConcurrentActive()
+	return state.autoQuests == true
+		and state.autoGrowModeActive()
+end
+
 function state.growthModeActive()
 	-- Growth can be owned either by the manual Growth tab or temporarily by
 	-- Auto Quests while it finishes/resets a growing slot. Pride Rock must
@@ -1059,6 +1078,12 @@ end
 function state.growthPrideRestrictionActive(character)
 	-- ZoneTime always outranks the normal Growth home.
 	if not state.growthPrideEnabled
+		or (
+			state.questGrowthConcurrentActive
+			and state.questGrowthConcurrentActive()
+			and state.questTravelActive
+			and not state.questSwimActive
+		)
 		or (
 			state.autoQuests
 			and state.questZonePriority
@@ -2937,19 +2962,11 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		and type(
 			state.moveAquaticToDryTerrain
 		) == "function"
-		and (
-			state.isCharacterSwimmingState(
-				character
-			)
-			or (
-				type(
-					state.gameSwimmingGeometry
-				) == "function"
-				and state.gameSwimmingGeometry(
-					character,
-					root
-				)
-			)
+		and type(
+			state.isUnderMainWaterPart
+		) == "function"
+		and state.isUnderMainWaterPart(
+			root
 		)
 
 	if aquaticLandPreflight then
@@ -10634,349 +10651,468 @@ function state.aquaticFlyDisableFallGuard()
 	fly.selfDamageGuard = false
 end
 
-function state.aquaticFlyDryGroundReached(
-	character,
-	root,
-	waterY
-)
-	if not character
-		or not root
-		or type(waterY) ~= "number" then
-		return false
-	end
-
-	if root.Position.Y < config.dangerY then
-		return false
-	end
-
-	-- Never look at the river bottom. The game exits Swimming from WATER
-	-- SURFACE geometry, not from "solid Terrain under the animal".
-	return state.gameSwimmingExitConfirmed(
-		character,
-		root,
-		waterY
-	)
-end
-
-function state.findAquaticDryTerrainExit(character, root, preferredTarget)
-	if not character or not root then
+function state.mainWaterPartInfo(root)
+	if not root then
 		return nil
 	end
 
-	local waterY =
-		state.gameWaterSurfaceHeightAt(
+	local waterPart =
+		workspace:FindFirstChild(
+			"MainWaterPart"
+		)
+
+	if not waterPart
+		or not waterPart:IsA(
+			"BasePart"
+		) then
+		return nil
+	end
+
+	local localPosition =
+		waterPart.CFrame:PointToObjectSpace(
 			root.Position
 		)
 
-	if type(waterY) ~= "number" then
-		return nil
-	end
+	local halfX =
+		waterPart.Size.X * 0.5
 
-	local origin =
-		Vector3.new(
-			root.Position.X,
-			waterY,
-			root.Position.Z
+	local halfY =
+		waterPart.Size.Y * 0.5
+
+	local halfZ =
+		waterPart.Size.Z * 0.5
+
+	local insideXZ =
+		math.abs(localPosition.X)
+			<= halfX
+		and math.abs(localPosition.Z)
+			<= halfZ
+
+	-- Water top at the current local X/Z. This also remains valid if the part
+	-- is ever slightly rotated instead of perfectly axis-aligned.
+	local topPoint =
+		waterPart.CFrame:PointToWorldSpace(
+			Vector3.new(
+				localPosition.X,
+				halfY,
+				localPosition.Z
+			)
 		)
 
-	local preferredDirection
-
-	if typeof(preferredTarget) == "Vector3" then
-		local delta =
-			Vector3.new(
-				preferredTarget.X - origin.X,
-				0,
-				preferredTarget.Z - origin.Z
-			)
-
-		if delta.Magnitude > 1 then
-			preferredDirection = delta.Unit
-		end
-	end
-
-	local directions = {}
-
-	local function rotated(direction, degrees)
-		local angle = math.rad(degrees)
-		local c = math.cos(angle)
-		local s = math.sin(angle)
-
-		return Vector3.new(
-			direction.X * c - direction.Z * s,
-			0,
-			direction.X * s + direction.Z * c
-		).Unit
-	end
-
-	if preferredDirection then
-		for _, degrees in ipairs({
-			0, -32, 32, -68, 68
-		}) do
-			table.insert(
-				directions,
-				rotated(preferredDirection, degrees)
-			)
-		end
-	else
-		for index = 0, 5 do
-			local angle = index / 6 * math.pi * 2
-			table.insert(
-				directions,
-				Vector3.new(
-					math.cos(angle),
-					0,
-					math.sin(angle)
-				)
-			)
-		end
-	end
-
-	local clearance = state.movementRootClearance(character)
-
-	for _, radius in ipairs({
-		20, 38, 62, 92, 124
-	}) do
-		local best
-		local bestScore = math.huge
-
-		for _, direction in ipairs(directions) do
-			local point = origin + direction * radius
-
-			local hit =
-				workspace:Raycast(
-					Vector3.new(
-						point.X,
-						waterY + 120,
-						point.Z
-					),
-					Vector3.new(0, -250, 0),
-					terrainParams
-				)
-
-			if hit
-				and hit.Material ~= Enum.Material.Water
-				and hit.Normal.Y >= 0.18
-				and hit.Position.Y >= waterY - 0.75 then
-
-				local candidate =
-					hit.Position
-					+ Vector3.new(
-						0,
-						math.clamp(
-							clearance * 0.38,
-							1.8,
-							3.2
-						),
-						0
-					)
-
-				local score =
-					radius
-					+ math.abs(
-						hit.Position.Y - waterY
-					) * 0.15
-
-				if typeof(preferredTarget) == "Vector3" then
-					score +=
-						Vector3.new(
-							preferredTarget.X - candidate.X,
-							0,
-							preferredTarget.Z - candidate.Z
-						).Magnitude * 0.01
-				end
-
-				if score < bestScore then
-					bestScore = score
-					best = candidate
-				end
-			end
-		end
-
-		if best then
-			return best
-		end
-	end
-
-	return nil
+	return {
+		part = waterPart,
+		localPosition = localPosition,
+		halfX = halfX,
+		halfY = halfY,
+		halfZ = halfZ,
+		insideXZ = insideXZ,
+		topY = topPoint.Y,
+	}
 end
 
-function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
+function state.isUnderMainWaterPart(root)
+	local info =
+		state.mainWaterPartInfo(
+			root
+		)
+
+	if not info then
+		return false,
+			nil
+	end
+
+	-- The intentionally simple rule requested for Croc/Hippo:
+	-- if the water part is horizontally over us and its top is above the HRP,
+	-- we are in the water-exit condition.
+	local under =
+		info.insideXZ
+		and info.topY
+			> root.Position.Y + 0.10
+
+	return under,
+		info
+end
+
+function state.mainWaterNearestExitTarget(
+	character,
+	root
+)
+	local under, info =
+		state.isUnderMainWaterPart(
+			root
+		)
+
+	if not under or not info then
+		return nil,
+			info
+	end
+
+	local p =
+		info.localPosition
+
+	-- Nearest rectangle edge, no raycasts.
+	local options = {
+		{
+			distance = info.halfX - p.X,
+			axis = "x",
+			sign = 1,
+		},
+		{
+			distance = info.halfX + p.X,
+			axis = "x",
+			sign = -1,
+		},
+		{
+			distance = info.halfZ - p.Z,
+			axis = "z",
+			sign = 1,
+		},
+		{
+			distance = info.halfZ + p.Z,
+			axis = "z",
+			sign = -1,
+		},
+	}
+
+	local nearest =
+		options[1]
+
+	for index = 2, #options do
+		if options[index].distance
+			< nearest.distance then
+			nearest =
+				options[index]
+		end
+	end
+
+	local footprint =
+		character
+		and state.movementFootprint(
+			character
+		)
+		or 8
+
+	-- Go a few studs beyond the water-part edge so UNFLY does not happen on
+	-- the exact boundary.
+	local outsideMargin =
+		math.clamp(
+			footprint * 0.45,
+			7,
+			12
+		)
+
+	local lift =
+		math.clamp(
+			state.movementRootClearance(
+				character
+			) * 0.24,
+			0.65,
+			1.65
+		)
+
+	local targetX =
+		math.clamp(
+			p.X,
+			-info.halfX,
+			info.halfX
+		)
+
+	local targetZ =
+		math.clamp(
+			p.Z,
+			-info.halfZ,
+			info.halfZ
+		)
+
+	if nearest.axis == "x" then
+		targetX =
+			nearest.sign
+			* (
+				info.halfX
+				+ outsideMargin
+			)
+	else
+		targetZ =
+			nearest.sign
+			* (
+				info.halfZ
+				+ outsideMargin
+			)
+	end
+
+	local localTarget =
+		Vector3.new(
+			targetX,
+			info.halfY + lift,
+			targetZ
+		)
+
+	return info.part.CFrame:PointToWorldSpace(
+		localTarget
+	),
+		info
+end
+
+function state.mainWaterExitReached(
+	root,
+	waterPart
+)
+	if not root
+		or not waterPart
+		or not waterPart.Parent then
+		return false
+	end
+
+	local p =
+		waterPart.CFrame:PointToObjectSpace(
+			root.Position
+		)
+
+	local halfX =
+		waterPart.Size.X * 0.5
+
+	local halfY =
+		waterPart.Size.Y * 0.5
+
+	local halfZ =
+		waterPart.Size.Z * 0.5
+
+	local outsideXZ =
+		math.abs(p.X)
+			> halfX + 0.75
+		or math.abs(p.Z)
+			> halfZ + 0.75
+
+	if not outsideXZ then
+		return false
+	end
+
+	local topWorld =
+		waterPart.CFrame:PointToWorldSpace(
+			Vector3.new(
+				p.X,
+				halfY,
+				p.Z
+			)
+		)
+
+	-- No Terrain proof: by design the water part boundary is authoritative.
+	-- We only require the animal to have risen close to the water plane before
+	-- ending Fly, so a very deep Croc cannot cross the side boundary underground.
+	return root.Position.Y
+		>= topWorld.Y - 0.75
+end
+
+function state.aquaticFlyDryGroundReached(
+	character,
+	root,
+	_unusedWaterY
+)
+	if not character or not root then
+		return false
+	end
+
+	local info =
+		state.mainWaterPartInfo(
+			root
+		)
+
+	if not info then
+		return false
+	end
+
+	return state.mainWaterExitReached(
+		root,
+		info.part
+	)
+end
+
+function state.findAquaticDryTerrainExit(
+	character,
+	root,
+	_preferredTarget
+)
+	-- Compatibility wrapper. Croc/Hippo no longer scan Terrain for a bank.
+	return state.mainWaterNearestExitTarget(
+		character,
+		root
+	)
+end
+
+function state.aquaticRiverInfinityFlyExit(
+	character,
+	root,
+	_preferredTarget
+)
 	if not character
 		or not root
-		or not state.isCrocOrHippoMovementCharacter(character) then
+		or not state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+
 		return false
 	end
 
 	local humanoid =
-		character:FindFirstChildOfClass("Humanoid")
+		character:FindFirstChildOfClass(
+			"Humanoid"
+		)
 
-	if not humanoid or humanoid.Health <= 0 then
+	if not humanoid
+		or humanoid.Health <= 0 then
 		return false
 	end
 
-	local waterPart = workspace:FindFirstChild("MainWaterPart")
-
-	local waterY, waterSource =
-		state.gameWaterSurfaceHeightAt(
-			root.Position
+	local under, info =
+		state.isUnderMainWaterPart(
+			root
 		)
 
-	if type(waterY) ~= "number" then
+	if not info then
+		runtimeMessage =
+			"Water Fly: MainWaterPart not found"
 		return false
 	end
 
-	if state.aquaticFlyDryGroundReached(
-		character,
-		root,
-		waterY
-	) then
-		pcall(
-			humanoid.ChangeState,
-			humanoid,
-			Enum.HumanoidStateType.GettingUp
-		)
-		return true
-	end
-
-	-- Match Savannah's own swimming geometry. MovementState is useful evidence,
-	-- but the SwimHeightAttachment vs water surface comparison is authoritative
-	-- for this recovery because IY Fly may temporarily make the state show Idle.
-	local swimmingAtStart =
-		state.isCharacterSwimmingState(
-			character
-		)
-
-	local geometryInWater =
-		state.gameSwimmingGeometry(
-			character,
+	-- Already outside the water-part condition: nothing to recover.
+	if not under then
+		return state.mainWaterExitReached(
 			root,
-			waterY
+			info.part
 		)
-
-	if not swimmingAtStart
-		and not geometryInWater then
-		return false
 	end
 
 	local target =
-		state.findAquaticDryTerrainExit(
+		state.mainWaterNearestExitTarget(
 			character,
-			root,
-			preferredTarget
+			root
 		)
 
-	if not target then
-		runtimeMessage =
-			CROC.isCharacter(character)
-				and "Croc water Fly: no local dry bank found"
-				or "Hippo water Fly: no local dry bank found"
+	if typeof(target) ~= "Vector3" then
 		return false
 	end
 
-	state.releaseMovementNow(character, true)
+	local waterPart =
+		info.part
 
-	local fly = state.aquaticRiverEscape
+	state.releaseMovementNow(
+		character,
+		true
+	)
+
+	local fly =
+		state.aquaticRiverEscape
 
 	pcall(function()
-		local old = root:FindFirstChild("MMB_AquaticFlyVelocity")
-		if old then old:Destroy() end
+		local old =
+			root:FindFirstChild(
+				"MMB_AquaticFlyVelocity"
+			)
+
+		if old then
+			old:Destroy()
+		end
 	end)
 
 	pcall(function()
-		local old = root:FindFirstChild("MMB_AquaticFlyGyro")
-		if old then old:Destroy() end
+		local old =
+			root:FindFirstChild(
+				"MMB_AquaticFlyGyro"
+			)
+
+		if old then
+			old:Destroy()
+		end
 	end)
 
-	local oldAutoRotate = humanoid.AutoRotate
+	local oldAutoRotate =
+		humanoid.AutoRotate
+
 	local oldWaterCollision =
-		waterPart
-		and waterPart:IsA("BasePart")
-		and waterPart.CanCollide
-		or false
+		waterPart.CanCollide
 
-	state.aquaticFlyEnableFallGuard(character)
+	state.aquaticFlyEnableFallGuard(
+		character
+	)
 
-	if waterPart and waterPart:IsA("BasePart") then
-		-- Do not let the water collision plane trap the rig below the surface.
-		waterPart.CanCollide = false
-	end
+	-- Only during Fly, so the collision plane cannot trap the rig below it.
+	waterPart.CanCollide = false
 
-	local BG = Instance.new("BodyGyro")
-	local BV = Instance.new("BodyVelocity")
+	local BG =
+		Instance.new(
+			"BodyGyro"
+		)
 
-	BG.Name = "MMB_AquaticFlyGyro"
-	BV.Name = "MMB_AquaticFlyVelocity"
+	local BV =
+		Instance.new(
+			"BodyVelocity"
+		)
 
-	-- Same core constants used by Infinite Yield Fly.
+	BG.Name =
+		"MMB_AquaticFlyGyro"
+
+	BV.Name =
+		"MMB_AquaticFlyVelocity"
+
+	-- Infinite Yield plain Fly core.
 	BG.P = 9e4
-	BG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-	BG.CFrame = root.CFrame
+	BG.MaxTorque =
+		Vector3.new(
+			9e9,
+			9e9,
+			9e9
+		)
 
-	BV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-	BV.Velocity = Vector3.zero
+	BG.CFrame =
+		root.CFrame
 
-	BG.Parent = root
-	BV.Parent = root
+	BV.MaxForce =
+		Vector3.new(
+			9e9,
+			9e9,
+			9e9
+		)
+
+	BV.Velocity =
+		Vector3.zero
+
+	BG.Parent =
+		root
+
+	BV.Parent =
+		root
 
 	fly.bodyGyro = BG
 	fly.bodyVelocity = BV
 
 	pcall(function()
-		-- Match Infinite Yield's actual Fly ownership: PlatformStand prevents the
-		-- Savannah movement controller from fighting BodyVelocity/BodyGyro.
-		-- MovementState may become Idle here, which is fine: the Fly no longer
-		-- uses MovementState as its completion condition.
 		humanoid.PlatformStand = true
 		humanoid.AutoRotate = false
 	end)
 
-	character:SetAttribute("MovementDisabled", false)
+	character:SetAttribute(
+		"MovementDisabled",
+		false
+	)
 
-	local clearance = state.movementRootClearance(character)
-
-	-- Low flight only: enough to rise from the river and cross the bank lip.
-	local cruiseY =
-		waterY
-		+ math.clamp(
-			clearance * 0.30,
-			0.75,
-			2.25
-		)
-
-	local bankY =
-		math.min(
-			target.Y,
-			waterY
-				+ math.clamp(
-					clearance * 0.48,
-					1.25,
-					3.25
-				)
-		)
-
-	-- Match the plain Infinite Yield `fly` command: NO numeric argument is
-	-- supplied and no multiplier is introduced here. sFLY() itself uses its
-	-- internal active base SPEED of 50 when movement is requested.
-	-- This remains completely independent from Acceleration / WalkSpeed.
+	-- Plain `fly` internal movement speed. Not Acceleration / WalkSpeed.
 	local IY_FLY_SPEED = 50
 
-	local flatDistance =
-		Vector3.new(
-			target.X - root.Position.X,
-			0,
-			target.Z - root.Position.Z
-		).Magnitude
+	local initialDistance =
+		(target - root.Position).Magnitude
 
 	local deadline =
 		tick()
 		+ math.clamp(
-			flatDistance / IY_FLY_SPEED + 2.0,
-			2.5,
-			7.0
+			initialDistance
+				/ IY_FLY_SPEED
+				+ 2.5,
+			3.0,
+			12.0
 		)
 
-	local success = false
-	local nextGroundCheckAt = 0
+	local success =
+		false
 
 	local callOk, callError =
 		pcall(function()
@@ -10987,148 +11123,141 @@ function state.aquaticRiverInfinityFlyExit(character, root, preferredTarget)
 				and humanoid.Health > 0
 				and tick() < deadline do
 
-				-- Keep Fly itself at Heartbeat cadence, but the only physical
-				-- completion test runs at 5 Hz and is a single 12-stud ray.
-				local now = tick()
-
-				if now >= nextGroundCheckAt then
-					nextGroundCheckAt =
-						now + 0.20
-
-					if state.aquaticFlyDryGroundReached(
-						character,
-						root,
-						waterY
-					) then
-						success = true
-						break
-					end
+				-- O(1) geometry only. No raycast, voxels, MovementState or
+				-- SwimHeightAttachment checks while Fly is active.
+				if state.mainWaterExitReached(
+					root,
+					waterPart
+				) then
+					success = true
+					break
 				end
 
-				local horizontal =
-					Vector3.new(
-						target.X - root.Position.X,
-						0,
-						target.Z - root.Position.Z
-					)
+				local delta =
+					target - root.Position
 
-				local remaining = horizontal.Magnitude
-
-				local desiredY =
-					remaining > 18
-						and cruiseY
-						or bankY
-
-				local hardCeiling =
-					waterY
-					+ math.clamp(
-						clearance * 0.55,
-						1.5,
-						3.75
-					)
-
-				desiredY = math.min(desiredY, hardCeiling)
-
-				if root.Position.Y > hardCeiling + 0.35 then
-					desiredY = cruiseY
-				end
-
-				local flyDelta =
-					Vector3.new(
-						horizontal.X,
-						desiredY - root.Position.Y,
-						horizontal.Z
-					)
-
-				if flyDelta.Magnitude <= 0.10 then
-					BV.Velocity = Vector3.zero
+				if delta.Magnitude <= 0.20 then
+					BV.Velocity =
+						Vector3.zero
 				else
 					BV.Velocity =
-						flyDelta.Unit * IY_FLY_SPEED
+						delta.Unit
+						* IY_FLY_SPEED
 				end
 
-				if horizontal.Magnitude > 0.25 then
+				local flat =
+					Vector3.new(
+						delta.X,
+						0,
+						delta.Z
+					)
+
+				if flat.Magnitude > 0.20 then
 					BG.CFrame =
 						CFrame.lookAt(
 							root.Position,
-							root.Position + horizontal.Unit,
+							root.Position
+								+ flat.Unit,
 							Vector3.yAxis
 						)
 				end
 
-				root.AssemblyAngularVelocity = Vector3.zero
+				root.AssemblyAngularVelocity =
+					Vector3.zero
 
 				runtimeMessage =
-					CROC.isCharacter(character)
+					CROC.isCharacter(
+						character
+					)
 						and string.format(
-							"Croc water Fly: exiting river (%.0f studs, %s)",
-							remaining,
-							tostring(waterSource or "water")
+							"Croc water Fly: MainWaterPart above -> nearest edge (%.0f)",
+							delta.Magnitude
 						)
 						or string.format(
-							"Hippo water Fly: exiting river (%.0f studs, %s)",
-							remaining,
-							tostring(waterSource or "water")
+							"Hippo water Fly: MainWaterPart above -> nearest edge (%.0f)",
+							delta.Magnitude
 						)
 
 				RunService.Heartbeat:Wait()
 			end
 		end)
 
-	-- UNFLY immediately removes both Infinite-Yield-style force objects.
+	-- UNFLY
 	pcall(function()
-		if BV and BV.Parent then BV:Destroy() end
+		if BV and BV.Parent then
+			BV:Destroy()
+		end
 	end)
 
 	pcall(function()
-		if BG and BG.Parent then BG:Destroy() end
+		if BG and BG.Parent then
+			BG:Destroy()
+		end
 	end)
 
 	fly.bodyVelocity = nil
 	fly.bodyGyro = nil
 
 	if root and root.Parent then
-		root.AssemblyLinearVelocity = Vector3.zero
-		root.AssemblyAngularVelocity = Vector3.zero
+		root.AssemblyLinearVelocity =
+			Vector3.zero
+
+		root.AssemblyAngularVelocity =
+			Vector3.zero
 	end
 
 	pcall(function()
 		humanoid.PlatformStand = false
-		humanoid.AutoRotate = oldAutoRotate ~= false
-		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+		humanoid.AutoRotate =
+			oldAutoRotate ~= false
+
+		humanoid:ChangeState(
+			Enum.HumanoidStateType.GettingUp
+		)
 	end)
 
-	character:SetAttribute("MovementDisabled", false)
+	character:SetAttribute(
+		"MovementDisabled",
+		false
+	)
 
+	-- Restore exactly what the water part had before this Fly.
+	if waterPart and waterPart.Parent then
+		waterPart.CanCollide =
+			oldWaterCollision
+	end
+
+	-- Keep fall protection for only two landing frames.
 	if success then
-		if waterPart and waterPart:IsA("BasePart") then
-			waterPart.CanCollide = false
-		end
-
-		-- Keep the anti-fall guard for two landing frames only.
 		for _ = 1, 2 do
 			RunService.Heartbeat:Wait()
 		end
-
-		state.aquaticFlyDisableFallGuard()
-
-		runtimeMessage =
-			CROC.isCharacter(character)
-				and "Croc water Fly OFF: dry Terrain reached"
-				or "Hippo water Fly OFF: dry Terrain reached"
-
-		return true
-	end
-
-	if waterPart and waterPart:IsA("BasePart") then
-		waterPart.CanCollide = oldWaterCollision
 	end
 
 	state.aquaticFlyDisableFallGuard()
 
+	if success then
+		runtimeMessage =
+			CROC.isCharacter(
+				character
+			)
+				and "Croc water Fly OFF: outside MainWaterPart"
+				or "Hippo water Fly OFF: outside MainWaterPart"
+
+		return true
+	end
+
 	if not callOk then
 		runtimeMessage =
-			"Aquatic Fly error: " .. tostring(callError)
+			"Aquatic Fly error: "
+			.. tostring(callError)
+	else
+		runtimeMessage =
+			CROC.isCharacter(
+				character
+			)
+				and "Croc water Fly timed out; retrying later"
+				or "Hippo water Fly timed out; retrying later"
 	end
 
 	return false
@@ -11149,8 +11278,28 @@ function state.moveAquaticToDryTerrain(character, root, preferredTarget)
 		return false
 	end
 
-	-- Crocodile/Hippo: Fly is allowed ONLY while escaping water.
-	if state.isCrocOrHippoMovementCharacter(character) then
+	-- Crocodile/Hippo: the whole water decision is MainWaterPart geometry.
+	if state.isCrocOrHippoMovementCharacter(
+		character
+	) then
+		local under, info =
+			state.isUnderMainWaterPart(
+				root
+			)
+
+		if info
+			and not under
+			and state.mainWaterExitReached(
+				root,
+				info.part
+			) then
+			return true
+		end
+
+		if not under then
+			return false
+		end
+
 		controller.busy = true
 
 		local ok =
@@ -11161,7 +11310,11 @@ function state.moveAquaticToDryTerrain(character, root, preferredTarget)
 			)
 
 		controller.busy = false
-		controller.retryAt = ok and 0 or tick() + 3.0
+		controller.retryAt =
+			ok
+				and 0
+				or tick() + 2.5
+
 		return ok
 	end
 
@@ -12489,14 +12642,16 @@ function DAMAGE.moveToSafety()
 		waterPart.CanCollide = isAquaticCharacter(character)
 	end
 
-	if (
-		isAquaticCharacter(
+	local crocHippoUnderWater =
+		state.isCrocOrHippoMovementCharacter(
 			character
 		)
-		or state.isCrocOrHippoMovementCharacter(
-			character
+		and state.isUnderMainWaterPart(
+			root
 		)
-	) and state.moveAquaticToDryTerrain then
+
+	if crocHippoUnderWater
+		and state.moveAquaticToDryTerrain then
 
 		local aquaticEscaped =
 			state.moveAquaticToDryTerrain(
@@ -12518,18 +12673,12 @@ function DAMAGE.moveToSafety()
 			return true, nil
 		end
 
-		-- Croc/Hippo river bottom is solid Terrain. Generic watchdog recovery
-		-- would therefore produce a false "safe/above Terrain" result.
-		if state.isCrocOrHippoMovementCharacter(
-			character
-		) then
-			runtimeMessage =
-				CROC.isCharacter(character)
-					and "Croc aquatic escape still active; generic watchdog blocked"
-					or "Hippo aquatic escape still active; generic watchdog blocked"
+		runtimeMessage =
+			CROC.isCharacter(character)
+				and "Croc under MainWaterPart: generic watchdog blocked"
+				or "Hippo under MainWaterPart: generic watchdog blocked"
 
-			return false, nil
-		end
+		return false, nil
 	end
 
 	-- Local Terrain is always preferred. Do not walk to a spawn when a dry
@@ -13034,22 +13183,15 @@ local function forcePostDrinkMove(wasUnderground)
 		if state.isCrocOrHippoMovementCharacter(
 			character
 		) then
-			local riverY =
-				state.gameWaterSurfaceHeightAt(
-					root.Position
-				)
-
-			if type(riverY) ~= "number"
-				or type(
-					state.aquaticFlyDryGroundReached
-				) ~= "function" then
+			if type(
+				state.aquaticFlyDryGroundReached
+			) ~= "function" then
 				return false
 			end
 
 			return state.aquaticFlyDryGroundReached(
 				character,
-				root,
-				riverY
+				root
 			)
 		end
 
@@ -13319,27 +13461,9 @@ function state.noIdleWaterSafetyStep()
 	if state.isCrocOrHippoMovementCharacter(
 		character
 	) then
-		local swimming =
-			state.isCharacterSwimmingState(
-				character
-			)
-
-		local waterY =
-			state.gameWaterSurfaceHeightAt(
-				root.Position
-			)
-
-		local geometryInWater =
-			type(waterY) == "number"
-			and state.gameSwimmingGeometry(
-				character,
-				root,
-				waterY
-			)
-			or false
-
-		if not swimming
-			and not geometryInWater then
+		if not state.isUnderMainWaterPart(
+			root
+		) then
 			return
 		end
 	elseif not state.isBodyActuallyInWater(
@@ -19487,6 +19611,36 @@ local function isSwimQuest(props)
 	return hasSwimming
 end
 
+function state.questAllowedDuringAutoGrow(quest)
+	if not state.questGrowthConcurrentActive() then
+		return true
+	end
+
+	if type(quest) ~= "table"
+		or type(quest.props) ~= "table" then
+		return false
+	end
+
+	local props = quest.props
+	local data = props.QuestData or {}
+
+	-- Auto Grow owns species/slot choice. Ignore quests that would require
+	-- a fixed location, a specific species, or Swimming.
+	if data.ShouldBeSpawnedAsSpecificAnimalName then
+		return false
+	end
+
+	if props.QuestType == "ZoneTime" then
+		return false
+	end
+
+	if isSwimQuest(props) then
+		return false
+	end
+
+	return true
+end
+
 local function isLandDistanceQuest(props)
 	if not props or props.QuestType ~= "TravelDistance" then return false end
 	local allowed = props.QuestData and props.QuestData.AllowedMovementStates
@@ -20710,6 +20864,12 @@ function state.questIsActionable(quest, records)
 
 	records = records or savedCharacters()
 
+	if not state.questAllowedDuringAutoGrow(
+		quest
+	) then
+		return false, "auto_grow_parallel_filtered", nil
+	end
+
 	local targetAnimal = findSpecificAnimalTarget(quest, records)
 	local questData =
 		quest.props.QuestData or {}
@@ -20734,7 +20894,7 @@ function state.questIsActionable(quest, records)
 	if quest.props.QuestType == "GroupTime" then
 		local possible = state.questGroup.refreshAvailability(
 			records,
-			true
+			not state.questGrowthConcurrentActive()
 		)
 
 		if not possible
@@ -23185,6 +23345,27 @@ local function updateQuestAutomation()
 		state.questReleaseStaleRecoveryLock()
 	end
 
+	local growQuestConcurrent =
+		state.questGrowthConcurrentActive()
+
+	if growQuestConcurrent then
+		-- Auto Grow owns the animal/slot and fixed destination.
+		-- Auto Quests keeps only compatible parallel work.
+		state.questZonePriority.active = false
+		state.questZonePriority.zone = nil
+		state.questZonePriority.resolved = true
+		state.questZoneDrinkRelease("zone_inactive")
+		state.questClearReturnZone()
+		questTargetZoneName = nil
+
+		if state.questSwimActive then
+			state.questSwimActive = false
+			state.questSwimReady = false
+			state.questMoveSubState = "Running"
+			removeSwimBarrier()
+		end
+	end
+
 	if not state.autoQuests then
 		state.questZonePriority.active = false
 		state.questZonePriority.zone = nil
@@ -23404,6 +23585,35 @@ local function updateQuestAutomation()
 		return
 	end
 
+	if growQuestConcurrent
+		and (
+			#quests == 0
+			or actionableQuestCount == 0
+		) then
+
+		state.questZoneDrinkRelease("zone_complete")
+		state.questClearReturnZone()
+		questTargetZoneName = nil
+		questTravelWanted = false
+		state.questTravelActive = false
+		state.questLandInputActive = false
+		state.questSetW(false)
+		state.questSwimActive = false
+		state.questSwimReady = false
+		state.questMotionMoving = false
+		state.questMotionMode = nil
+
+		questStatusText =
+			incompleteQuestCount > 0
+				and "Auto Grow + Quests: Local/Swim/specific ignored"
+				or "Auto Grow + Quests: waiting for quests"
+
+		runtimeMessage =
+			"Parallel mode: Auto Quests remains enabled for Run/Group-compatible quests"
+
+		return
+	end
+
 	if #quests == 0 or actionableQuestCount == 0 then
 		state.questZoneDrinkRelease("zone_complete")
 		state.questClearReturnZone()
@@ -23533,7 +23743,8 @@ local function updateQuestAutomation()
 		end
 	end
 
-	if incompleteSwimCount > 0 then
+	if incompleteSwimCount > 0
+		and not growQuestConcurrent then
 		state.questZoneDrinkRelease("zone_inactive")
 		state.questSwimActive = true
 		state.questTravelActive = false
@@ -23728,7 +23939,13 @@ local function updateQuestAutomation()
 	local incompleteTravelCount = 0
 	for _, quest in ipairs(quests) do
 		if isTravelQuestForAutoRun(quest.props)
-			and not state.questGroup.questComplete(quest) then
+			and not state.questGroup.questComplete(quest)
+			and (
+				not growQuestConcurrent
+				or state.questAllowedDuringAutoGrow(
+					quest
+				)
+			) then
 
 			incompleteTravelCount += 1
 			questTravelWanted = true
@@ -23767,7 +23984,10 @@ local function updateQuestAutomation()
 
 	-- Feeding may temporarily move any animal away from an active ZoneTime
 	-- mission. Once survival is stable, return there BEFORE other quest routing.
-	if state.questReturnToZoneAfterFeeding(quests) then
+	if not growQuestConcurrent
+		and state.questReturnToZoneAfterFeeding(
+			quests
+		) then
 		return
 	end
 
@@ -23782,7 +24002,13 @@ local function updateQuestAutomation()
 		-- Anything our terrestrial Auto Run handles counts here.
 		-- Swim-only quests intentionally do NOT block flying animals.
 		if isTravelQuestForAutoRun(quest.props)
-			and not state.questGroup.questComplete(quest) then
+			and not state.questGroup.questComplete(quest)
+			and (
+				not growQuestConcurrent
+				or state.questAllowedDuringAutoGrow(
+					quest
+				)
+			) then
 			state.questPendingLandCount += 1
 		end
 	end
@@ -24018,7 +24244,9 @@ local function updateQuestAutomation()
 	state.questFlyingDeferred = false
 
 	for _, quest in ipairs(quests) do
-		if not state.questGroup.questComplete(quest) then
+		if not growQuestConcurrent
+			and not state.questGroup.questComplete(quest) then
+
 			local targetAnimal = findSpecificAnimalTarget(quest, records)
 
 			if targetAnimal then
@@ -24072,7 +24300,11 @@ local function updateQuestAutomation()
 	-- Growth policy runs BEFORE a specific-animal switch. This guarantees that a
 	-- mature Baboon/Elephant/etc. can never steal priority from ANY existing
 	-- <100% slot just because a PlayTime quest also exists.
-	if state.questHasIncompleteGrowth(quests) then
+	if not growQuestConcurrent
+		and state.questHasIncompleteGrowth(
+			quests
+		) then
+
 		if trySwitchToGrowingSlot(
 			quests,
 			records,
@@ -24086,7 +24318,8 @@ local function updateQuestAutomation()
 		end
 	end
 
-	if focusQuest
+	if not growQuestConcurrent
+		and focusQuest
 		and focusAnimal
 		and not state.questGrowthReset.active
 		and not state.questGrowthOwnsCurrent then
@@ -24147,8 +24380,11 @@ local function updateQuestAutomation()
 			and not state.questGroup.questComplete(quest) then
 
 			local allowGroupAnimalSwitch =
-				not specificAnimalFocus
-				or state.questGrowthOwnsCurrent
+				not growQuestConcurrent
+				and (
+					not specificAnimalFocus
+						or state.questGrowthOwnsCurrent
+				)
 
 			-- IMPORTANT v71:
 			-- Ensure FIRST. The previous order asked whether a "real possibility"
@@ -24250,7 +24486,8 @@ local function updateQuestAutomation()
 	local zoneQuestTitle
 	local bestZoneRatio = -1
 	for _, quest in ipairs(quests) do
-		if quest.props.QuestType == "ZoneTime" then
+		if not growQuestConcurrent
+			and quest.props.QuestType == "ZoneTime" then
 			local targetZone = findZoneInQuest(quest)
 			if targetZone then
 				local ratio = progressRatio(quest)
@@ -25959,11 +26196,15 @@ local function growthStep()
 	elseif state.growNew then
 		local totalSlots = #savedCharacters()
 		if totalSlots >= state.growthTopUp.maxSlots then
-			runtimeMessage = "Limite de " .. state.growthTopUp.maxSlots .. " slots atingido; ativando Farm Coins"
 			state.growExisting, state.growNew = false, false
 			state.growExistingAutomaticAll = false
 			state.growAllSlots = false
-			state.farmCoins = true
+			state.farmCoins = not state.autoQuests
+
+			runtimeMessage = state.autoQuests
+				and ("Limite de " .. state.growthTopUp.maxSlots .. " slots atingido; Auto Quests continua")
+				or ("Limite de " .. state.growthTopUp.maxSlots .. " slots atingido; ativando Farm Coins")
+
 			if previousEntry then spawnSlot(previousEntry, true) end
 		else
 			runtimeMessage = "Criando novo slot"
@@ -26003,7 +26244,12 @@ local function growthStep()
 		state.growAllSlots = false
 		state.growNew = false
 		state.growExistingAutomaticAll = false
-		state.farmCoins = true
+		state.farmCoins = not state.autoQuests
+
+		if state.autoQuests then
+			questStatusText = "Auto Grow complete; Auto Quests continues"
+			runtimeMessage = "Auto Grow complete: Auto Quests stays active; AFK Coin not started"
+		end
 	end
 	state.applySurvivalDefaults(
 		false
@@ -27179,21 +27425,47 @@ local function toggle(parent, label, key, order)
 		) and state[key] then
 			state.questPostGrowAll = false
 			state.growExistingAutomaticAll = false
-			state.farmCoins, state.autoQuests = false, false
+			state.farmCoins = false
+
+			if state.autoQuests then
+				state.questZonePriority.active = false
+				state.questZonePriority.zone = nil
+				state.questZonePriority.resolved = true
+				state.questClearReturnZone()
+				questTargetZoneName = nil
+				state.questSwimActive = false
+				state.questSwimReady = false
+				removeSwimBarrier()
+
+				questStatusText = "Auto Grow + Auto Quests: Run/Group parallel"
+				runtimeMessage = "Parallel mode: Local/Swim/specific-animal quests ignored"
+			end
+
 		elseif key == "autoQuests" and state[key] then
+			local alreadyGrowing = state.autoGrowModeActive()
+
 			state.questZonePriority.active = false
 			state.questZonePriority.zone = nil
-			state.questZonePriority.resolved = false
-			state.questPostGrowAll = false
-			state.growExistingAutomaticAll = false
-			state.growAllSlots = false
+			state.questZonePriority.resolved = alreadyGrowing == true
 			state.questSeenAny = false
 			state.questEmptyScans = 0
 			state.questGroup.difficultySince = nil
-			state.farmCoins, state.growExisting, state.growNew = false, false, false
+			state.farmCoins = false
 			state.applySurvivalDefaults(true)
-			questStatusText = "Scanning Daily + Weekly quests"
-			runtimeMessage = "Auto Quests active"
+
+			if alreadyGrowing then
+				state.questClearReturnZone()
+				questTargetZoneName = nil
+				state.questSwimActive = false
+				state.questSwimReady = false
+				removeSwimBarrier()
+				questStatusText = "Auto Grow + Auto Quests: Run/Group parallel"
+				runtimeMessage = "Auto Quests joined Auto Grow: Local/Swim/specific-animal quests ignored"
+			else
+				state.questPostGrowAll = false
+				questStatusText = "Scanning Daily + Weekly quests"
+				runtimeMessage = "Auto Quests active"
+			end
 		elseif key == "autoQuests" and not state[key] then
 			state.questZonePriority.active = false
 			state.questZonePriority.zone = nil
