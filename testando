@@ -11940,7 +11940,10 @@ function state.findNearbyMainWaterBankTarget(
 				workspace:Raycast(
 					Vector3.new(
 						candidateXZ.X,
-						waterTopY + 28,
+						math.max(
+							info.topY,
+							root.Position.Y
+						) + 28,
 						candidateXZ.Z
 					),
 					Vector3.new(
@@ -12308,12 +12311,28 @@ function state.aquaticRiverInfinityFlyExit(
 		return false
 	end
 
-	local target =
-		state.findNearbyMainWaterBankTarget(
-			character,
-			root,
-			_preferredTarget
-		)
+	local target
+	local targetOk,
+		targetResult =
+			pcall(
+				state.findNearbyMainWaterBankTarget,
+				character,
+				root,
+				_preferredTarget
+			)
+
+	if not targetOk then
+		runtimeMessage =
+			"Aquatic bank scan error: "
+			.. tostring(
+				targetResult
+			)
+
+		return false
+	end
+
+	target =
+		targetResult
 
 	if typeof(target) ~= "Vector3" then
 		runtimeMessage =
@@ -12444,6 +12463,19 @@ function state.aquaticRiverInfinityFlyExit(
 	fly.bodyGyro = BG
 	fly.bodyPosition = BP
 	fly.bodyVelocity = nil
+
+	runtimeMessage =
+		CROC.isCharacter(
+			character
+		)
+			and string.format(
+				"Croc water position-control START · bank %.0f studs",
+				(target - root.Position).Magnitude
+			)
+			or string.format(
+				"Hippo water position-control START · bank %.0f studs",
+				(target - root.Position).Magnitude
+			)
 
 	pcall(function()
 		humanoid.PlatformStand = true
