@@ -79,6 +79,10 @@ local state = {
 	coinFarmSwitching = false,
 	coinFarmSwitchReason = nil,
 	coinFarmRetryAt = 0,
+
+	coinFarmAllowAutoQuests =
+		resumeState.coinFarmAllowAutoQuests == true,
+
 	autoQuests =
 		resumeState.autoQuests == true,
 
@@ -151,6 +155,15 @@ local state = {
 	-- `center` is the known Pride Rock quest-zone coordinate.
 	-- `home` is the existing safe farm point inside Pride Rock, close to the
 	-- slot/reset area. Food candidates use a slightly tighter radius.
+	growthPrideEnabled =
+		resumeState.growthPrideEnabled ~= false,
+
+	questZonePriority = {
+		active = false,
+		zone = nil,
+		resolved = resumeState.autoQuests ~= true,
+	},
+
 	growthPride = {
 		center = Vector3.new(-6124.87, -4.29, 4454.70),
 		home = Vector3.new(-6245.2, 10, 4664.3),
@@ -652,7 +665,108 @@ function state.isGrowthHerbivore(character)
 	return true
 end
 
+function state.questZonePriorityActive()
+	local zoneState = state.questZonePriority
+
+	return state.autoQuests
+		and zoneState
+		and zoneState.resolved == true
+		and zoneState.active == true
+		and type(zoneState.zone) == "string"
+		and zoneState.zone ~= ""
+end
+
+function state.positionInsideMapZone(position, zoneName)
+	if typeof(position) ~= "Vector3"
+		or type(zoneName) ~= "string"
+		or zoneName == "" then
+		return nil
+	end
+
+	local mapZones =
+		workspace:FindFirstChild(
+			"MapZones"
+		)
+
+	local zoneModel =
+		mapZones
+		and mapZones:FindFirstChild(
+			zoneName
+		)
+
+	if not zoneModel then
+		return nil
+	end
+
+	local foundVolume = false
+	local zoneParts = {}
+
+	if zoneModel:IsA("BasePart") then
+		table.insert(zoneParts, zoneModel)
+	end
+
+	for _, object in ipairs(
+		zoneModel:GetDescendants()
+	) do
+		if object:IsA("BasePart") then
+			table.insert(zoneParts, object)
+		end
+	end
+
+	for _, object in ipairs(zoneParts) do
+		foundVolume = true
+
+		local localPoint =
+			object.CFrame:PointToObjectSpace(
+				position
+			)
+
+		if math.abs(localPoint.X)
+			<= object.Size.X * 0.5 + 3
+			and math.abs(localPoint.Z)
+				<= object.Size.Z * 0.5 + 3 then
+			return true
+		end
+	end
+
+	if foundVolume then
+		return false
+	end
+
+	return nil
+end
+
+function state.questZoneFoodPositionAllowed(position)
+	if not state.questZonePriorityActive() then
+		return true
+	end
+
+	local inside =
+		state.positionInsideMapZone(
+			position,
+			state.questZonePriority.zone
+		)
+
+	-- No exposed zone volume: don't risk starvation.
+	if inside == nil then
+		return true
+	end
+
+	return inside
+end
+
 function state.growthPrideRestrictionActive(character)
+	-- ZoneTime always outranks the normal Growth home.
+	if not state.growthPrideEnabled
+		or (
+			state.autoQuests
+			and state.questZonePriority
+			and state.questZonePriority.resolved == false
+		)
+		or state.questZonePriorityActive() then
+		return false
+	end
+
 	return isSavannahLife
 		and state.growthModeActive()
 		and state.isGrowthHerbivore(character)
@@ -773,11 +887,38 @@ function state.growthPrideFoodPositionAllowed(position)
 	) <= state.growthPride.foodRadius
 end
 
+function state.autoFoodPositionAllowed(position)
+	local character =
+		player.Character
+
+	-- Zone-local food restriction applies only to herbivores (including
+	-- Giraffe). Carnivores/Baboon may still leave briefly for their valid food
+	-- source; quest movement remains paused until feeding finishes.
+	if state.questZonePriorityActive()
+		and state.isGrowthHerbivore(
+			character
+		) then
+
+		return state.questZoneFoodPositionAllowed(
+			position
+		)
+	end
+
+	return state.growthPrideFoodPositionAllowed(
+		position
+	)
+end
+
 local AskSubState = ReplicatedStorage:FindFirstChild("AskServerToSetSubStateRemoteFunction")
 local SpawnRemote = ReplicatedStorage:WaitForChild("SpawnAsCharacterRemoteFunction", 15)
 local ResetRemote = ReplicatedStorage:WaitForChild("CustomCharacterResetRemoteFunction", 15)
 local CreateRemote = ReplicatedStorage:WaitForChild("CreateNewCharacterRemoteFunction", 15)
 local ClaimQuestRemote = ReplicatedStorage:WaitForChild("ClaimQuestRemoteFunction", 15)
+local PlayerDamageSelfRemote =
+	ReplicatedStorage:FindFirstChild(
+		"PlayerDamageSelfRemoteEvent",
+		true
+	)
 local QuestsStorage
 pcall(function()
 	local sharedFolder = ReplicatedStorage:WaitForChild("Shared", 10)
@@ -804,9 +945,34 @@ local originalNamecall
 if AskSubState and type(hookmetamethod) == "function" and type(checkcaller) == "function" then
 	pcall(function()
 		originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-			if blockClientSubState and self == AskSubState and not checkcaller() then
-				return true
+			if not checkcaller() then
+				if blockClientSubState
+					and self == AskSubState then
+					return true
+				end
+
+				-- FallDamageHandler and Oxygen use the same self-damage remote.
+				-- Block both only during the controlled underground transaction.
+				local selfDamageRemote =
+					(
+						PlayerDamageSelfRemote
+						and self == PlayerDamageSelfRemote
+					)
+					or (
+						typeof(self) == "Instance"
+						and self.Name == "PlayerDamageSelfRemoteEvent"
+						and self:IsDescendantOf(
+							ReplicatedStorage
+						)
+					)
+
+				if selfDamageRemote
+					and state.drinkTest
+					and state.drinkTest.selfDamageGuard == true then
+					return nil
+				end
 			end
+
 			return originalNamecall(self, ...)
 		end)
 	end)
@@ -1534,9 +1700,6 @@ function state.adjustMovementAcceleration(character, value)
 		return nil
 	end
 
-	-- v74:
-	-- Flying animals are unstable when pushed at the raw Acceleration value.
-	-- Their automation speed ceiling is exactly 50% of the displayed value.
 	if state.isFlyingMovementCharacter(character) then
 		return value * 0.50
 	end
@@ -1544,33 +1707,155 @@ function state.adjustMovementAcceleration(character, value)
 	return value
 end
 
-function state.safeMovementSpeed(character)
-	local model =
-		workspace:FindFirstChild(player.Name)
+function state.movementGrowthRatio(character)
+	if not character then return 1 end
 
-	local acceleration =
-		model and model:GetAttribute("Acceleration")
-
-	if acceleration == nil and character then
-		acceleration =
-			character:GetAttribute("Acceleration")
-	end
-
-	acceleration =
-		state.adjustMovementAcceleration(
-			character,
-			acceleration
+	local growth =
+		tonumber(
+			character:GetAttribute(
+				"GrowthPercentage"
+			)
 		)
 
-	if not acceleration then
-		-- Keep the same proportional fallback when the attribute has not
-		-- replicated yet.
-		return state.isFlyingMovementCharacter(character)
-			and 25
-			or 50
+	if growth == nil then
+		return 1
 	end
 
-	return acceleration
+	if growth > 1 then
+		growth /= 100
+	end
+
+	return math.clamp(growth, 0, 1)
+end
+
+function state.rawMovementAcceleration(character)
+	character = character or player.Character
+
+	local candidates = {}
+
+	local function add(value)
+		value = tonumber(value)
+		if value and value > 0 then
+			table.insert(candidates, value)
+		end
+	end
+
+	if character then
+		add(
+			character:GetAttribute(
+				"Acceleration"
+			)
+		)
+	end
+
+	local model =
+		workspace:FindFirstChild(
+			player.Name
+		)
+
+	if model and model ~= character then
+		add(
+			model:GetAttribute(
+				"Acceleration"
+			)
+		)
+	end
+
+	if #candidates == 0 then
+		return nil
+	end
+
+	-- After a slot reset one replication source can briefly keep the adult
+	-- Acceleration. The lower live value is always the safer current ceiling.
+	local acceleration = candidates[1]
+	for index = 2, #candidates do
+		acceleration =
+			math.min(
+				acceleration,
+				candidates[index]
+			)
+	end
+
+	return state.adjustMovementAcceleration(
+		character,
+		acceleration
+	)
+end
+
+function state.dynamicMovementSpeed(character, mode)
+	character = character or player.Character
+
+	local acceleration =
+		state.rawMovementAcceleration(
+			character
+		)
+
+	local growth =
+		state.movementGrowthRatio(
+			character
+		)
+
+	local growthScale =
+		0.30 + 0.70 * growth
+
+	local modeScale =
+		mode == "Swimming"
+			and 0.82
+			or 1.00
+
+	if acceleration
+		and acceleration > 0 then
+
+		-- Acceleration is treated as a ceiling, never copied directly to speed.
+		-- This is recalculated continuously, so a baby speeds up as it grows.
+		local target =
+			acceleration
+			* growthScale
+			* modeScale
+			* 0.90
+
+		return math.min(
+			target,
+			acceleration * 0.92
+		),
+			acceleration,
+			growth
+	end
+
+	-- Conservative fallback while the new slot's attributes replicate.
+	local humanoid =
+		character
+		and character:FindFirstChildOfClass(
+			"Humanoid"
+		)
+
+	local fallback =
+		humanoid
+		and tonumber(humanoid.WalkSpeed)
+		or (
+			state.isFlyingMovementCharacter(character)
+				and 12
+				or 16
+		)
+
+	fallback = math.max(1, fallback)
+
+	return fallback
+		* growthScale
+		* modeScale
+		* 0.90,
+		0,
+		growth
+end
+
+function state.safeMovementSpeed(character)
+	local speed =
+		state.dynamicMovementSpeed(
+			character,
+			"Land"
+		)
+
+	return math.max(1, speed)
 end
 
 function state.safeNudgeToward(root, targetPosition, speedScale)
@@ -1694,7 +1979,62 @@ state.drinkTest = state.drinkTest or {
 	transitLastY = nil,
 	transitLastYAt = 0,
 	hardExitBusy = false,
+
+	selfDamageGuard = false,
+	fallDamageConfig = nil,
+	fallDamageConfigOld = nil,
 }
+
+function state.drinkTestEnableSelfDamageGuard(character)
+	local test = state.drinkTest
+
+	test.selfDamageGuard = true
+	test.fallDamageConfig = nil
+	test.fallDamageConfigOld = nil
+
+	if not character or not AnimalConfig then
+		return
+	end
+
+	local animalType =
+		character:GetAttribute(
+			"AnimalType"
+		)
+
+	local animalName =
+		character:GetAttribute(
+			"AnimalName"
+		)
+
+	local configForAnimal =
+		animalType
+			and animalName
+			and AnimalConfig[animalType]
+			and AnimalConfig[animalType][animalName]
+
+	if type(configForAnimal) == "table" then
+		test.fallDamageConfig = configForAnimal
+		test.fallDamageConfigOld =
+			configForAnimal.DisableFallDamage
+
+		configForAnimal.DisableFallDamage = true
+	end
+end
+
+function state.drinkTestDisableSelfDamageGuard()
+	local test = state.drinkTest
+
+	if test.fallDamageConfig then
+		pcall(function()
+			test.fallDamageConfig.DisableFallDamage =
+				test.fallDamageConfigOld
+		end)
+	end
+
+	test.fallDamageConfig = nil
+	test.fallDamageConfigOld = nil
+	test.selfDamageGuard = false
+end
 
 function state.drinkProgressReset()
 	local data = state.drinkProgress
@@ -2094,7 +2434,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		and state.growthPrideRestrictionActive(
 			player.Character
 		)
-		and not state.growthPrideFoodPositionAllowed(
+		and not state.autoFoodPositionAllowed(
 			position
 		) then
 
@@ -4919,7 +5259,7 @@ function state.grassCandidateVerified(
 			0
 	end
 
-	if not state.growthPrideFoodPositionAllowed(
+	if not state.autoFoodPositionAllowed(
 		position
 	) then
 		return false,
@@ -6415,7 +6755,7 @@ local function nearestGiraffeTree(root)
 			and not info.depleted
 			and leafPart
 			and approach
-			and state.growthPrideFoodPositionAllowed(
+			and state.autoFoodPositionAllowed(
 				approach.ground
 			) then
 			GIRAFFE.targetLeaves = info.leaves
@@ -6460,7 +6800,7 @@ local function nearestGiraffeTree(root)
 				and not info.depleted
 				and leafPart
 				and approach
-				and state.growthPrideFoodPositionAllowed(
+				and state.autoFoodPositionAllowed(
 					approach.ground
 				) then
 
@@ -10425,7 +10765,7 @@ function state.drinkTestFindLocalSpot(origin, character)
 		return nil
 	end
 
-	local _, _, humanoid =
+	local _, root, humanoid =
 		characterParts()
 
 	local lift =
@@ -10435,6 +10775,49 @@ function state.drinkTestFindLocalSpot(origin, character)
 				1.5
 			)
 			or 2.5
+
+	local head =
+		character:FindFirstChild(
+			"Head"
+		)
+
+	local headOffset =
+		root
+			and head
+			and math.max(
+				0,
+				head.Position.Y - root.Position.Y
+			)
+			or 0
+
+	local bodyHeight =
+		state.movementBodySize(
+			character
+		).Y
+
+	-- A single stable depth based on the current body. Elephant needs a much
+	-- deeper HRP than the old fixed -3 studs before Drinking is accepted.
+	local drinkDepth =
+		math.clamp(
+			math.max(
+				3.5,
+				headOffset + 1.25,
+				bodyHeight * 0.22
+			),
+			3.5,
+			14
+		)
+
+	local waterBottomY =
+		waterPart.Position.Y
+		- waterPart.Size.Y * 0.5
+
+	local undergroundStandY =
+		math.max(
+			waterY - drinkDepth,
+			config.dangerY + 12,
+			waterBottomY + 3
+		)
 
 	-- v98: the old minimum could leave the HRP only ~2 studs under Terrain.
 	-- drinkIsBuriedUnderTerrain requires >=4 studs of actual cover, so keep a
@@ -10499,7 +10882,9 @@ function state.drinkTestFindLocalSpot(origin, character)
 						- waterY
 
 					if cover >= minimumCover
-						and cover <= maximumCover then
+						and cover <= maximumCover
+						and undergroundStandY
+							>= config.dangerY + 12 then
 
 						-- Favor local X/Z strongly; cover depth is secondary.
 						local score =
@@ -10517,12 +10902,11 @@ function state.drinkTestFindLocalSpot(origin, character)
 										z
 									),
 
-								-- Old working behavior put land animals about
-								-- 3 studs BELOW the water surface.
+								-- Stable current-body depth; no shoreline micro-adjust loop.
 								stand =
 									Vector3.new(
 										x,
-										waterY - 3,
+										undergroundStandY,
 										z
 									),
 
@@ -12083,6 +12467,8 @@ function state.drinkTestRestoreEnvironment()
 	test.emergencyFallback = false
 	test.hardExitBusy = false
 
+	state.drinkTestDisableSelfDamageGuard()
+
 	-- Never leave the normal Savannah sub-state remote blocked after a drink
 	-- transaction. A stale block can prevent later Eat/Drink sessions.
 	blockClientSubState = false
@@ -12491,6 +12877,13 @@ function state.runUndergroundDrinkTest()
 	criticalRecoveryActive = true
 	blockClientSubState = false
 
+	-- Enable before the first Y displacement so FallDamageHandler never records
+	-- the scripted Terrain crossing as a real fall. The same scoped guard also
+	-- prevents Oxygen self-damage while intentionally below Terrain.
+	state.drinkTestEnableSelfDamageGuard(
+		character
+	)
+
 	state.drinkTestRender()
 
 	local ok, failure =
@@ -12689,6 +13082,13 @@ function state.runUndergroundDrinkTest()
 				local lastRemoteAt = 0
 				local progressConfirmed = false
 
+				local initialProgressGrace =
+					state.isHeavyGroundMover(
+						character
+					)
+						and 12
+						or 8
+
 				-- Keep a safety reserve for surfacing. The animal is never allowed
 				-- to spend the full 90-second ceiling waiting below Terrain.
 				local hardSafetyDeadline =
@@ -12838,10 +13238,13 @@ function state.runUndergroundDrinkTest()
 
 					if not progressConfirmed
 						and now - drinkStartedAt
-							>= 4.5 then
+							>= initialProgressGrace then
 
 						error(
-							"underground Drink remote produced no Water progress within 4.5s"
+							string.format(
+								"underground Drink produced no Water progress within %.0fs",
+								initialProgressGrace
+							)
 						)
 					end
 
@@ -20635,6 +21038,9 @@ local function updateQuestAutomation()
 	end
 
 	if not state.autoQuests then
+		state.questZonePriority.active = false
+		state.questZonePriority.zone = nil
+		state.questZonePriority.resolved = true
 		state.questZoneDrinkRelease("zone_inactive")
 		state.questTravelHerbivoreFeed.active = false
 		questTargetZoneName = nil
@@ -20661,6 +21067,72 @@ local function updateQuestAutomation()
 			if renders.autoEat then renders.autoEat() end
 			if renders.autoDrink then renders.autoDrink() end
 		end
+	end
+
+	-- Acquire feeding ownership BEFORE quest routing can switch animal/group/zone.
+	-- This prevents the first frame of a low-food carnivore/Giraffe/Baboon from
+	-- starting another quest transaction before Auto Eat gets its next 1s tick.
+	local earlyFood =
+		tonumber(
+			character:GetAttribute(
+				"Food"
+			)
+		) or 100
+
+	if state.autoEat
+		and not preSwitchFoodTarget
+		and earlyFood <= 70 then
+
+		if isGiraffeCharacter(character) then
+			state.questGiraffeFeeding = true
+			eatingToFull = true
+		elseif isBaboonCharacter(character) then
+			state.questBaboonFeeding = true
+			eatingToFull = true
+		elseif isCarnivoreCharacter(character) then
+			state.questCarnivoreFeeding = true
+			eatingToFull = true
+		end
+	end
+
+	-- Food/Water owns the character exclusively. Opportunistic remote eating/
+	-- drinking during an Auto Run circle does not set these ownership flags.
+	local survivalOwnsQuestControl =
+		drinkingToFull
+		or eatingToFull
+		or carcassEatBusy
+		or CROC.approachBusy
+		or BABOON.busy
+		or GIRAFFE.busy
+		or state.questCarnivoreFeeding
+		or state.questBaboonFeeding
+		or state.questGiraffeFeeding
+		or forcingPostDrinkMove
+		or criticalRecoveryActive
+		or DAMAGE.active
+
+	if survivalOwnsQuestControl then
+		questTravelWanted = false
+		state.questTravelActive = false
+		state.questLandInputActive = false
+		state.questMotionMoving = false
+		state.questMotionMode = nil
+		state.questSetW(false)
+
+		questStatusText =
+			drinkingToFull
+				and "Paused: drinking"
+			or state.questCarnivoreFeeding
+				and "Paused: carnivore feeding"
+			or state.questGiraffeFeeding
+				and "Paused: Giraffe feeding"
+			or state.questBaboonFeeding
+				and "Paused: Baboon feeding"
+			or eatingToFull
+				and "Paused: eating"
+			or "Paused: survival controller"
+
+		return
 	end
 
 	local quests = getAllQuests()
@@ -21631,6 +22103,29 @@ local function updateQuestAutomation()
 		end
 	end
 
+	state.questZonePriority.resolved = true
+	state.questZonePriority.active =
+		type(questTargetZoneName) == "string"
+		and questTargetZoneName ~= ""
+	state.questZonePriority.zone =
+		state.questZonePriority.active
+		and questTargetZoneName
+		or nil
+
+	if state.questZonePriority.active
+		and state.safeMove
+		and state.safeMove.active
+		and state.safeMove.reason == "growth_home" then
+
+		state.safeMove.cancelToken += 1
+		state.growthPride.returning = false
+		state.growthPride.returnRequested = false
+		state.releaseMovementNow(
+			player.Character,
+			true
+		)
+	end
+
 	local passiveSurviveTitle
 	for _, quest in ipairs(quests) do
 		local data = quest.props and quest.props.QuestData
@@ -22296,41 +22791,15 @@ local function getQuestMoveSpeed(character)
 end
 
 function state.questGetAcceleration(character)
-	local model =
-		workspace:FindFirstChild(player.Name)
-
-	local value =
-		model and model:GetAttribute("Acceleration")
-
-	if value == nil and character then
-		value =
-			character:GetAttribute("Acceleration")
-	end
-
-	value =
-		state.adjustMovementAcceleration(
-			character,
-			value
-		)
-
-	if not value then
-		return 0
-	end
-
-	return value
+	return state.rawMovementAcceleration(
+		character
+	) or 0
 end
 
 function state.questGetGrowthRatio(character)
-	if not character then return 1 end
-
-	local growth = tonumber(character:GetAttribute("GrowthPercentage"))
-	if growth == nil then return 1 end
-
-	if growth > 1 then
-		growth /= 100
-	end
-
-	return math.clamp(growth, 0, 1)
+	return state.movementGrowthRatio(
+		character
+	)
 end
 
 function state.questMotionCalibrationKey(character, mode)
@@ -22349,38 +22818,15 @@ function state.questMotionCalibrationKey(character, mode)
 end
 
 function state.questGetTargetMoveSpeed(character, mode)
-	local acceleration = state.questGetAcceleration(character)
-	local growth = state.questGetGrowthRatio(character)
+	local target, acceleration, growth =
+		state.dynamicMovementSpeed(
+			character,
+			mode
+		)
 
-	if acceleration <= 0 then
-		-- Fallback only while the attribute has not replicated.
-		local fallback =
-			mode == "Swimming" and 12 or 16
-
-		if state.isFlyingMovementCharacter(character) then
-			fallback *= 0.50
-		end
-
-		return fallback, acceleration, growth
-	end
-
-	-- O erro antigo foi usar Acceleration puro como velocidade.
-	-- O jogo também reduz movimento conforme o crescimento.
-	--
-	-- Escala conservadora:
-	--   0%   -> 30% da capacidade
-	--   50%  -> 65%
-	--   100% -> 100%
-	--
-	-- Depois usamos 92% disso para não encostar no limitador.
-	local growthScale = 0.30 + (0.70 * growth)
-	local modeScale = mode == "Swimming" and 0.82 or 1.00
-	local target = acceleration * growthScale * modeScale * 0.92
-
-	-- Nunca deixa um filhote completamente parado caso Acceleration seja baixo.
-	target = math.max(target, mode == "Swimming" and 7 or 9)
-
-	return target, acceleration, growth
+	return math.max(1, target),
+		acceleration,
+		growth
 end
 
 function state.questUpdateMotionTarget(character, root, mode)
@@ -22782,6 +23228,18 @@ function state.growthPrideReturnStep()
 	if not state.growthPrideRestrictionActive(
 		character
 	) then
+		if state.growthPride.returning
+			and state.safeMove
+			and state.safeMove.active
+			and state.safeMove.reason == "growth_home" then
+
+			state.safeMove.cancelToken += 1
+			state.releaseMovementNow(
+				character,
+				true
+			)
+		end
+
 		state.growthPride.returning = false
 		state.growthPride.returnRequested = false
 		return
@@ -24124,6 +24582,14 @@ local function toggle(parent, label, key, order)
 				or 12
 		end
 
+		if key == "coinFarmAllowAutoQuests"
+			or key == "growthPrideEnabled" then
+			labelText.TextSize =
+				UserInputService.TouchEnabled
+					and 9
+					or 10
+		end
+
 		labelText.TextColor3 = on and COLOR_ACCENT or COLOR_TEXT
 		TweenService:Create(track, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
 			BackgroundColor3 = on and COLOR_ACCENT or Color3.fromRGB(50, 27, 44),
@@ -24216,6 +24682,30 @@ local function toggle(parent, label, key, order)
 			state.growAllSlots = false
 		end
 
+		if key == "growthPrideEnabled" then
+			if not state[key] then
+				state.growthPride.returnRequested = false
+				state.growthPride.returning = false
+
+				if state.safeMove
+					and state.safeMove.active
+					and state.safeMove.reason == "growth_home" then
+					state.safeMove.cancelToken += 1
+				end
+
+				state.releaseMovementNow(
+					player.Character,
+					true
+				)
+
+				runtimeMessage =
+					"Pride Rock Growth home disabled by player"
+			else
+				runtimeMessage =
+					"Pride Rock Growth home enabled (recommended)"
+			end
+		end
+
 		if key == "farmCoins" and state[key] then
 			state.questPostGrowAll = false
 			state.growExistingAutomaticAll = false
@@ -24237,6 +24727,9 @@ local function toggle(parent, label, key, order)
 			state.growExistingAutomaticAll = false
 			state.farmCoins, state.autoQuests = false, false
 		elseif key == "autoQuests" and state[key] then
+			state.questZonePriority.active = false
+			state.questZonePriority.zone = nil
+			state.questZonePriority.resolved = false
 			state.questPostGrowAll = false
 			state.growExistingAutomaticAll = false
 			state.growAllSlots = false
@@ -24248,6 +24741,9 @@ local function toggle(parent, label, key, order)
 			questStatusText = "Scanning Daily + Weekly quests"
 			runtimeMessage = "Auto Quests active"
 		elseif key == "autoQuests" and not state[key] then
+			state.questZonePriority.active = false
+			state.questZonePriority.zone = nil
+			state.questZonePriority.resolved = true
 			state.questClearReturnZone()
 			questTravelWanted = false
 			state.questTravelActive = false
@@ -24263,7 +24759,8 @@ local function toggle(parent, label, key, order)
 			questStatusText = state[key] and "Auto Claim active" or "Ready"
 		end
 		for _, changedKey in ipairs({
-			key, "farmCoins", "growExisting", "growAllSlots", "growNew",
+			key, "farmCoins", "coinFarmAllowAutoQuests",
+			"growExisting", "growAllSlots", "growNew", "growthPrideEnabled",
 			"autoQuests", "autoClaimQuests", "autoEat", "autoDrink"
 		}) do
 			if renders[changedKey] then renders[changedKey]() end
@@ -24808,9 +25305,16 @@ toggle(
 	8
 )
 
+toggle(
+	tabContents.Survival,
+	"Allow Auto Quests to start automatically",
+	"coinFarmAllowAutoQuests",
+	9
+)
+
 coinFarmAnimalSelector(
 	tabContents.Survival,
-	9
+	10
 )
 
 -- ============================================================
@@ -24820,11 +25324,29 @@ sectionLabel(tabContents.Growth, "GROWTH MODE", 0)
 toggle(tabContents.Growth, "Grow Existing Slots", "growExisting", 1)
 toggle(tabContents.Growth, "Grow All Slots", "growAllSlots", 2)
 toggle(tabContents.Growth, "Grow New Slots", "growNew", 3)
+toggle(
+	tabContents.Growth,
+	"Keep herbivore Growth at Pride Rock (Recommended)",
+	"growthPrideEnabled",
+	4
+)
 
-sectionLabel(tabContents.Growth, "NEW SLOT GENDER", 4)
+local prideGrowthNote = Instance.new("TextLabel")
+prideGrowthNote.Size = UDim2.new(1, 0, 0, 30)
+prideGrowthNote.LayoutOrder = 5
+prideGrowthNote.BackgroundTransparency = 1
+prideGrowthNote.Font = FONT_BODY
+prideGrowthNote.Text = "Recommended: safer farming near the slot-reset point. Zone quests always override this option."
+prideGrowthNote.TextColor3 = COLOR_SUBTEXT
+prideGrowthNote.TextSize = 9
+prideGrowthNote.TextWrapped = true
+prideGrowthNote.TextXAlignment = Enum.TextXAlignment.Left
+prideGrowthNote.Parent = tabContents.Growth
+
+sectionLabel(tabContents.Growth, "NEW SLOT GENDER", 6)
 local genderRow = Instance.new("Frame")
 genderRow.Size = UDim2.new(1, 0, 0, 32)
-genderRow.LayoutOrder = 5
+genderRow.LayoutOrder = 7
 genderRow.BackgroundTransparency = 1
 genderRow.Parent = tabContents.Growth
 local genderLayout = Instance.new("UIListLayout", genderRow)
@@ -24860,7 +25382,7 @@ renderGender()
 
 local genderNote = Instance.new("TextLabel")
 genderNote.Size = UDim2.new(1, 0, 0, 28)
-genderNote.LayoutOrder = 5
+genderNote.LayoutOrder = 8
 genderNote.BackgroundTransparency = 1
 genderNote.Font = FONT_BODY
 genderNote.Text = "Applies only to slots created by \"Grow New Slots\"."
@@ -25563,9 +26085,11 @@ end)
 task.spawn(function()
 	local lastClaimCheck = 0
 	while state.alive do
-		-- AFK Coin is also the idle watcher. If a fresh Daily/Weekly appears
-		-- while we are coin farming, switch back to Auto Quests automatically.
-		if state.farmCoins and not state.autoQuests then
+		-- Optional idle watcher. AFK Coin returns to Auto Quests only when the
+		-- player explicitly enabled "Allow Auto Quests to start automatically".
+		if state.farmCoins
+			and state.coinFarmAllowAutoQuests
+			and not state.autoQuests then
 			local coinQuests = getAllQuests()
 			local hasPending = state.questHasActionablePending(
 				coinQuests,
@@ -25582,6 +26106,9 @@ task.spawn(function()
 				state.questSeenAny = true
 				state.questEmptyScans = 0
 				state.autoQuests = true
+				state.questZonePriority.active = false
+				state.questZonePriority.zone = nil
+				state.questZonePriority.resolved = false
 				state.applySurvivalDefaults(
 			false
 		)
@@ -28145,6 +28672,12 @@ shared.__uiRootCleanup = function()
 
 		autoDrinkPreferredMode =
 			state.autoDrinkPreferredMode,
+
+		coinFarmAllowAutoQuests =
+			state.coinFarmAllowAutoQuests == true,
+
+		growthPrideEnabled =
+			state.growthPrideEnabled ~= false,
 
 		autoEatManualDisabled = state.autoEatManualDisabled == true,
 		autoDrinkManualDisabled = state.autoDrinkManualDisabled == true,
