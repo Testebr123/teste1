@@ -209,7 +209,21 @@ local state = {
 	-- `home` is the existing safe farm point inside Pride Rock, close to the
 	-- slot/reset area. Food candidates use a slightly tighter radius.
 	growthPrideEnabled =
-		resumeState.growthPrideEnabled ~= false,
+		resumeState.growthPrideUserSet == true
+			and resumeState.growthPrideEnabled ~= false
+			or true,
+
+	-- New default policy: herbivores start with Pride Rock Growth ON.
+	-- Once the player changes the toggle manually, that preference is respected.
+	growthPrideUserSet =
+		resumeState.growthPrideUserSet == true,
+
+	-- Player-selected slot staging/reset location.
+	-- nil = use the map's existing recommended default.
+	resetSpawnFullName =
+		type(resumeState.resetSpawnFullName) == "string"
+			and resumeState.resetSpawnFullName
+			or nil,
 
 	questZonePriority = {
 		active = false,
@@ -416,6 +430,7 @@ local runtimeMessage = "Anti-AFK ativo"
 local criticalRecoveryActive
 local completionSpawnParts = {}
 local selectedMoveToSpawn
+local selectedResetSpawn
 local INFO = {}
 local DEATH_REPORT = {}
 local DAMAGE = {
@@ -466,6 +481,97 @@ table.insert(connections, player.Idled:Connect(function()
 	end)
 end))
 
+local function spawnLocationLabel(part)
+	if not part then
+		return "Unknown location"
+	end
+
+	local spawns =
+		workspace:FindFirstChild(
+			"Spawns"
+		)
+
+	local fullName =
+		part:GetFullName()
+
+	if spawns then
+		local marker =
+			spawns:GetFullName()
+				.. "."
+
+		fullName =
+			fullName:gsub(
+				"^"
+					.. marker:gsub(
+						"([%.%-])",
+						"%%%1"
+					),
+				""
+			)
+	end
+
+	return fullName
+end
+
+local function resolveResetSpawn()
+	if selectedResetSpawn
+		and selectedResetSpawn.Parent then
+
+		return selectedResetSpawn
+	end
+
+	selectedResetSpawn =
+		nil
+
+	local wanted =
+		state.resetSpawnFullName
+
+	if type(wanted)
+		~= "string"
+		or wanted == "" then
+
+		return nil
+	end
+
+	for _, part in ipairs(
+		completionSpawnParts
+	) do
+		if part
+			and part.Parent
+			and part:GetFullName()
+				== wanted then
+
+			selectedResetSpawn =
+				part
+
+			return part
+		end
+	end
+
+	return nil
+end
+
+local function setResetSpawn(part)
+	if part
+		and part:IsA(
+			"BasePart"
+		)
+		and part.Parent then
+
+		selectedResetSpawn =
+			part
+
+		state.resetSpawnFullName =
+			part:GetFullName()
+	else
+		selectedResetSpawn =
+			nil
+
+		state.resetSpawnFullName =
+			nil
+	end
+end
+
 local function refreshCompletionSpawns()
 	completionSpawnParts = {}
 	local spawns = workspace:FindFirstChild("Spawns")
@@ -476,6 +582,15 @@ local function refreshCompletionSpawns()
 	end
 	table.sort(completionSpawnParts, function(a, b) return a:GetFullName() < b:GetFullName() end)
 	if selectedMoveToSpawn and not selectedMoveToSpawn.Parent then selectedMoveToSpawn = nil end
+
+	if selectedResetSpawn
+		and not selectedResetSpawn.Parent then
+
+		selectedResetSpawn =
+			nil
+	end
+
+	resolveResetSpawn()
 end
 local function findAquaticNestRock()
 	-- No Dino Life, AquaticNestRock1/2 ficam na água e servem só de PASSAGEM
@@ -29135,7 +29250,22 @@ state.growthTopUp = state.growthTopUp or {
 }
 
 function state.slotSwitchTarget()
-	-- Same staging point used by Grow Slots.
+	-- A player-selected Reset Spawn has absolute priority for slot staging.
+	-- If no custom spawn is selected, preserve the existing recommended default.
+	refreshCompletionSpawns()
+
+	local customSpawn =
+		resolveResetSpawn()
+
+	if customSpawn
+		and customSpawn.Parent then
+
+		return customSpawn.Position,
+			spawnLocationLabel(
+				customSpawn
+			)
+	end
+
 	local spawnName =
 		isDinoLife
 			and "NestRock3"
@@ -29154,17 +29284,12 @@ function state.slotSwitchTarget()
 	local target =
 		namedSpawn
 			and namedSpawn.Position
-			or (
-				selectedMoveToSpawn
-				and selectedMoveToSpawn.Parent
-				and selectedMoveToSpawn.Position
-			)
 			or getSafeFarmPosition()
 
 	local label =
 		namedSpawn
 			and spawnName
-			or "slot switch point"
+			or "default slot switch point"
 
 	return target, label
 end
@@ -30981,9 +31106,15 @@ local function toggle(parent, label, key, order)
 	labelText.BackgroundTransparency = 1
 	labelText.Font = FONT_BUTTON
 	labelText.Text = label
-	labelText.TextSize = 12
+	labelText.TextSize =
+		UserInputService.TouchEnabled
+			and 12
+			or 13
 	labelText.TextColor3 = COLOR_TEXT
 	labelText.TextXAlignment = Enum.TextXAlignment.Left
+	labelText.TextYAlignment = Enum.TextYAlignment.Center
+	labelText.TextWrapped = true
+	labelText.LineHeight = 1.0
 	labelText.Parent = row
 
 	-- Switch de verdade (trilho + bolinha), em vez de um botão que só muda
@@ -31005,10 +31136,44 @@ local function toggle(parent, label, key, order)
 	knob.Parent = track
 	corner(knob, 8)
 
+	local disabledMark = Instance.new("TextLabel")
+	disabledMark.Size = UDim2.new(1, 0, 1, 0)
+	disabledMark.Position = UDim2.fromOffset(0, 0)
+	disabledMark.BackgroundTransparency = 1
+	disabledMark.Font = Enum.Font.GothamBlack
+	disabledMark.Text = "X"
+	disabledMark.TextSize = 12
+	disabledMark.TextColor3 = COLOR_ACCENT
+	disabledMark.TextXAlignment = Enum.TextXAlignment.Center
+	disabledMark.TextYAlignment = Enum.TextYAlignment.Center
+	disabledMark.Visible = false
+	disabledMark.ZIndex = 3
+	disabledMark.Parent = track
+
 	local hovering = false
+
+	local function prideDisabledForCurrentAnimal()
+		return key == "growthPrideEnabled"
+			and isCarnivoreCharacter(
+				player.Character
+					or workspace:FindFirstChild(
+						player.Name
+					)
+			)
+	end
+
 	local function applyVisual()
-		local on = state[key]
-		if on then
+		local disabled =
+			prideDisabledForCurrentAnimal()
+
+		local on =
+			state[key]
+			and not disabled
+
+		if disabled then
+			row.BackgroundColor3 = Color3.fromRGB(23, 16, 21)
+			rowStroke.Color = Color3.fromRGB(55, 38, 49)
+		elseif on then
 			row.BackgroundColor3 = COLOR_CARD_ON
 			rowStroke.Color = COLOR_ACCENT
 		elseif hovering then
@@ -31019,8 +31184,14 @@ local function toggle(parent, label, key, order)
 			rowStroke.Color = Color3.fromRGB(48, 24, 42)
 		end
 	end
+
 	local function render()
-		local on = state[key]
+		local disabled =
+			prideDisabledForCurrentAnimal()
+
+		local on =
+			state[key]
+			and not disabled
 
 		if key == "growExisting" then
 			labelText.Text =
@@ -31029,31 +31200,113 @@ local function toggle(parent, label, key, order)
 				or label
 			labelText.TextSize =
 				on and state.growExistingAutomaticAll
-				and 10
-				or 12
+					and (
+						UserInputService.TouchEnabled
+							and 11
+							or 12
+					)
+					or (
+						UserInputService.TouchEnabled
+							and 12
+							or 13
+					)
 		end
 
 		if key == "coinFarmAllowAutoQuests"
 			or key == "growthPrideEnabled" then
 			labelText.TextSize =
 				UserInputService.TouchEnabled
-					and 9
-					or 10
+					and 11
+					or 12
 		end
 
-		labelText.TextColor3 = on and COLOR_ACCENT or COLOR_TEXT
-		TweenService:Create(track, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
-			BackgroundColor3 = on and COLOR_ACCENT or Color3.fromRGB(50, 27, 44),
-		}):Play()
-		TweenService:Create(knob, TweenInfo.new(0.15, Enum.EasingStyle.Quad), {
-			Position = on and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2),
-		}):Play()
+		if disabled then
+			labelText.TextColor3 =
+				Color3.fromRGB(
+					112,
+					94,
+					105
+				)
+
+			track.BackgroundColor3 =
+				Color3.fromRGB(
+					34,
+					25,
+					31
+				)
+
+			knob.Visible =
+				false
+
+			disabledMark.Visible =
+				true
+		else
+			labelText.TextColor3 =
+				on
+					and COLOR_ACCENT
+					or COLOR_TEXT
+
+			knob.Visible =
+				true
+
+			disabledMark.Visible =
+				false
+
+			TweenService:Create(
+				track,
+				TweenInfo.new(
+					0.15,
+					Enum.EasingStyle.Quad
+				),
+				{
+					BackgroundColor3 =
+						on
+							and COLOR_ACCENT
+							or Color3.fromRGB(
+								50,
+								27,
+								44
+							),
+				}
+			):Play()
+
+			TweenService:Create(
+				knob,
+				TweenInfo.new(
+					0.15,
+					Enum.EasingStyle.Quad
+				),
+				{
+					Position =
+						on
+							and UDim2.fromOffset(
+								20,
+								2
+							)
+							or UDim2.fromOffset(
+								2,
+								2
+							),
+				}
+			):Play()
+		end
+
 		applyVisual()
 	end
 	renders[key] = render
 	row.MouseEnter:Connect(function() hovering = true; applyVisual() end)
 	row.MouseLeave:Connect(function() hovering = false; applyVisual() end)
 	row.Activated:Connect(function()
+		if key == "growthPrideEnabled"
+			and prideDisabledForCurrentAnimal() then
+
+			runtimeMessage =
+				"Pride Rock Growth is unavailable for carnivores"
+
+			render()
+			return
+		end
+
 		if (
 			key == "autoEat"
 			or key == "autoDrink"
@@ -31154,6 +31407,9 @@ local function toggle(parent, label, key, order)
 		end
 
 		if key == "growthPrideEnabled" then
+			state.growthPrideUserSet =
+				true
+
 			if not state[key] then
 				state.growthPride.returnRequested = false
 				state.growthPride.returning = false
@@ -31297,7 +31553,10 @@ local function sectionLabel(parent, text, order)
 	label.Font = FONT_BUTTON
 	label.Text = text
 	label.TextColor3 = COLOR_SUBTEXT
-	label.TextSize = 11
+	label.TextSize =
+		UserInputService.TouchEnabled
+			and 11
+			or 12
 	label.TextXAlignment = Enum.TextXAlignment.Left
 	label.Parent = wrap
 	return wrap
@@ -31318,7 +31577,10 @@ local function coinFarmAnimalSelector(parent, order)
 	main.BorderSizePixel = 0
 	main.AutoButtonColor = false
 	main.Font = FONT_BUTTON
-	main.TextSize = 11
+	main.TextSize =
+		UserInputService.TouchEnabled
+			and 12
+			or 13
 	main.TextColor3 = COLOR_TEXT
 	main.TextXAlignment = Enum.TextXAlignment.Left
 	main.Parent = wrap
@@ -31377,7 +31639,10 @@ local function coinFarmAnimalSelector(parent, order)
 		button.BorderSizePixel = 0
 		button.AutoButtonColor = false
 		button.Font = FONT_BODY
-		button.TextSize = 11
+		button.TextSize =
+			UserInputService.TouchEnabled
+				and 12
+				or 13
 		button.TextColor3 = COLOR_TEXT
 		button.TextXAlignment = Enum.TextXAlignment.Left
 		button.Text = textValue
@@ -31656,8 +31921,8 @@ state.createAutoDrinkModeButton = function(
 	description.Text = descriptionText
 	description.TextSize =
 		UserInputService.TouchEnabled
-			and 9
-			or 10
+			and 10
+			or 11
 	description.TextColor3 =
 		warning
 			and Color3.fromRGB(
@@ -31836,22 +32101,751 @@ toggle(
 	4
 )
 
+task.spawn(function()
+	local lastCarnivoreState = nil
+
+	while state.alive do
+		local character =
+			player.Character
+				or workspace:FindFirstChild(
+					player.Name
+				)
+
+		local carnivore =
+			isCarnivoreCharacter(
+				character
+			)
+
+		if carnivore
+			~= lastCarnivoreState then
+
+			lastCarnivoreState =
+				carnivore
+
+			if not carnivore
+				and not state.growthPrideUserSet then
+
+				state.growthPrideEnabled =
+					true
+			end
+
+			if renders.growthPrideEnabled then
+				pcall(
+					renders.growthPrideEnabled
+				)
+			end
+		end
+
+		task.wait(
+			0.6
+		)
+	end
+end)
+
 local prideGrowthNote = Instance.new("TextLabel")
-prideGrowthNote.Size = UDim2.new(1, 0, 0, 30)
+prideGrowthNote.Size = UDim2.new(1, 0, 0, 34)
 prideGrowthNote.LayoutOrder = 5
 prideGrowthNote.BackgroundTransparency = 1
 prideGrowthNote.Font = FONT_BODY
-prideGrowthNote.Text = "Recommended: safer farming near the slot-reset point. Zone quests always override this option."
+prideGrowthNote.Text = "Recommended for herbivores. Disabled for carnivores. Zone quests always override this option."
 prideGrowthNote.TextColor3 = COLOR_SUBTEXT
-prideGrowthNote.TextSize = 9
+prideGrowthNote.TextSize =
+	UserInputService.TouchEnabled
+		and 10
+		or 11
 prideGrowthNote.TextWrapped = true
 prideGrowthNote.TextXAlignment = Enum.TextXAlignment.Left
 prideGrowthNote.Parent = tabContents.Growth
 
-sectionLabel(tabContents.Growth, "NEW SLOT GENDER", 6)
+sectionLabel(
+	tabContents.Growth,
+	"RESET SPAWN",
+	6
+)
+
+;(function()
+local resetSpawnWrap =
+	Instance.new(
+		"Frame"
+	)
+
+resetSpawnWrap.Size =
+	UDim2.new(
+		1,
+		0,
+		0,
+		58
+	)
+
+resetSpawnWrap.LayoutOrder =
+	7
+
+resetSpawnWrap.BackgroundTransparency =
+	1
+
+resetSpawnWrap.ClipsDescendants =
+	true
+
+resetSpawnWrap.Parent =
+	tabContents.Growth
+
+local resetSpawnMain =
+	Instance.new(
+		"TextButton"
+	)
+
+resetSpawnMain.Size =
+	UDim2.new(
+		1,
+		0,
+		0,
+		58
+	)
+
+resetSpawnMain.BackgroundColor3 =
+	COLOR_CARD
+
+resetSpawnMain.BorderSizePixel =
+	0
+
+resetSpawnMain.AutoButtonColor =
+	false
+
+resetSpawnMain.Text =
+	""
+
+resetSpawnMain.Parent =
+	resetSpawnWrap
+
+corner(
+	resetSpawnMain,
+	12
+)
+
+local resetSpawnStroke =
+	stroke(
+		resetSpawnMain,
+		Color3.fromRGB(
+			48,
+			24,
+			42
+		),
+		1
+	)
+
+local resetSpawnTitle =
+	Instance.new(
+		"TextLabel"
+	)
+
+resetSpawnTitle.Size =
+	UDim2.new(
+		1,
+		-54,
+		0,
+		23
+	)
+
+resetSpawnTitle.Position =
+	UDim2.fromOffset(
+		14,
+		6
+	)
+
+resetSpawnTitle.BackgroundTransparency =
+	1
+
+resetSpawnTitle.Font =
+	FONT_BUTTON
+
+resetSpawnTitle.Text =
+	"Reset Spawn"
+
+resetSpawnTitle.TextSize =
+	UserInputService.TouchEnabled
+		and 12
+		or 13
+
+resetSpawnTitle.TextColor3 =
+	COLOR_TEXT
+
+resetSpawnTitle.TextXAlignment =
+	Enum.TextXAlignment.Left
+
+resetSpawnTitle.TextTruncate =
+	Enum.TextTruncate.AtEnd
+
+resetSpawnTitle.Parent =
+	resetSpawnMain
+
+local resetSpawnDescription =
+	Instance.new(
+		"TextLabel"
+	)
+
+resetSpawnDescription.Size =
+	UDim2.new(
+		1,
+		-54,
+		0,
+		23
+	)
+
+resetSpawnDescription.Position =
+	UDim2.fromOffset(
+		14,
+		29
+	)
+
+resetSpawnDescription.BackgroundTransparency =
+	1
+
+resetSpawnDescription.Font =
+	FONT_BODY
+
+resetSpawnDescription.Text =
+	"Choose where your slots move before reset after reaching 100% Growth."
+
+resetSpawnDescription.TextSize =
+	UserInputService.TouchEnabled
+		and 10
+		or 11
+
+resetSpawnDescription.TextColor3 =
+	COLOR_SUBTEXT
+
+resetSpawnDescription.TextWrapped =
+	true
+
+resetSpawnDescription.TextXAlignment =
+	Enum.TextXAlignment.Left
+
+resetSpawnDescription.TextYAlignment =
+	Enum.TextYAlignment.Top
+
+resetSpawnDescription.Parent =
+	resetSpawnMain
+
+local resetSpawnArrow =
+	Instance.new(
+		"TextLabel"
+	)
+
+resetSpawnArrow.Size =
+	UDim2.fromOffset(
+		30,
+		30
+	)
+
+resetSpawnArrow.AnchorPoint =
+	Vector2.new(
+		1,
+		0.5
+	)
+
+resetSpawnArrow.Position =
+	UDim2.new(
+		1,
+		-12,
+		0.5,
+		0
+	)
+
+resetSpawnArrow.BackgroundTransparency =
+	1
+
+resetSpawnArrow.Font =
+	Enum.Font.GothamBold
+
+resetSpawnArrow.Text =
+	"⌄"
+
+resetSpawnArrow.TextSize =
+	18
+
+resetSpawnArrow.TextColor3 =
+	COLOR_ACCENT
+
+resetSpawnArrow.Parent =
+	resetSpawnMain
+
+local resetSpawnOptions =
+	Instance.new(
+		"ScrollingFrame"
+	)
+
+resetSpawnOptions.Position =
+	UDim2.fromOffset(
+		0,
+		64
+	)
+
+resetSpawnOptions.Size =
+	UDim2.new(
+		1,
+		0,
+		0,
+		0
+	)
+
+resetSpawnOptions.BackgroundColor3 =
+	COLOR_CARD
+
+resetSpawnOptions.BorderSizePixel =
+	0
+
+resetSpawnOptions.ScrollBarThickness =
+	4
+
+resetSpawnOptions.ScrollBarImageColor3 =
+	COLOR_ACCENT
+
+resetSpawnOptions.CanvasSize =
+	UDim2.fromOffset(
+		0,
+		0
+	)
+
+resetSpawnOptions.Visible =
+	false
+
+resetSpawnOptions.Parent =
+	resetSpawnWrap
+
+corner(
+	resetSpawnOptions,
+	10
+)
+
+local resetSpawnOptionsPadding =
+	Instance.new(
+		"UIPadding"
+	)
+
+resetSpawnOptionsPadding.PaddingTop =
+	UDim.new(
+		0,
+		6
+	)
+
+resetSpawnOptionsPadding.PaddingBottom =
+	UDim.new(
+		0,
+		6
+	)
+
+resetSpawnOptionsPadding.PaddingLeft =
+	UDim.new(
+		0,
+		6
+	)
+
+resetSpawnOptionsPadding.PaddingRight =
+	UDim.new(
+		0,
+		6
+	)
+
+resetSpawnOptionsPadding.Parent =
+	resetSpawnOptions
+
+local resetSpawnLayout =
+	Instance.new(
+		"UIListLayout"
+	)
+
+resetSpawnLayout.Padding =
+	UDim.new(
+		0,
+		5
+	)
+
+resetSpawnLayout.SortOrder =
+	Enum.SortOrder.LayoutOrder
+
+resetSpawnLayout.Parent =
+	resetSpawnOptions
+
+local resetSpawnOpen =
+	false
+
+local function defaultResetSpawnName()
+	return isDinoLife
+		and "NestRock3"
+		or "PrideRockSpawn1"
+end
+
+local function resetSpawnSelectedLabel()
+	refreshCompletionSpawns()
+
+	local selected =
+		resolveResetSpawn()
+
+	if selected then
+		return spawnLocationLabel(
+			selected
+		)
+	end
+
+	return "Default ("
+		.. defaultResetSpawnName()
+		.. ")"
+end
+
+local function renderResetSpawn()
+	refreshCompletionSpawns()
+
+	local selected =
+		resolveResetSpawn()
+
+	local selectedLabel =
+		selected
+			and spawnLocationLabel(
+				selected
+			)
+			or (
+				"Default ("
+				.. defaultResetSpawnName()
+				.. ")"
+			)
+
+	resetSpawnTitle.Text =
+		"Reset Spawn  ·  "
+		.. selectedLabel
+
+	resetSpawnTitle.TextColor3 =
+		selected
+			and COLOR_ACCENT
+			or COLOR_TEXT
+
+	resetSpawnStroke.Color =
+		selected
+			and COLOR_ACCENT
+			or Color3.fromRGB(
+				48,
+				24,
+				42
+			)
+
+	resetSpawnArrow.Text =
+		resetSpawnOpen
+			and "⌃"
+			or "⌄"
+end
+
+local function clearResetSpawnOptions()
+	for _, child in ipairs(
+		resetSpawnOptions:GetChildren()
+	) do
+		if child
+			~= resetSpawnLayout
+			and child
+				~= resetSpawnOptionsPadding then
+
+			child:Destroy()
+		end
+	end
+end
+
+local function addResetSpawnOption(
+	label,
+	part,
+	order
+)
+	local button =
+		Instance.new(
+			"TextButton"
+		)
+
+	button.Size =
+		UDim2.new(
+			1,
+			-2,
+			0,
+			UserInputService.TouchEnabled
+				and 38
+				or 34
+		)
+
+	button.LayoutOrder =
+		order
+
+	button.BackgroundColor3 =
+		COLOR_CARD_ON
+
+	button.BorderSizePixel =
+		0
+
+	button.AutoButtonColor =
+		false
+
+	button.Font =
+		FONT_BUTTON
+
+	button.Text =
+		label
+
+	button.TextSize =
+		UserInputService.TouchEnabled
+			and 11
+			or 12
+
+	button.TextColor3 =
+		COLOR_TEXT
+
+	button.TextWrapped =
+		true
+
+	button.Parent =
+		resetSpawnOptions
+
+	corner(
+		button,
+		10
+	)
+
+	local optionStroke =
+		stroke(
+			button,
+			Color3.fromRGB(
+				48,
+				24,
+				42
+			),
+			1
+		)
+
+	local current =
+		resolveResetSpawn()
+
+	local selected =
+		(
+			part == nil
+				and current == nil
+		)
+		or (
+			part
+				and current == part
+		)
+
+	if selected then
+		button.TextColor3 =
+			COLOR_ACCENT
+
+		optionStroke.Color =
+			COLOR_ACCENT
+	end
+
+	button.Activated:Connect(function()
+		setResetSpawn(
+			part
+		)
+
+		resetSpawnOpen =
+			false
+
+		resetSpawnOptions.Visible =
+			false
+
+		resetSpawnOptions.Size =
+			UDim2.new(
+				1,
+				0,
+				0,
+				0
+			)
+
+		resetSpawnWrap.Size =
+			UDim2.new(
+				1,
+				0,
+				0,
+				58
+			)
+
+		renderResetSpawn()
+
+		runtimeMessage =
+			part
+				and (
+					"Reset Spawn selected: "
+					.. spawnLocationLabel(
+						part
+					)
+				)
+				or (
+					"Reset Spawn restored to default: "
+					.. defaultResetSpawnName()
+				)
+	end)
+end
+
+local function rebuildResetSpawnOptions()
+	refreshCompletionSpawns()
+	clearResetSpawnOptions()
+
+	addResetSpawnOption(
+		"Default ("
+			.. defaultResetSpawnName()
+			.. ")",
+		nil,
+		1
+	)
+
+	for index, part in ipairs(
+		completionSpawnParts
+	) do
+		addResetSpawnOption(
+			spawnLocationLabel(
+				part
+			),
+			part,
+			index + 1
+		)
+	end
+
+	local count =
+		#completionSpawnParts + 1
+
+	local rowHeight =
+		UserInputService.TouchEnabled
+			and 38
+			or 34
+
+	local contentHeight =
+		count * rowHeight
+			+ math.max(
+				0,
+				count - 1
+			) * 5
+			+ 12
+
+	local visibleHeight =
+		math.min(
+			contentHeight,
+			UserInputService.TouchEnabled
+				and 220
+				or 200
+		)
+
+	resetSpawnOptions.CanvasSize =
+		UDim2.fromOffset(
+			0,
+			contentHeight
+		)
+
+	resetSpawnOptions.Size =
+		UDim2.new(
+			1,
+			0,
+			0,
+			visibleHeight
+		)
+
+	resetSpawnWrap.Size =
+		UDim2.new(
+			1,
+			0,
+			0,
+			64 + visibleHeight
+		)
+end
+
+resetSpawnMain.MouseEnter:Connect(function()
+	resetSpawnMain.BackgroundColor3 =
+		COLOR_CARD_ON
+end)
+
+resetSpawnMain.MouseLeave:Connect(function()
+	resetSpawnMain.BackgroundColor3 =
+		COLOR_CARD
+end)
+
+resetSpawnMain.Activated:Connect(function()
+	resetSpawnOpen =
+		not resetSpawnOpen
+
+	if resetSpawnOpen then
+		rebuildResetSpawnOptions()
+
+		resetSpawnOptions.Visible =
+			true
+	else
+		resetSpawnOptions.Visible =
+			false
+
+		resetSpawnOptions.Size =
+			UDim2.new(
+				1,
+				0,
+				0,
+				0
+			)
+
+		resetSpawnWrap.Size =
+			UDim2.new(
+				1,
+				0,
+				0,
+				58
+			)
+	end
+
+	renderResetSpawn()
+end)
+
+renders.resetSpawn =
+	renderResetSpawn
+
+renderResetSpawn()
+
+local resetSpawnsModel =
+	workspace:FindFirstChild(
+		"Spawns"
+	)
+
+if resetSpawnsModel then
+	table.insert(
+		connections,
+		resetSpawnsModel.DescendantAdded:Connect(function()
+			mmbTaskDefer(function()
+				refreshCompletionSpawns()
+
+				if renders.resetSpawn then
+					renders.resetSpawn()
+				end
+
+				if resetSpawnOpen then
+					rebuildResetSpawnOptions()
+				end
+			end)
+		end)
+	)
+
+	table.insert(
+		connections,
+		resetSpawnsModel.DescendantRemoving:Connect(function()
+			mmbTaskDefer(function()
+				refreshCompletionSpawns()
+
+				if renders.resetSpawn then
+					renders.resetSpawn()
+				end
+
+				if resetSpawnOpen then
+					rebuildResetSpawnOptions()
+				end
+			end)
+		end)
+	)
+end
+
+end)()
+
+sectionLabel(tabContents.Growth, "NEW SLOT GENDER", 8)
 local genderRow = Instance.new("Frame")
 genderRow.Size = UDim2.new(1, 0, 0, 32)
-genderRow.LayoutOrder = 7
+genderRow.LayoutOrder = 9
 genderRow.BackgroundTransparency = 1
 genderRow.Parent = tabContents.Growth
 local genderLayout = Instance.new("UIListLayout", genderRow)
@@ -31865,7 +32859,10 @@ local function genderButton(text, value)
 	button.BorderSizePixel = 0
 	button.Font = FONT_BUTTON
 	button.Text = text
-	button.TextSize = 12
+	button.TextSize =
+		UserInputService.TouchEnabled
+			and 12
+			or 13
 	button.AutoButtonColor = false
 	button.Parent = genderRow
 	corner(button, 16)
@@ -31887,12 +32884,15 @@ renderGender()
 
 local genderNote = Instance.new("TextLabel")
 genderNote.Size = UDim2.new(1, 0, 0, 28)
-genderNote.LayoutOrder = 8
+genderNote.LayoutOrder = 10
 genderNote.BackgroundTransparency = 1
 genderNote.Font = FONT_BODY
 genderNote.Text = "Applies only to slots created by \"Grow New Slots\"."
 genderNote.TextColor3 = COLOR_SUBTEXT
-genderNote.TextSize = 10
+genderNote.TextSize =
+	UserInputService.TouchEnabled
+		and 10
+		or 11
 genderNote.TextWrapped = true
 genderNote.TextXAlignment = Enum.TextXAlignment.Left
 genderNote.Parent = tabContents.Growth
@@ -31995,7 +32995,10 @@ state.moveToCancelButton.BorderSizePixel = 0
 state.moveToCancelButton.Font = FONT_TITLE
 state.moveToCancelButton.Text = "Cancel Current Move"
 state.moveToCancelButton.TextColor3 = COLOR_SUBTEXT
-state.moveToCancelButton.TextSize = 12
+state.moveToCancelButton.TextSize =
+	UserInputService.TouchEnabled
+		and 12
+		or 13
 state.moveToCancelButton.AutoButtonColor = false
 state.moveToCancelButton.Parent = tabContents["Move To"]
 corner(state.moveToCancelButton, 8)
@@ -32008,14 +33011,9 @@ state.renderMoveToCancelButton()
 
 refreshCompletionSpawns()
 local function completionSpawnLabel(part)
-	if not part then return "Unknown location" end
-	local spawns = workspace:FindFirstChild("Spawns")
-	local fullName = part:GetFullName()
-	if spawns then
-		local marker = spawns:GetFullName() .. "."
-		fullName = fullName:gsub("^" .. marker:gsub("([%.%-])", "%%%1"), "")
-	end
-	return fullName
+	return spawnLocationLabel(
+		part
+	)
 end
 
 local spawnList = Instance.new("Frame")
@@ -32056,7 +33054,10 @@ local function rebuildMoveToList()
 		button.BorderSizePixel = 0
 		button.Font = FONT_BUTTON
 		button.TextColor3 = COLOR_TEXT
-		button.TextSize = 11
+		button.TextSize =
+			UserInputService.TouchEnabled
+				and 12
+				or 13
 		button.TextWrapped = true
 		button.Text = completionSpawnLabel(destination)
 		button.AutoButtonColor = false
@@ -32123,7 +33124,10 @@ farmButton.BorderSizePixel = 0
 farmButton.Font = FONT_TITLE
 farmButton.Text = "Move to Farm"
 farmButton.TextColor3 = COLOR_ACCENT_DK
-farmButton.TextSize = 12
+farmButton.TextSize =
+	UserInputService.TouchEnabled
+		and 12
+		or 13
 farmButton.AutoButtonColor = false
 farmButton.Parent = tabContents["Move To"]
 corner(farmButton, 8)
@@ -35191,6 +36195,12 @@ shared.__uiRootCleanup = function()
 
 		growthPrideEnabled =
 			state.growthPrideEnabled ~= false,
+
+		growthPrideUserSet =
+			state.growthPrideUserSet == true,
+
+		resetSpawnFullName =
+			state.resetSpawnFullName,
 
 		deathReports =
 			state.slotGuardian
