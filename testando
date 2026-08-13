@@ -3327,21 +3327,26 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		local oldAutoRotate =
 			humanoid.AutoRotate
 
+		local oldMovementDisabled =
+			character:GetAttribute(
+				"MovementDisabled"
+			)
+
 		local BG =
 			Instance.new(
 				"BodyGyro"
 			)
 
-		local BV =
+		local BP =
 			Instance.new(
-				"BodyVelocity"
+				"BodyPosition"
 			)
 
 		BG.Name =
 			"MMB_MainWaterBridgeGyro"
 
-		BV.Name =
-			"MMB_MainWaterBridgeVelocity"
+		BP.Name =
+			"MMB_MainWaterBridgePosition"
 
 		BG.P = 9e4
 		BG.MaxTorque =
@@ -3351,29 +3356,39 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				9e9
 			)
 
-		BV.MaxForce =
+		BP.P = 26000
+		BP.D = 3200
+		BP.MaxForce =
 			Vector3.new(
-				9e9,
-				9e9,
-				9e9
+				9e8,
+				9e8,
+				9e8
 			)
 
 		BG.CFrame =
 			root.CFrame
 
-		BV.Velocity =
-			Vector3.zero
+		BP.Position =
+			root.Position
 
 		BG.Parent =
 			root
 
-		BV.Parent =
+		BP.Parent =
 			root
 
 		pcall(function()
 			humanoid.PlatformStand = true
 			humanoid.AutoRotate = false
 		end)
+
+		-- EXACTLY the same ownership policy for Croc and Hippo.
+		-- Their SwimmingControllers cannot pull the rig below the surface while
+		-- this elevated land-route bridge owns the root position.
+		character:SetAttribute(
+			"MovementDisabled",
+			true
+		)
 
 		local currentLocal =
 			waterPart.CFrame:PointToObjectSpace(
@@ -3383,8 +3398,8 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		local halfY =
 			waterPart.Size.Y * 0.5
 
-		local clearance =
-			state.movementRootClearance(
+		local surfaceStandOffset =
+			state.aquaticWaterStandOffset(
 				character
 			)
 
@@ -3392,7 +3407,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			math.max(
 				currentLocal.Y,
 				halfY
-					+ clearance
+					+ surfaceStandOffset
 					+ 2.0
 			)
 
@@ -3457,6 +3472,12 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				50
 			)
 
+		local commandedPosition =
+			root.Position
+
+		local lastHeartbeatAt =
+			tick()
+
 		local function bridgeFlyTo(
 			goal,
 			timeout
@@ -3478,25 +3499,67 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					goal - root.Position
 
 				if delta.Magnitude <= 1.5 then
+					commandedPosition =
+						goal
+
+					BP.Position =
+						goal
+
 					return true
 				end
 
-				local speed =
+				local now =
+					tick()
+
+				local dt =
 					math.clamp(
-						delta.Magnitude * 1.5,
-						14,
-						bridgeSpeed
+						now
+							- lastHeartbeatAt,
+						1 / 120,
+						1 / 20
 					)
 
-				BV.Velocity =
-					delta.Unit
-					* speed
+				lastHeartbeatAt =
+					now
+
+				local commandDelta =
+					goal
+						- commandedPosition
+
+				if commandDelta.Magnitude > 0.05 then
+					local commandSpeed =
+						math.clamp(
+							commandDelta.Magnitude
+								* 1.8,
+							12,
+							bridgeSpeed
+						)
+
+					local step =
+						math.min(
+							commandDelta.Magnitude,
+							commandSpeed * dt
+						)
+
+					commandedPosition =
+						commandedPosition
+						+ commandDelta.Unit
+							* step
+				else
+					commandedPosition =
+						goal
+				end
+
+				BP.Position =
+					commandedPosition
 
 				local flat =
 					Vector3.new(
-						delta.X,
+						goal.X
+							- root.Position.X,
 						0,
-						delta.Z
+						goal.Z
+							- root.Position.Z
 					)
 
 				if flat.Magnitude > 0.25 then
@@ -3509,6 +3572,12 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 						)
 				end
 
+				-- Kill swimming/downward momentum. BodyPosition owns Y as well
+				-- as X/Z, so Hippo cannot sag below the water plane.
+				root.AssemblyLinearVelocity =
+					root.AssemblyLinearVelocity
+						* 0.15
+
 				root.AssemblyAngularVelocity =
 					Vector3.zero
 
@@ -3516,8 +3585,8 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					CROC.isCharacter(
 						character
 					)
-						and "Croc MoveTo: flying above MainWaterPart"
-						or "Hippo MoveTo: flying above MainWaterPart"
+						and "Croc MoveTo: position-control above water"
+						or "Hippo MoveTo: position-control above water"
 
 				RunService.Heartbeat:Wait()
 			end
@@ -3540,7 +3609,8 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				)
 			)
 
-		local crossed = false
+		local crossed =
+			false
 
 		if lifted then
 			local crossDistance =
@@ -3560,8 +3630,8 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		end
 
 		pcall(function()
-			if BV and BV.Parent then
-				BV:Destroy()
+			if BP and BP.Parent then
+				BP:Destroy()
 			end
 		end)
 
@@ -3589,10 +3659,17 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			)
 		end)
 
-		character:SetAttribute(
-			"MovementDisabled",
-			false
-		)
+		if oldMovementDisabled == nil then
+			character:SetAttribute(
+				"MovementDisabled",
+				false
+			)
+		else
+			character:SetAttribute(
+				"MovementDisabled",
+				oldMovementDisabled
+			)
+		end
 
 		if crossed then
 			runtimeMessage =
@@ -5842,7 +5919,9 @@ function state.drinkFindMainWaterBank(
 
 	-- One precomputed bank point. No movement refinement after arrival.
 	local bankBackoff =
-		CROC.isCharacter(character)
+		state.isCrocOrHippoMovementCharacter(
+			character
+		)
 			and math.clamp(state.movementFootprint(character) * 0.20, 1.8, 3.4)
 			or 0.80
 
@@ -5906,16 +5985,18 @@ function state.drinkFindAccessibleSpot(origin, character)
 
 	local waterPart = workspace:FindFirstChild("MainWaterPart")
 	local isAquatic = isAquaticCharacter(character)
-	local isCroc = CROC.isCharacter(character)
+	local isCrocHippo =
+		state.isCrocOrHippoMovementCharacter(
+			character
+		)
 	local angleOffset = (player.UserId % 360) * math.pi / 180
 
 	local function considerWaterPoint(waterPoint, source)
 		if not waterPoint or state.drinkAreaFailed(waterPoint) then return nil end
 
-		-- Crocodile is aquatic, but for drinking it intentionally remains on
-		-- REAL Terrain at the bank. Hippo/other aquatic animals keep the old
-		-- water-surface behavior.
-		if isAquatic and not isCroc then
+		-- Crocodile AND Hippo stay on REAL Terrain at the bank for drinking.
+		-- Only other aquatic animals keep the old water-surface behavior.
+		if isAquatic and not isCrocHippo then
 			return {
 				water = waterPoint,
 				stand = waterPoint + Vector3.new(0, state.aquaticWaterStandOffset(character), 0),
@@ -9037,7 +9118,9 @@ function CROC.approachDrink()
 
 	if not character
 		or not root
-		or not CROC.isCharacter(character) then
+		or not state.isCrocOrHippoMovementCharacter(
+			character
+		) then
 		return false
 	end
 
@@ -9095,7 +9178,9 @@ function CROC.approachDrink()
 
 	if character
 		and root
-		and CROC.isCharacter(character)
+		and state.isCrocOrHippoMovementCharacter(
+			character
+		)
 		and moved then
 
 		-- v92: NO shoreline refinement movement.
@@ -11562,20 +11647,28 @@ function state.mainWaterDryBankReached(
 			)
 		)
 
+	-- IMPORTANT: cast against the REAL world, not Terrain-only.
+	-- The first collidable support under the animal MUST itself be Terrain.
+	-- Therefore Rock3Var3 / MeshParts / Parts / models can never be accepted
+	-- as a valid aquatic exit even if there is Terrain somewhere below them.
 	local params =
 		RaycastParams.new()
 
 	params.FilterType =
-		Enum.RaycastFilterType.Include
+		Enum.RaycastFilterType.Exclude
 
 	params.FilterDescendantsInstances = {
-		workspace.Terrain,
+		character,
+		waterPart,
 	}
 
 	params.IgnoreWater = true
 
-	-- Short local proof only. River bottom is rejected because its surface is
-	-- below MainWaterPart's top; a nearby bank/hill rises to that level.
+	pcall(function()
+		params.RespectCanCollide =
+			true
+	end)
+
 	local hit =
 		workspace:Raycast(
 			root.Position
@@ -11593,6 +11686,8 @@ function state.mainWaterDryBankReached(
 		)
 
 	if not hit
+		or hit.Instance
+			~= workspace.Terrain
 		or hit.Material
 			== Enum.Material.Water
 		or hit.Normal.Y < 0.10 then
@@ -11601,6 +11696,143 @@ function state.mainWaterDryBankReached(
 
 	return hit.Position.Y
 		>= topWorld.Y - 0.35
+end
+
+
+function state.aquaticTerrainBankCandidateClear(
+	character,
+	root,
+	waterPart,
+	terrainHit,
+	clearance
+)
+	if not character
+		or not root
+		or not waterPart
+		or not terrainHit
+		or terrainHit.Instance
+			~= workspace.Terrain then
+
+		return false
+	end
+
+	-- Landing-column proof: raycast the actual world downward. The FIRST
+	-- collidable thing must be Terrain. If Rock3Var3 is sitting above it,
+	-- the rock wins the ray and this candidate is rejected.
+	local supportParams =
+		RaycastParams.new()
+
+	supportParams.FilterType =
+		Enum.RaycastFilterType.Exclude
+
+	supportParams.FilterDescendantsInstances = {
+		character,
+		waterPart,
+	}
+
+	supportParams.IgnoreWater = true
+
+	pcall(function()
+		supportParams.RespectCanCollide =
+			true
+	end)
+
+	local supportOrigin =
+		terrainHit.Position
+			+ Vector3.new(
+				0,
+				math.max(
+					10,
+					clearance + 7
+				),
+				0
+			)
+
+	local support =
+		workspace:Raycast(
+			supportOrigin,
+			Vector3.new(
+				0,
+				-math.max(
+					18,
+					clearance + 12
+				),
+				0
+			),
+			supportParams
+		)
+
+	if not support
+		or support.Instance
+			~= workspace.Terrain
+		or support.Material
+			== Enum.Material.Water then
+
+		return false
+	end
+
+	if math.abs(
+		support.Position.Y
+			- terrainHit.Position.Y
+	) > 1.25 then
+		return false
+	end
+
+	-- Route proof: ignore Terrain itself and check only physical objects between
+	-- us and the chosen Terrain bank. A rock/tree/mesh blocking the direct exit
+	-- makes us choose a different Terrain candidate instead of climbing it.
+	local obstacleParams =
+		RaycastParams.new()
+
+	obstacleParams.FilterType =
+		Enum.RaycastFilterType.Exclude
+
+	obstacleParams.FilterDescendantsInstances = {
+		character,
+		workspace.Terrain,
+		waterPart,
+	}
+
+	obstacleParams.IgnoreWater = true
+
+	pcall(function()
+		obstacleParams.RespectCanCollide =
+			true
+	end)
+
+	local target =
+		terrainHit.Position
+			+ Vector3.new(
+				0,
+				clearance,
+				0
+			)
+
+	local route =
+		target - root.Position
+
+	if route.Magnitude > 1 then
+		local obstacle =
+			workspace:Raycast(
+				root.Position
+					+ Vector3.new(
+						0,
+						math.min(
+							2.5,
+							clearance * 0.45
+						),
+						0
+					),
+				route,
+				obstacleParams
+			)
+
+		if obstacle then
+			return false
+		end
+	end
+
+	return true
 end
 
 function state.findNearbyMainWaterBankTarget(
@@ -11746,6 +11978,8 @@ function state.findNearbyMainWaterBankTarget(
 		22,
 		36,
 		54,
+		78,
+		108,
 	}) do
 
 		local best
@@ -11778,12 +12012,21 @@ function state.findNearbyMainWaterBankTarget(
 				)
 
 			if hit
+				and hit.Instance
+					== workspace.Terrain
 				and hit.Material
 					~= Enum.Material.Water
 				and hit.Normal.Y
 					>= 0.10
 				and hit.Position.Y
-					>= waterTopY - 0.35 then
+					>= waterTopY - 0.35
+				and state.aquaticTerrainBankCandidateClear(
+					character,
+					root,
+					waterPart,
+					hit,
+					clearance
+				) then
 
 				local heightPenalty =
 					math.max(
@@ -11998,12 +12241,14 @@ end
 function state.findAquaticDryTerrainExit(
 	character,
 	root,
-	_preferredTarget
+	preferredTarget
 )
-	-- Compatibility wrapper. Croc/Hippo no longer scan Terrain for a bank.
-	return state.mainWaterNearestExitTarget(
+	-- Compatibility wrapper is Terrain-only as well. No MainWaterPart-edge,
+	-- Rock, MeshPart or arbitrary BasePart fallback is allowed.
+	return state.findNearbyMainWaterBankTarget(
 		character,
-		root
+		root,
+		preferredTarget
 	)
 end
 
@@ -12077,14 +12322,13 @@ function state.aquaticRiverInfinityFlyExit(
 		)
 
 	if typeof(target) ~= "Vector3" then
-		target =
-			state.mainWaterNearestExitTarget(
-				character,
-				root
+		runtimeMessage =
+			CROC.isCharacter(
+				character
 			)
-	end
+				and "Croc water exit: no clear Terrain bank nearby; waiting"
+				or "Hippo water exit: no clear Terrain bank nearby; waiting"
 
-	if typeof(target) ~= "Vector3" then
 		return false
 	end
 
@@ -14359,7 +14603,10 @@ table.insert(connections, player.CharacterAdded:Connect(function(character)
 		state.oxygenGuardApply(character)
 		state.staminaGuardApply(character)
 		state.releaseMovementNow(character, true)
-		if CROC.isCharacter(character) then
+		if state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+
 			state.autoDrinkMode = "surface"
 			state.autoDrinkPreferredMode = "surface"
 			state.drinkClearUndergroundMode()
@@ -16560,7 +16807,10 @@ local function virtualDrinkKick()
 			local _, newRoot = characterParts()
 			if newRoot then drinkingSourcePosition = newRoot.Position end
 			CROC.dinoLastMoveAt = tick()
-		elseif CROC.isCharacter(character) then
+		elseif state.isCrocOrHippoMovementCharacter(
+			character
+		) then
+
 			drinkingSourcePosition = nil
 			removeSwimBarrier()
 			local _, waterPart = CROC.getWaterSurfaceY()
@@ -16691,18 +16941,22 @@ local function autoDrinkStep()
 	-- Crocodile can NEVER use Underground Drink. Its low body/physics make the
 	-- hidden-water transit unsafe; Surface Water is mandatory.
 	if state.autoDrinkMode == "underground"
-		and CROC.isCharacter(character) then
+		and state.isCrocOrHippoMovementCharacter(
+			character
+		) then
 		state.autoDrinkMode = "surface"
 		state.autoDrinkPreferredMode = "surface"
 		state.drinkClearUndergroundMode()
-		runtimeMessage = "Underground Drink is disabled for Crocodile; Surface Water forced"
+		runtimeMessage = "Underground Drink is disabled for Crocodile/Hippo; Surface Water forced"
 		if state.renderAutoDrinkModeButtons then pcall(state.renderAutoDrinkModeButtons) end
 	end
 
 	-- v103 permanent underground Auto Drink mode.
 	if state.autoDrinkMode == "underground"
 		and isSavannahLife
-		and not CROC.isCharacter(character)
+		and not state.isCrocOrHippoMovementCharacter(
+			character
+		)
 		and tick() >= (state.drinkTest.forceSurfaceUntil or 0)
 		and (
 			earlyWater <= 75
@@ -17071,7 +17325,9 @@ local function autoDrinkStep()
 		drinkingStuckSince = tick()
 
 		if not isDinoLife
-			and not CROC.isCharacter(character)
+			and not state.isCrocOrHippoMovementCharacter(
+				character
+			)
 			and detectAvailableFood(character) ~= "Drink"
 			and not (
 				state.drinkVisualPromptVisible
@@ -17266,7 +17522,9 @@ local function autoDrinkStep()
 			isSavannahLife
 				and water < 70
 				and state.autoDrinkMode == "surface"
-				and not CROC.isCharacter(character)
+				and not state.isCrocOrHippoMovementCharacter(
+					character
+				)
 
 		if emergencyUnderground then
 			state.drinkSearch.failedCount = 0
@@ -29803,9 +30061,12 @@ setActiveTab("Survival")
 table.insert(connections, RunService.Heartbeat:Connect(function()
 	local character, root, humanoid = characterParts()
 
-	-- Crocodile nao usa a swimBarrier. Ela travava X/Z e impedia justamente
-	-- o caminho PrideRockSpawn1 -> margem.
-	if character and CROC.isCharacter(character) then
+	-- Crocodile/Hippo nao usam swimBarrier. It can pull the aquatic rig down
+	-- or lock X/Z while our Terrain-bank / over-water controller owns movement.
+	if character
+		and state.isCrocOrHippoMovementCharacter(
+			character
+		) then
 		if swimBarrier then removeSwimBarrier() end
 		return
 	end
