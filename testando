@@ -8982,6 +8982,132 @@ local function virtualEatKick()
 	eatingStuckSince = nil
 end
 
+-- ============================================================
+-- SURVIVAL ARBITER
+-- Food and Water are mutually exclusive long-running jobs. Once one need owns
+-- survival, the other may not steal movement just because its percentage changes
+-- by a few points. Only critical thirst may preempt an active food job.
+-- ============================================================
+state.survivalArbiter = state.survivalArbiter or {
+\towner = nil,
+\townerSince = 0,
+\tlastOwner = nil,
+\thandoffNotBefore = 0,
+\tlastProgressAt = 0,
+\tlastValue = nil,
+\tpreemptions = 0,
+}
+
+function state.survivalArbiterReset(reason)
+\tlocal arbiter = state.survivalArbiter
+\tarbiter.owner = nil
+\tarbiter.ownerSince = 0
+\tarbiter.lastOwner = nil
+\tarbiter.handoffNotBefore = 0
+\tarbiter.lastProgressAt = tick()
+\tarbiter.lastValue = nil
+\tarbiter.preemptions = 0
+end
+
+function state.survivalArbiterChoose(food, water)
+\tfood = tonumber(food) or 100
+\twater = tonumber(water) or 100
+
+\t-- Critical thirst always wins. Otherwise use hysteresis: Water only steals
+\t-- initial ownership when it is meaningfully worse than Food.
+\tif state.autoDrink and water <= 45 then
+\t\treturn "water"
+\tend
+
+\tlocal waterNeed = state.autoDrink and water <= 75
+\tlocal foodNeed = state.autoEat and food < 92
+
+\tif waterNeed and foodNeed then
+\t\tif water <= 60 or water <= food - 8 then
+\t\t\treturn "water"
+\t\tend
+\t\treturn "food"
+\telseif waterNeed then
+\t\treturn "water"
+\telseif foodNeed then
+\t\treturn "food"
+\tend
+
+\treturn nil
+end
+
+function state.survivalArbiterAcquire(kind, food, water, reason)
+\tif kind ~= "food" and kind ~= "water" then
+\t\treturn false
+\tend
+
+\tlocal arbiter = state.survivalArbiter
+\tlocal now = tick()
+\tfood = tonumber(food) or 100
+\twater = tonumber(water) or 100
+
+\tif arbiter.owner == kind then
+\t\treturn true
+\tend
+
+\tif arbiter.owner ~= nil then
+\t\t-- Food may only be interrupted for genuinely dangerous thirst. Normal
+\t\t-- Water <=75 is NOT enough to abandon a grass/tree/carcass route.
+\t\tlocal emergencyWaterPreempt =
+\t\t\tkind == "water"
+\t\t\tand arbiter.owner == "food"
+\t\t\tand state.autoDrink
+\t\t\tand water <= 45
+
+\t\tif not emergencyWaterPreempt then
+\t\t\treturn false
+\t\tend
+
+\t\tarbiter.preemptions = (arbiter.preemptions or 0) + 1
+\tend
+
+\t-- Small dead-band after a completed job prevents Eat/Drink from swapping on
+\t-- adjacent scheduler frames. Critical Water bypasses it.
+\tif now < (arbiter.handoffNotBefore or 0)
+\t\tand kind ~= arbiter.lastOwner
+\t\tand not (kind == "water" and water <= 45) then
+\t\treturn false
+\tend
+
+\tarbiter.owner = kind
+\tarbiter.ownerSince = now
+\tarbiter.lastProgressAt = now
+\tarbiter.lastValue = kind == "water" and water or food
+
+\treturn true
+end
+
+function state.survivalArbiterNoteProgress(kind, value)
+\tlocal arbiter = state.survivalArbiter
+\tif arbiter.owner ~= kind then return end
+
+\tvalue = tonumber(value)
+\tif not value then return end
+
+\tif arbiter.lastValue == nil or value > arbiter.lastValue + 0.01 then
+\t\tarbiter.lastValue = value
+\t\tarbiter.lastProgressAt = tick()
+\tend
+end
+
+function state.survivalArbiterComplete(kind)
+\tlocal arbiter = state.survivalArbiter
+\tif arbiter.owner ~= kind then return false end
+
+\tarbiter.lastOwner = kind
+\tarbiter.owner = nil
+\tarbiter.ownerSince = 0
+\tarbiter.lastProgressAt = tick()
+\tarbiter.lastValue = nil
+\tarbiter.handoffNotBefore = tick() + 1.1
+\treturn true
+end
+
 local function autoEatStep()
 	if state.questGrowthReset.exclusive then return end
 	-- v65: Swim quests do not disable survival. If Food is low, eating pauses
@@ -8993,6 +9119,24 @@ local function autoEatStep()
 
 	local food = character:GetAttribute("Food") or 100
 	local water = character:GetAttribute("Water") or 100
+
+	state.survivalArbiterNoteProgress("food", food)
+	state.survivalArbiterNoteProgress("water", water)
+
+	local survivalOwner = state.survivalArbiter.owner
+	if survivalOwner == "water" then
+		-- A committed Drink job keeps ownership until it actually completes or
+		-- its own watchdog proves the source bad. Do not start walking to grass.
+		return
+	end
+
+	if survivalOwner == nil then
+		local preferredNeed = state.survivalArbiterChoose(food, water)
+		if preferredNeed == "water" then
+			state.survivalArbiterAcquire("water", food, water, "initial arbitration")
+			return
+		end
+	end
 
 	-- v80: after an herbivore leaves Pride Rock to drink, it must return to
 	-- Pride Rock BEFORE looking for grass/tree food. Drinking is the sole
@@ -9093,6 +9237,7 @@ local function autoEatStep()
 			if food >= 100 then
 				state.questGiraffeFeeding = false
 				eatingToFull = false
+				state.survivalArbiterComplete("food")
 				resetEatingSearch(food)
 				GIRAFFE.cancel()
 				eatingStuckSince = nil
@@ -9122,6 +9267,7 @@ local function autoEatStep()
 			if food >= 100 then
 				state.questBaboonFeeding = false
 				eatingToFull = false
+				state.survivalArbiterComplete("food")
 				resetEatingSearch(food)
 				BABOON.cancel()
 				eatingStuckSince = nil
@@ -9151,6 +9297,7 @@ local function autoEatStep()
 			if food >= 100 then
 				state.questCarnivoreFeeding = false
 				eatingToFull = false
+				state.survivalArbiterComplete("food")
 				resetEatingSearch(food)
 				activeCarcass = nil
 				eatingStuckSince = nil
@@ -9174,9 +9321,23 @@ local function autoEatStep()
 					and 85
 			)
 			or (preSwitchFoodTarget or 92)
+
+	if food < foodCap then
+		if not state.survivalArbiterAcquire(
+			"food",
+			food,
+			water,
+			"Auto Eat committed"
+		) then
+			return
+		end
+	end
+
 	if food >= foodCap then
 		local wasEating = eatingToFull
 		eatingToFull = false
+		state.survivalArbiterNoteProgress("food", food)
+		state.survivalArbiterComplete("food")
 		resetEatingSearch(food)
 		activeCarcass = nil
 		eatingStuckSince = nil
@@ -13557,6 +13718,32 @@ local function autoDrinkStep()
 			character:GetAttribute("Water")
 		) or 100
 
+	local earlyFood =
+		tonumber(
+			character:GetAttribute("Food")
+		) or 100
+
+	state.survivalArbiterNoteProgress("water", earlyWater)
+	state.survivalArbiterNoteProgress("food", earlyFood)
+
+	local survivalOwner = state.survivalArbiter.owner
+	if survivalOwner == "food" and earlyWater > 45 then
+		-- Food has a committed route. Normal thirst must wait instead of making
+		-- the animal abandon grass, walk to water, abandon water, and repeat.
+		return
+	end
+
+	if earlyWater <= 75 or drinkingToFull then
+		if not state.survivalArbiterAcquire(
+			"water",
+			earlyFood,
+			earlyWater,
+			earlyWater <= 45 and "critical thirst preemption" or "Auto Drink committed"
+		) then
+			return
+		end
+	end
+
 	local movementInteraction
 	if state.questMovementOpportunisticInteract then
 		movementInteraction =
@@ -13848,6 +14035,8 @@ local function autoDrinkStep()
 	end
 
 	if water <= 75 then
+		-- Reaching this block means the arbiter granted Water ownership. Only now
+		-- may Drink clear Food state (normal Water <=75 by itself cannot do it).
 		drinkingToFull = true
 		eatingToFull = false
 		eatingSourcePosition = nil
@@ -13875,6 +14064,8 @@ local function autoDrinkStep()
 		drinkingStuckSince = nil
 		lastDrinkWatchdogWater = water
 		state.drinkProgressReset()
+		state.survivalArbiterNoteProgress("water", water)
+		state.survivalArbiterComplete("water")
 
 		if state.autoQuests then
 			state.questForceFastRecheckUntil = tick() + 12
@@ -19746,6 +19937,7 @@ task.spawn(function()
 
 			if character ~= lastCharacter then
 				lastCharacter = character
+				state.survivalArbiterReset("character changed")
 
 				-- State below belongs to the previous slot and must never leak
 				-- into a newly spawned one.
@@ -19993,10 +20185,18 @@ function state.survivalBrainTakeover(kind, reason)
 	local food = tonumber(character:GetAttribute("Food")) or 100
 	local water = tonumber(character:GetAttribute("Water")) or 100
 
-	if kind == "water" and (not state.autoDrink or water > 75) then
+	if kind == "water"
+		and (
+			not state.autoDrink
+			or (water > 75 and state.survivalArbiter.owner ~= "water")
+		) then
 		return false
 	end
-	if kind == "food" and (not state.autoEat or food > 70) then
+	if kind == "food"
+		and (
+			not state.autoEat
+			or (food > 70 and state.survivalArbiter.owner ~= "food")
+		) then
 		return false
 	end
 
@@ -20006,10 +20206,19 @@ function state.survivalBrainTakeover(kind, reason)
 		return false
 	end
 
-	-- Water gets final priority before the takeover timestamp is committed.
-	-- This avoids a recursive food->water handoff being blocked by our own cooldown.
-	if kind == "food" and state.autoDrink and water <= 60 then
+	-- Respect the committed survival job. The only cross-job preemption allowed is
+	-- critical Water (<=45), handled by survivalArbiterAcquire.
+	if kind == "food" and state.autoDrink and water <= 45 then
 		kind = "water"
+	end
+
+	if not state.survivalArbiterAcquire(
+		kind,
+		food,
+		water,
+		"Survival Brain recovery"
+	) then
+		return false
 	end
 
 	brain.lastForceAt = now
@@ -20133,6 +20342,14 @@ task.spawn(function()
 			local food = tonumber(character:GetAttribute("Food")) or 100
 			local water = tonumber(character:GetAttribute("Water")) or 100
 
+			-- Manual toggle changes must release ownership immediately; otherwise a
+			-- disabled Food job could keep Auto Drink locked (or vice versa).
+			if state.survivalArbiter.owner == "food" and not state.autoEat then
+				state.survivalArbiterReset("Auto Eat disabled")
+			elseif state.survivalArbiter.owner == "water" and not state.autoDrink then
+				state.survivalArbiterReset("Auto Drink disabled")
+			end
+
 			if character ~= lastCharacter then
 				lastCharacter = character
 				lastFood = food
@@ -20165,24 +20382,65 @@ task.spawn(function()
 				lastPosition = root.Position
 			end
 
-			local waterNeed = state.autoDrink and water <= 75
-			local foodNeed = state.autoEat and food <= 70
+			-- A committed job remains a need until its refill target is reached. This
+			-- lets the watchdog keep diagnosing a Drink at 80% or Eat at 80% instead
+			-- of forgetting it merely because it crossed the start threshold.
+			if state.survivalArbiter.owner == "water" and water >= 98 then
+				state.survivalArbiterComplete("water")
+			elseif state.survivalArbiter.owner == "food"
+				and food >= 92
+				and not eatingToFull
+				and not state.questCarnivoreFeeding
+				and not state.questBaboonFeeding
+				and not state.questGiraffeFeeding then
+				state.survivalArbiterComplete("food")
+			end
+
+			local waterNeed = state.autoDrink
+				and (water <= 75 or (state.survivalArbiter.owner == "water" and water < 98))
+			local foodNeed = state.autoEat
+				and (food <= 70 or (state.survivalArbiter.owner == "food" and food < 92))
 
 			if not waterNeed and not foodNeed then
 				state.survivalBrain.mode = nil
 				state.survivalBrain.modeSince = 0
+				if state.survivalArbiter.owner == "water" and water >= 98 then
+					state.survivalArbiterComplete("water")
+				elseif state.survivalArbiter.owner == "food" and food >= 92 then
+					state.survivalArbiterComplete("food")
+				end
 				return
 			end
 
-			local wanted
-			if waterNeed and foodNeed then
-				-- Thirst is the more dangerous deadlock. Give it priority once it is
-				-- clearly lower, or whenever it crosses 60%.
-				wanted = (water <= 60 or water <= food - 4) and "water" or "food"
-			elseif waterNeed then
-				wanted = "water"
-			else
-				wanted = "food"
+			local wanted = state.survivalArbiter.owner
+
+			-- Once Food/Water is committed, percentages may fluctuate without changing
+			-- jobs. Only critical thirst may preempt Food.
+			if wanted == "food" and state.autoDrink and water <= 45 then
+				state.survivalArbiterAcquire(
+					"water",
+					food,
+					water,
+					"critical thirst while feeding"
+				)
+				wanted = state.survivalArbiter.owner
+			end
+
+			if not wanted then
+				wanted = state.survivalArbiterChoose(food, water)
+				if wanted then
+					state.survivalArbiterAcquire(
+						wanted,
+						food,
+						water,
+						"Survival Brain initial choice"
+					)
+					wanted = state.survivalArbiter.owner or wanted
+				end
+			end
+
+			if not wanted then
+				return
 			end
 
 			if state.survivalBrain.mode ~= wanted then
