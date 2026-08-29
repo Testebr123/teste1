@@ -237,6 +237,11 @@ local state = {
 		lastDrinkRemoteAt = 0,
 		grassGraceUntil = 0,
 		drinkGraceUntil = 0,
+		circleEatActive = false,
+		circleEatLastProgressAt = 0,
+		circleEatPulseCount = 0,
+		circleEatRestoreAt = 0,
+		circleEatRetryAfter = 0,
 		lastFood = nil,
 		lastWater = nil,
 	},
@@ -274,6 +279,7 @@ local state = {
 		lastRootPosition = nil,
 		lastPhysicalProgressAt = 0,
 		lastQuestValueProgressAt = 0,
+		resumePending = false,
 	},
 	questSwimActive = false,
 	questSwimReady = false,
@@ -2469,6 +2475,34 @@ function state.questZonePriorityActive()
 		and zoneState.zone ~= ""
 end
 
+function state.questLocomotionOwnsGrowth()
+	if not state.autoQuests then return false end
+	if state.questZonePriorityActive() or state.questSwimActive == true then
+		return true
+	end
+
+	local ai = state.MMBAI
+	local lease = ai and ai.MovementManager and ai.MovementManager.lease
+	if lease and lease.owner == "Quest" then
+		return true
+	end
+
+	local verifiedMovement =
+		state.questMovementPriorityVerified == true
+		and state.questMovementPriorityPending == true
+
+	return verifiedMovement
+		and (
+			state.questTravelActive == true
+			or state.questLandInputActive == true
+			or state.questMotionMoving == true
+			or state.autoRunMoveOwnsInput == true
+			or (state.safeMove
+				and state.safeMove.active
+				and state.safeMove.reason == "quest")
+		)
+end
+
 function state.positionInsideMapZone(position, zoneName)
 	if typeof(position) ~= "Vector3"
 		or type(zoneName) ~= "string"
@@ -2600,18 +2634,10 @@ function state.growthPrideRestrictionActive(character)
 		return false
 	end
 
-	-- ZoneTime and Swim own locomotion while they run in parallel with Auto Grow.
+	-- Only concrete Quest locomotion suppresses the Growth home objective.
+	-- An unresolved scan is observation state, not movement ownership.
 	if not state.growthPrideEnabled
-		or (
-			state.autoQuests
-			and state.questZonePriority
-			and state.questZonePriority.resolved == false
-		)
-		or state.questZonePriorityActive()
-		or (
-			state.questGrowthConcurrentActive()
-			and state.questSwimActive
-		) then
+		or state.questLocomotionOwnsGrowth() then
 		return false
 	end
 
@@ -3118,112 +3144,108 @@ function state.growthPrideLiveZoneStatus(
 		pride.zoneLastSource
 end
 
-function state.growthPrideNearestZonePoint(
-	position,
-	character
-)
-	if typeof(position) ~= "Vector3" then
+function state.growthPrideSpawnReference()
+	local spawns = workspace:FindFirstChild("Spawns")
+	local spawn1 = spawns and spawns:FindFirstChild("PrideRockSpawn1", true)
+	return spawn1 and spawn1:IsA("BasePart") and spawn1 or nil
+end
+
+function state.growthPrideNearestZonePoint(position, character)
+	if typeof(position) ~= "Vector3" then return nil end
+
+	local parts = state.growthPrideZoneParts()
+	local spawn1 = state.growthPrideSpawnReference()
+	if not spawn1 or #parts <= 0 then
 		return nil
 	end
 
-	local parts =
-		state.growthPrideZoneParts()
-
-	local best
-	local bestDistance =
-		math.huge
-
-	local inward =
-		tonumber(
-			state.growthPride.zoneReturnMargin
-		) or 18
-
+	local footprint = character and state.movementFootprint(character) or 4
+	local inward = math.clamp(
+		(tonumber(state.growthPride.zoneReturnMargin) or 18)
+			+ math.clamp(footprint * 0.60, 6, 18),
+		24,
+		40
+	)
+	local ranked = {}
 	for _, part in ipairs(parts) do
 		if part and part.Parent then
-			local localPoint =
-				part.CFrame:PointToObjectSpace(
-					position
-				)
+			local localSpawn = part.CFrame:PointToObjectSpace(spawn1.Position)
+			local half = part.Size * 0.5
+			local area = part.Size.X * part.Size.Z
+			local meaningful = math.min(part.Size.X, part.Size.Z) >= 8 and area >= 256
+			local contains = math.abs(localSpawn.X) <= half.X
+				and math.abs(localSpawn.Z) <= half.Z
 
-			local half =
-				part.Size * 0.5
+			local nearest = Vector3.new(
+				math.clamp(localSpawn.X, -half.X, half.X), 0,
+				math.clamp(localSpawn.Z, -half.Z, half.Z)
+			)
+			local distance = Vector3.new(
+				localSpawn.X - nearest.X, 0, localSpawn.Z - nearest.Z
+			).Magnitude
 
-			local localTarget =
-				Vector3.new(
-					math.clamp(
-						localPoint.X,
-						-half.X + inward,
-						half.X - inward
-					),
-					0,
-					math.clamp(
-						localPoint.Z,
-						-half.Z + inward,
-						half.Z - inward
+			if half.X > inward + 1 and half.Z > inward + 1 then
+				local priority, score = 3, distance
+				if meaningful and contains then
+					local clearance = math.min(
+						half.X - math.abs(localSpawn.X),
+						half.Z - math.abs(localSpawn.Z)
 					)
-				)
-
-			local world =
-				part.CFrame:PointToWorldSpace(
-					localTarget
-				)
-
-			local hit =
-				workspace:Raycast(
-					Vector3.new(
-						world.X,
-						math.max(
-							position.Y + 120,
-							200
-						),
-						world.Z
-					),
-					Vector3.new(
-						0,
-						-400,
-						0
-					),
-					terrainParams
-				)
-
-			if hit
-				and hit.Material
-					~= Enum.Material.Water then
-
-				local candidate =
-					hit.Position
-					+ Vector3.new(
-						0,
-						3,
-						0
-					)
-
-				local distance =
-					Vector3.new(
-						candidate.X
-							- position.X,
-						0,
-						candidate.Z
-							- position.Z
-					).Magnitude
-
-				if distance < bestDistance then
-					best =
-						candidate
-
-					bestDistance =
-						distance
+					priority = 1
+					score = -(math.min(area, 10000000) + math.max(clearance, 0) * 100)
+				elseif meaningful then
+					priority = 2
 				end
+				ranked[#ranked + 1] = { part = part, priority = priority, score = score }
 			end
 		end
 	end
 
-	if best then
-		return best
+	table.sort(ranked, function(a, b)
+		return a.priority < b.priority or a.priority == b.priority and a.score < b.score
+	end)
+	local groundParams = RaycastParams.new()
+	groundParams.FilterType = Enum.RaycastFilterType.Include
+	groundParams.FilterDescendantsInstances = { workspace.Terrain }
+	groundParams.IgnoreWater = false
+
+	for _, entry in ipairs(ranked) do
+	local selected = entry.part
+	local half = selected.Size * 0.5
+	local animalLocal = selected.CFrame:PointToObjectSpace(position)
+	local spawnLocal = selected.CFrame:PointToObjectSpace(spawn1.Position)
+	local function clampInterior(point)
+		return Vector3.new(
+			math.clamp(point.X, -half.X + inward, half.X - inward), 0,
+			math.clamp(point.Z, -half.Z + inward, half.Z - inward)
+		)
+	end
+	local base = clampInterior(animalLocal)
+	local spawnInterior = clampInterior(spawnLocal)
+	local towardSpawn = spawnInterior - base
+	local distanceToSpawn = towardSpawn.Magnitude
+	local direction = distanceToSpawn > 0.05 and towardSpawn.Unit or Vector3.zero
+	for _, advance in ipairs({ 0, 8, 16, 24 }) do
+		local localTarget = base + direction * math.min(advance, distanceToSpawn)
+		local world = selected.CFrame:PointToWorldSpace(localTarget)
+		local hit = workspace:Raycast(
+			Vector3.new(world.X, math.max(position.Y + 120, 200), world.Z),
+			Vector3.new(0, -400, 0),
+			groundParams
+		)
+		if hit and hit.Material ~= Enum.Material.Water then
+			local candidate = hit.Position + Vector3.new(0, 3, 0)
+			local verified = selected.CFrame:PointToObjectSpace(candidate)
+			if math.abs(verified.X) <= half.X - inward
+				and math.abs(verified.Z) <= half.Z - inward
+				and state.growthPridePositionInsideZone(candidate, 0) == true then
+				return candidate
+			end
+		end
+	end
 	end
 
-	-- Replication fallback: center of the actual territory, never Spawn1.
-	return state.growthPride.center
+	return nil
 end
 
 function state.growthPrideInside(character, root)
@@ -3250,10 +3272,29 @@ function state.growthPrideInside(character, root)
 		return false
 	end
 
-	-- Unknown/pending may NEVER create Growth movement.
+	-- Keep one bounded replication grace, then let real Pride geometry decide.
 	state.growthPride.zoneLastSource =
 		source
 		or "zone_unknown"
+
+	local pride = state.growthPride
+	local bootstrapActive =
+		pride.zoneStatusCharacter == character
+		and tick() <= (tonumber(pride.zoneBootstrapUntil) or 0)
+	if bootstrapActive then
+		return true
+	end
+
+	local geometric = state.growthPridePositionInsideZone(
+		root.Position,
+		tonumber(pride.zoneMargin) or 7
+	)
+	if geometric ~= nil then
+		pride.zoneLastSource = geometric
+			and "MapZones_unknown_fallback_inside"
+			or "MapZones_unknown_fallback_outside"
+		return geometric
+	end
 
 	return true
 end
@@ -3606,6 +3647,17 @@ task.spawn(function()
 	end
 end)
 
+local function drinkCleanupMayControlBody()
+	local authority = state.MMBAI and state.MMBAI.Authority
+	local owner = authority and authority.currentOwner
+
+	return not authority
+		or owner == nil
+		or owner == "None"
+		or owner == "Water"
+		or owner == "Growth"
+end
+
 local function setSubState(name)
 	-- Reset Point staging owns the completed animal's body exclusively. Once the
 	-- slot-switch transaction starts, no legacy/opportunistic worker may restart
@@ -3614,6 +3666,22 @@ local function setSubState(name)
 	if state.slotSwitchStagingActive == true
 		and (name == "Eating" or name == "Drinking") then
 		return
+	end
+
+	if name == "Drinking" then
+		local character = player.Character
+		local water = character
+			and tonumber(character:GetAttribute("Water"))
+		local target = state.questTravelRefillWaterTarget
+			and state.questTravelRefillWaterTarget()
+
+		if water and target and water >= target then
+			blockClientSubState = false
+			if AskSubState and drinkCleanupMayControlBody() then
+				pcall(AskSubState.InvokeServer, AskSubState, "Walking")
+			end
+			return
+		end
 	end
 
 	if name == "Drinking"
@@ -7789,20 +7857,20 @@ function state.dynamicMovementSpeed(character, mode)
 		--
 		-- Give ONLY mature normal terrestrial animals modest headroom. Croc and
 		-- flyers never enter this branch and keep their conservative land rule.
-		local matureGroundBoost =
-			growth >= 0.95
-				and 1.10
-				or 0.985
+		local matureGround = growth >= 0.95
+		local groundScale = matureGround
+			and 1.10
+			or growthScale
 
 		local target =
 			acceleration
 			* modeScale
-			* matureGroundBoost
+			* groundScale
 
 		local ceiling =
-			growth >= 0.95
+			matureGround
 				and acceleration * 1.12
-				or acceleration * 0.99
+				or acceleration * growthScale
 
 		return math.min(
 			target,
@@ -8558,6 +8626,29 @@ function state.intentionalWaterTransitActive(
 
 	local safeMove =
 		state.safeMove
+
+	-- Slot staging may deliberately cross a river. Water remains legal only for
+	-- the exact live Slots route and only while SafeMove keeps proving progress.
+	local slotSwitchWaterTransit =
+		(isSavannahLife or isDinoLife)
+		and safeMove
+		and safeMove.active == true
+		and safeMove.reason == "slot_switch"
+		and safeMove.allowWaterTransit == true
+		and safeMove.waterTransitKind == "slot_switch"
+		and state.slotSwitchStagingActive == true
+		and typeof(safeMove.target) == "Vector3"
+
+	if slotSwitchWaterTransit then
+		local progressAt =
+			tonumber(safeMove.lastProgressAt)
+			or tonumber(safeMove.startedAt)
+			or 0
+
+		if tick() - progressAt <= 8.0 then
+			return true
+		end
+	end
 
 	-- v5.4 CARNIVORE SPAWN-SEARCH RIVER TRANSIT:
 	-- MirageSpawn/other carcass Spawn Locations are search waypoints, not hazards.
@@ -11324,7 +11415,6 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		local selected = state.survivalArbiterChoose(liveFood, liveWater)
 		local survivalOverride =
 			(options.purpose == "water" or options.purpose == "water_search")
-			and liveWater < 70
 			and selected == "water"
 
 		if not survivalOverride then
@@ -11342,9 +11432,9 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		local liveWater = liveCharacter and tonumber(liveCharacter:GetAttribute("Water")) or 100
 		local selected = state.survivalArbiterChoose(liveFood, liveWater)
 		local survivalOverride =
-			(options.purpose == "food" and liveFood < 80 and selected == "food")
+			(options.purpose == "food" and selected == "food")
 			or ((options.purpose == "water" or options.purpose == "water_search")
-				and liveWater < 70 and selected == "water")
+				and selected == "water")
 
 		if not survivalOverride then
 			return false
@@ -13405,7 +13495,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 		).Magnitude
 
 		local maximumSpeed = math.max(
-			4,
+			math.min(4, acceleration),
 			acceleration * speedScale
 		)
 
@@ -13437,7 +13527,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				state.safeMovementSpeed(character)
 
 			maximumSpeed = math.max(
-				4,
+				math.min(4, liveAcceleration),
 				liveAcceleration * speedScale
 			)
 
@@ -13727,13 +13817,18 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 
 			-- Terrestrial TravelDistance forces W as a movement signal while
 			-- the planner remains the world-space steering authority.
+			local landQuestPurpose =
+				purpose == "quest"
+					or purpose == "growth_home"
+					or purpose == "slot_switch"
 			local landQuestTap =
-				state.autoQuests
-					and state.questLandInputActive
+				state.autoQuests == true
+					and (tonumber(state.questPendingLandCount) or 0) > 0
+					and landQuestPurpose
+					and (purpose ~= "slot_switch" or state.slotSwitchStagingActive == true)
 					and not activeSwimApproach
-					and not flying
+					and not verticalMovement
 					and purpose ~= "safety"
-					and purpose ~= "spawn"
 					and purpose ~= "manual"
 					and not calmRiverApproach
 					and flatDistance > math.max(tolerance * 2.5, 8)
@@ -13744,7 +13839,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 			state.safeMove.nativeW = false
 
 			-- Held W is reserved for the separate Swimming path.
-			if state.questSetW then
+			if state.questSetW and not landQuestTap then
 				state.questSetW(false)
 			end
 
@@ -13841,7 +13936,12 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 				end
 			end
 
-			if progressDistance < lastDistance - 1.25 then
+			local progressEpsilon =
+				math.clamp(maximumSpeed * 0.05, 0.25, 1.25)
+			local stallGrace =
+				1.35 + math.clamp((6 - maximumSpeed) * 0.10, 0, 0.55)
+
+			if progressDistance < lastDistance - progressEpsilon then
 				lastDistance = progressDistance
 				lastProgressAt = now
 				if continuousPrideTransit then
@@ -13884,7 +13984,7 @@ local function safeMoveToPosition(position, maxAttempts, faceTowards, options)
 					return false
 				end
 
-			elseif tick() - lastProgressAt >= 1.35 then
+			elseif tick() - lastProgressAt >= stallGrace then
 				if tick() < hillAvoidUntil
 					and state.safeMove.hill
 					and state.safeMove.hill.sign then
@@ -17312,7 +17412,7 @@ function state.surfaceDrinkLegacySafeMoveToPosition(position, maxAttempts, faceT
 		).Magnitude
 
 		local maximumSpeed = math.max(
-			4,
+			math.min(4, acceleration),
 			acceleration * speedScale
 		)
 
@@ -17344,7 +17444,7 @@ function state.surfaceDrinkLegacySafeMoveToPosition(position, maxAttempts, faceT
 				state.safeMovementSpeed(character)
 
 			maximumSpeed = math.max(
-				4,
+				math.min(4, liveAcceleration),
 				liveAcceleration * speedScale
 			)
 
@@ -17627,13 +17727,18 @@ function state.surfaceDrinkLegacySafeMoveToPosition(position, maxAttempts, faceT
 
 			-- Terrestrial TravelDistance forces W as a movement signal while
 			-- the planner remains the world-space steering authority.
+			local landQuestPurpose =
+				purpose == "quest"
+					or purpose == "growth_home"
+					or purpose == "slot_switch"
 			local landQuestTap =
-				state.autoQuests
-					and state.questLandInputActive
+				state.autoQuests == true
+					and (tonumber(state.questPendingLandCount) or 0) > 0
+					and landQuestPurpose
+					and (purpose ~= "slot_switch" or state.slotSwitchStagingActive == true)
 					and not activeSwimApproach
-					and not flying
+					and not verticalMovement
 					and purpose ~= "safety"
-					and purpose ~= "spawn"
 					and purpose ~= "manual"
 					and not calmRiverApproach
 					and flatDistance > math.max(tolerance * 2.5, 8)
@@ -17644,7 +17749,7 @@ function state.surfaceDrinkLegacySafeMoveToPosition(position, maxAttempts, faceT
 			state.safeMove.nativeW = false
 
 			-- Held W is reserved for the separate Swimming path.
-			if state.questSetW then
+			if state.questSetW and not landQuestTap then
 				state.questSetW(false)
 			end
 
@@ -17713,7 +17818,12 @@ function state.surfaceDrinkLegacySafeMoveToPosition(position, maxAttempts, faceT
 				and (position - current).Magnitude
 				or flatDistance
 
-			if progressDistance < lastDistance - 1.25 then
+			local progressEpsilon =
+				math.clamp(maximumSpeed * 0.05, 0.25, 1.25)
+			local stallGrace =
+				1.35 + math.clamp((6 - maximumSpeed) * 0.10, 0, 0.55)
+
+			if progressDistance < lastDistance - progressEpsilon then
 				local progressNow = tick()
 				lastDistance = progressDistance
 				lastProgressAt = progressNow
@@ -17751,7 +17861,7 @@ function state.surfaceDrinkLegacySafeMoveToPosition(position, maxAttempts, faceT
 					return false
 				end
 
-			elseif tick() - lastProgressAt >= 1.35 then
+			elseif tick() - lastProgressAt >= stallGrace then
 				if tick() < hillAvoidUntil
 					and state.safeMove.hill
 					and state.safeMove.hill.sign then
@@ -23055,9 +23165,36 @@ local function findDistantGrass(origin)
 	return nil
 end
 
+function state.activeAuthoritativeSurvivalTransaction()
+	local authority = state.MMBAI and state.MMBAI.Authority
+	local transaction = authority and authority.transaction
+	local owner = authority and authority.exclusive
+		and (authority.currentOwner == "Food" or authority.currentOwner == "Water")
+		and authority.currentOwner or nil
+	if owner and transaction and transaction.owner == owner
+		and transaction.phase ~= "COMPLETED" and transaction.phase ~= "FAILED" then
+		return owner, transaction
+	end
+	return nil, nil
+end
+
+function state.foodSearchResultObsolete(searchCharacter, searchFood)
+	local character = player.Character
+	if character ~= searchCharacter
+		or not character or not character:FindFirstChild("HumanoidRootPart") then return true end
+	local owner = state.activeAuthoritativeSurvivalTransaction()
+	if owner ~= "Food" then return true end
+	local food = tonumber(character:GetAttribute("Food")) or 100
+	if food > (tonumber(searchFood) or food) + 0.01 then return true end
+	return (state.eatStopPromptVisible and state.eatStopPromptVisible())
+		or (state.grassEatAvailable and state.grassEatAvailable(character))
+end
+
 local function moveToGrass(
 	grassPosition,
-	speedOverride
+	speedOverride,
+	searchCharacter,
+	searchFood
 )
 	local character,
 		root =
@@ -23235,6 +23372,10 @@ local function moveToGrass(
 
 		options.maxSpeed =
 			speedOverride
+	end
+
+	if searchCharacter and state.foodSearchResultObsolete(searchCharacter, searchFood) then
+		return false, "grass_search_obsolete"
 	end
 
 	local moved =
@@ -23566,6 +23707,7 @@ function state.grassSearchTowardPride(foodTarget)
 	end
 
 	local targetFood = tonumber(foodTarget) or 92
+	local searchStartedFood = tonumber(character:GetAttribute("Food")) or 100
 	local foundGrass = nil
 	local promptFound = false
 
@@ -23687,31 +23829,35 @@ function state.grassSearchTowardPride(foodTarget)
 			"Grama encontrada durante a rota; desviando para comer"
 
 		local grassMoved, grassReason =
-			moveToGrass(foundGrass)
+			moveToGrass(foundGrass, nil, character, searchStartedFood)
 
 		if grassMoved then
 			search.retryAt = 0
 			return true, grassReason or "grass_found", foundGrass
 		end
 
-		search.retryAt = tick() + 1.5
+		search.retryAt = grassReason == "grass_search_obsolete" and 0 or tick() + 1.5
 		return false, grassReason or "grass_move_failed"
 	end
 
 	-- If the Pride route itself completed, scan once more from the new position.
 	-- Usually this immediately sees the known grass-rich farming area.
 	if moved then
+		local finalSearchFood = tonumber(character:GetAttribute("Food")) or 100
 		local finalGrass =
 			findNearestGrass(root.Position)
 			or findDistantGrass(root.Position)
 
 		if finalGrass then
 			local grassMoved, grassReason =
-				moveToGrass(finalGrass)
+				moveToGrass(finalGrass, nil, character, finalSearchFood)
 
 			if grassMoved then
 				search.retryAt = 0
 				return true, grassReason or "grass_at_pride", finalGrass
+			elseif grassReason == "grass_search_obsolete" then
+				search.retryAt = 0
+				return false, grassReason
 			end
 		end
 	end
@@ -29542,7 +29688,12 @@ local function eatCarcass(
 		or not humanoid
 		or not carcass.Parent then
 
-		if activeCarcass == carcass then
+		if character == workerCharacter
+			and character
+			and not carcass.Parent then
+			state.retryQuestCarnivoreFeed(character,
+				"Carcass disappeared during Eat acquisition")
+		elseif activeCarcass == carcass then
 			clearActiveCarcass(true)
 		end
 		carcassEatBusy = false
@@ -29742,7 +29893,7 @@ local function eatCarcass(
 			-- A feeding cycle that ACTUALLY started at the quest hunger threshold keeps
 			-- the carcass until 100%, then releases it as before.
 			if (not questFeedCommitted and curFood > 70)
-				or (questFeedCommitted and curFood >= 100) then
+				or (questFeedCommitted and curFood >= 99.5) then
 
 				questReleasedAtFull = true
 				runtimeMessage =
@@ -29960,19 +30111,23 @@ local function eatCarcass(
 		root.AssemblyAngularVelocity = Vector3.zero
 	end
 
-	if questReleasedAtFull then
-		clearActiveCarcass(true)
-		eatingToFull = false
-		state.questCarnivoreFeeding = false
-		eatingStuckSince = nil
-		state.survivalArbiterComplete("food")
-		state.questForceFastRecheckUntil = tick() + 12
-		runtimeMessage =
-			"Carnivore full; carcass released; Auto Quests resumed"
+	local terminalFood = character
+		and tonumber(character:GetAttribute("Food"))
+		or 0
+	local questFoodSatisfied = state.autoQuests == true
+		and terminalFood >= 99.5
+
+	if questReleasedAtFull
+		or (not carcass.Parent and questFoodSatisfied) then
+		state.finishQuestCarnivoreFeed(
+			character,
+			"Carnivore Food complete; returning to Auto Quests"
+		)
 	elseif not carcass.Parent then
-		clearActiveCarcass(true)
-		runtimeMessage =
-			"Locked carcass consumed; searching may continue"
+		state.retryQuestCarnivoreFeed(
+			character,
+			"Committed carcass disappeared before Food completed"
+		)
 	elseif activeCarcassCommitted and activeCarcass == carcass then
 		-- No actionable quest is asking for the character, so preserve the user's
 		-- original exclusive-carcass rule until this Instance disappears.
@@ -30698,10 +30853,14 @@ end
 
 function state.questTravelRefillWaterTarget()
 	local character = player.Character
+	local refill = state.questTravelFullRefill
+	if refill and refill.active and refill.owner == "water" then
+		return 100
+	end
 
-	-- Growing Pride herbivores leave the zone only to solve Water. 98% is the
-	-- completed survival transaction; waiting for a quest-level 100% refill can
-	-- strand the animal at the shoreline after its real Drink job is already done.
+	-- Outside an explicit full-refill transaction, growing Pride herbivores use
+	-- 98% as the completed Water objective. Waiting for an incidental 100% refill
+	-- can strand the animal at the shoreline after its real Drink job is already done.
 	if isSavannahLife
 		and character
 		and not state.questSwimActive
@@ -30711,10 +30870,6 @@ function state.questTravelRefillWaterTarget()
 		return tonumber(preSwitchWaterTarget) or 98
 	end
 
-	local refill = state.questTravelFullRefill
-	if refill and refill.active and refill.owner == "water" then
-		return 100
-	end
 	return tonumber(preSwitchWaterTarget) or 98
 end
 
@@ -31593,6 +31748,116 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local eatingStuckSince
 local lastEatWatchdogFood
 
+local function clearQuestCarnivoreFeedState(character, reason)
+	character = character or player.Character
+	if character and character == player.Character then
+		state.forceStopEatingSubState(character, reason)
+	end
+	clearActiveCarcass(true)
+	eatingStuckSince = nil; lastEatWatchdogFood = nil
+	carcassEatBusy = false
+	resetEatingSearch(character and tonumber(character:GetAttribute("Food")) or 100)
+	return character
+end
+
+function state.finishQuestCarnivoreFeed(character, reason)
+	local arbiter = state.survivalArbiter
+	local transaction = state.MMBAI and state.MMBAI.Authority and state.MMBAI.Authority.transaction
+	local executorThread = coroutine.running()
+	local generation = executorThread and arbiter.executorGenerations[executorThread] or arbiter.transactionGeneration
+	if transaction and transaction.owner == "Food" and generation and transaction.generation ~= generation then return end
+	character = clearQuestCarnivoreFeedState(character, reason)
+	eatingToFull = false; state.questCarnivoreFeeding = false
+	local completed = state.survivalArbiterComplete("food")
+	state.questForceFastRecheckUntil = tick() + 20
+	if not completed and state.questWakeAfterSurvival then
+		pcall(state.questWakeAfterSurvival, "food", reason)
+	end
+	runtimeMessage = reason or "Carnivore Food complete; Auto Quests resumed"
+end
+
+function state.retryQuestCarnivoreFeed(character, reason)
+	character = clearQuestCarnivoreFeedState(character, reason)
+	local owner = state.activeAuthoritativeSurvivalTransaction()
+	local foodStillOwns = owner == "Food"
+		or state.survivalArbiter.owner == "food"
+	if foodStillOwns then
+		eatingToFull = true
+		local ai = state.MMBAI
+		if ai and type(ai.RequestWorker) == "function" then
+			pcall(ai.RequestWorker, ai, "AutoEat", reason, 0.01)
+		end
+	end
+	runtimeMessage = foodStillOwns
+		and "Carcass disappeared; reacquiring Food target"
+		or "Carcass disappeared; stale Eating state cleared"
+end
+
+function state.questPulseOpportunisticEating(character, root, herbivore, food, detected, invokeRemote)
+	local liveCharacter, liveRoot = characterParts()
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local ai = state.MMBAI
+	local authority = ai and ai.Authority
+	local lease = ai and ai.MovementManager and ai.MovementManager.lease
+	local survivalOwner = state.activeAuthoritativeSurvivalTransaction()
+	local watch = state.questLandWWatch
+	local questOwnsLand = state.autoQuests
+		and state.questTravelActive
+		and state.questLandInputActive
+		and state.questMotionMode == "Land"
+		and state.autoRunMoveOwnsInput == true
+		and watch and (watch.lastQuestCount or 0) > 0
+		and state.aiSupervisorCanDriveOwner("Quest")
+	local transactionBlocked = survivalOwner ~= nil
+		or drinkingToFull or eatingToFull
+		or (state.questTravelFullRefill and state.questTravelFullRefill.active)
+	local specialFeeder = isCarnivoreCharacter(character)
+		or isBaboonCharacter(character) or isGiraffeCharacter(character)
+		or state.questCarnivoreFeeding or state.questBaboonFeeding
+		or state.questGiraffeFeeding or carcassEatBusy
+		or BABOON.busy or GIRAFFE.busy
+	local slotBlocked = state.questGrowthReset.exclusive
+		or state.slotSwitchStagingActive == true
+		or (state.slotParkingAudit and state.slotParkingAudit.active)
+		or (state.questSlots and state.questSlots.busy)
+
+	if character ~= liveCharacter
+		or root ~= liveRoot
+		or not humanoid
+		or humanoid.Health <= 0
+		or not isSavannahLife
+		or herbivore ~= true
+		or type(food) ~= "number"
+		or food < 80
+		or food >= 93
+		or detected ~= "Eat"
+		or not AskSubState
+		or not state.autoEat
+		or not questOwnsLand
+		or state.questSwimActive
+		or state.busy
+		or state.growthBusy
+		or slotBlocked
+		or criticalRecoveryActive
+		or DAMAGE.active
+		or forcingPostDrinkMove
+		or transactionBlocked
+		or specialFeeder
+		or (authority and authority.currentOwner ~= nil
+			and authority.currentOwner ~= "None"
+			and authority.currentOwner ~= "Quest")
+		or (lease and lease.owner ~= "Quest")
+		or (state.safeMove and state.safeMove.active)
+		or (state.isCharacterSwimmingState
+			and state.isCharacterSwimmingState(character)) then
+
+		return false
+	end
+
+	if invokeRemote ~= true then return true end
+	return pcall(AskSubState.InvokeServer, AskSubState, "Eating")
+end
+
 function state.questMovementOpportunisticInteract(
 	character,
 	root
@@ -31608,6 +31873,8 @@ function state.questMovementOpportunisticInteract(
 			data.drinkGraceUntil = 0
 			data.lastEatRemoteAt = 0
 			data.lastDrinkRemoteAt = 0
+			data.circleEatActive = false
+			data.circleEatRestoreAt = 0
 		end
 		return nil
 	end
@@ -31633,7 +31900,10 @@ function state.questMovementOpportunisticInteract(
 			state.aquaticRiverEscape
 			and state.aquaticRiverEscape.survivalSuspended
 		) then
-
+		if data then
+			data.circleEatActive = false
+			data.circleEatRestoreAt = 0
+		end
 		return nil
 	end
 
@@ -31649,8 +31919,22 @@ function state.questMovementOpportunisticInteract(
 		data.lastDrinkRemoteAt = 0
 		data.grassGraceUntil = 0
 		data.drinkGraceUntil = 0
+		data.circleEatActive = false
+		data.circleEatLastProgressAt = 0
+		data.circleEatPulseCount = 0
+		data.circleEatRestoreAt = 0
+		data.circleEatRetryAfter = 0
 		data.lastFood = nil
 		data.lastWater = nil
+	end
+
+	local landTravelInteraction = state.questTravelActive
+		and state.questLandInputActive and state.questMotionMode == "Land"
+		and state.autoRunMoveOwnsInput == true
+	if data.circleEatActive and not landTravelInteraction then
+		data.circleEatActive = false
+		data.circleEatRestoreAt = 0
+		data.grassGraceUntil = 0
 	end
 
 	local velocity =
@@ -31678,7 +31962,8 @@ function state.questMovementOpportunisticInteract(
 	local now = tick()
 
 	if now - (data.lastCheckAt or 0) < 0.06 then
-		if now < (data.grassGraceUntil or 0) then
+		if not landTravelInteraction
+			and now < (data.grassGraceUntil or 0) then
 			return "eat_grace"
 		end
 
@@ -31722,14 +32007,18 @@ function state.questMovementOpportunisticInteract(
 		)
 	end
 
-	if type(data.lastFood) == "number"
-		and food > data.lastFood + 0.01 then
+	local foodProgressed = type(data.lastFood) == "number"
+		and food > data.lastFood + 0.01
+	if foodProgressed then
 
-		data.grassGraceUntil =
-			math.max(
+		if data.circleEatActive and landTravelInteraction then
+			data.circleEatLastProgressAt = now
+		elseif not landTravelInteraction then
+			data.grassGraceUntil = math.max(
 				data.grassGraceUntil or 0,
 				now + 1.25
 			)
+		end
 	end
 
 	if type(data.lastWater) == "number"
@@ -31787,12 +32076,8 @@ function state.questMovementOpportunisticInteract(
 				)
 	end
 
-	-- GLOBAL opportunistic grass:
-	-- while an herbivore is already moving, pulse the server Eating substate.
-	-- We deliberately do NOT require DetectMeatGrassWater == "Eat" here: at
-	-- high running speed that prompt can exist for only a fraction of a frame.
-	-- If grass is under the animal the game consumes it; otherwise nothing
-	-- happens and the current route continues completely untouched.
+	-- Travel circle grass is a bounded 92 -> 93 top-up. Other automated movement
+	-- retains its existing Authority-gated opportunistic interaction behavior.
 	local waterOwnsSurvival =
 		not foodEmergency
 		and (
@@ -31807,7 +32092,56 @@ function state.questMovementOpportunisticInteract(
 	-- in the Swim farm. While travelling there on land, grass directly under the
 	-- route is still free: no detour, no stop, no facing change. Dedicated food
 	-- routes remain blocked by autoEatStep for the entire Swim quest.
-	if herbivore
+	if landTravelInteraction then
+		local circleAllowed = state.questPulseOpportunisticEating(
+			character, root, herbivore, food, detected, false)
+
+		local noProgress = data.circleEatActive
+			and (data.circleEatPulseCount or 0) >= 3
+			and now - (data.circleEatLastProgressAt or now) >= 2.0
+		local stopCircleEat = data.circleEatActive
+			and (food >= 93 or not circleAllowed or noProgress)
+		local restoreRunning = false
+
+		if stopCircleEat then
+			data.circleEatActive = false
+			data.circleEatRestoreAt = 0
+			data.grassGraceUntil = 0
+			data.circleEatRetryAfter = noProgress and (now + 2.0) or 0
+			restoreRunning = true
+		elseif data.circleEatActive and (data.circleEatRestoreAt or 0) > 0
+			and now >= data.circleEatRestoreAt then
+			data.circleEatRestoreAt = 0
+			restoreRunning = true
+		end
+
+		if restoreRunning
+			and state.aiSupervisorCanDriveOwner("Quest")
+			and not state.activeAuthoritativeSurvivalTransaction()
+			and AskSubState then
+			pcall(AskSubState.InvokeServer, AskSubState,
+				state.questMoveSubState or "Running")
+		end
+
+		if circleAllowed and now >= (data.circleEatRetryAfter or 0) then
+			if not data.circleEatActive then
+				data.circleEatActive = true
+				data.circleEatLastProgressAt = now
+				data.circleEatPulseCount = 0
+			end
+
+			if now - (data.lastEatRemoteAt or 0) >= 0.40
+				and state.questPulseOpportunisticEating(
+					character, root, herbivore, food, detected, true
+				) then
+				data.lastEatRemoteAt = now
+				data.circleEatPulseCount += 1
+				data.circleEatRestoreAt = now + 0.08
+			end
+			return "eat"
+		end
+
+	elseif herbivore
 		and not isGiraffeCharacter(character)
 		and state.autoEat
 		and not (
@@ -33362,9 +33696,12 @@ local function virtualEatKick()
 	end
 
 	if grass then
-		local moved =
+		local moved, moveReason =
 			moveToGrass(
-				grass
+				grass,
+				nil,
+				character,
+				food
 			)
 
 		if moved then
@@ -33387,7 +33724,7 @@ local function virtualEatKick()
 				runtimeMessage =
 					"Grama sem prompt Eat; procurando outra"
 			end
-		else
+		elseif moveReason ~= "grass_search_obsolete" then
 			temporarilyIgnoreGrass(grass, 4)
 		end
 	elseif isSavannahLife and food < 92 then
@@ -33436,22 +33773,34 @@ end
 state.survivalArbiter = state.survivalArbiter or {
 	owner = nil,
 	ownerSince = 0,
+	transactionGeneration = nil,
+	executorGenerations = setmetatable({}, { __mode = "k" }),
 	lastOwner = nil,
 	handoffNotBefore = 0,
 	lastProgressAt = 0,
 	lastValue = nil,
 	preemptions = 0,
 }
+state.survivalArbiter.executorGenerations =
+	state.survivalArbiter.executorGenerations
+	or setmetatable({}, { __mode = "k" })
+
+-- Weak per-executor bindings survive mirror resets so obsolete callbacks keep
+-- their old generation and can never borrow a newer same-owner commitment.
 
 function state.survivalArbiterReset(reason)
 	local arbiter = state.survivalArbiter
 	arbiter.owner = nil
 	arbiter.ownerSince = 0
+	arbiter.transactionGeneration = nil
 	arbiter.lastOwner = nil
 	arbiter.handoffNotBefore = 0
 	arbiter.lastProgressAt = tick()
 	arbiter.lastValue = nil
 	arbiter.preemptions = 0
+	if state.MMBAI and state.MMBAI.Blackboard then
+		state.MMBAI.Blackboard.survivalVerdict = nil
+	end
 end
 
 function state.authoritativeSurvivalOwner()
@@ -33674,6 +34023,19 @@ function state.survivalArbiterChoose(food, water)
 		tonumber(water)
 			or 100
 
+	local supervisor = state.MMBAI
+	local authority = supervisor and supervisor.Authority
+	if authority and type(authority.SurvivalVerdict) == "function" then
+		local verdict = authority:SurvivalVerdict(supervisor.Blackboard)
+		if verdict and verdict.selected then
+			return verdict.selected:lower()
+		end
+		if verdict and not verdict.foodNeed and not verdict.waterNeed
+			and not verdict.foodCommitted and not verdict.waterCommitted then
+			return nil
+		end
+	end
+
 	local authoritative =
 		state.authoritativeSurvivalOwner()
 
@@ -33796,6 +34158,32 @@ function state.survivalArbiterAcquire(kind, food, water, reason)
 	local now = tick()
 	food = tonumber(food) or 100
 	water = tonumber(water) or 100
+	local supervisor = state.MMBAI
+	local supervisorAuthority = supervisor and supervisor.Authority
+	local executorThread = coroutine.running()
+	local function bindExecutorGeneration(generation)
+		if executorThread and generation ~= nil then
+			arbiter.executorGenerations[executorThread] = generation
+		end
+	end
+	if supervisorAuthority
+		and type(supervisorAuthority.SurvivalVerdict) == "function" then
+		local verdict = supervisorAuthority:SurvivalVerdict(supervisor.Blackboard)
+		local requestedOwner = kind == "food" and "Food" or "Water"
+		if verdict.selected and verdict.selected ~= requestedOwner then return false end
+		supervisorAuthority:Signal(
+			"LegacyArbiterMirror:" .. kind,
+			requestedOwner,
+			reason or "legacy Survival commitment",
+			800,
+			2
+		)
+		supervisorAuthority:Elect(supervisor.Blackboard)
+		if supervisorAuthority.exclusive
+			and supervisorAuthority.currentOwner ~= requestedOwner then
+			return false
+		end
+	end
 
 	local authoritative = state.authoritativeSurvivalOwner()
 	local preferred =
@@ -33815,6 +34203,13 @@ function state.survivalArbiterAcquire(kind, food, water, reason)
 	end
 
 	if arbiter.owner == kind then
+		local transaction = supervisorAuthority and supervisorAuthority.transaction
+		if arbiter.transactionGeneration == nil
+			and transaction
+			and transaction.owner == (kind == "food" and "Food" or "Water") then
+			arbiter.transactionGeneration = transaction.generation
+		end
+		bindExecutorGeneration(arbiter.transactionGeneration)
 		return true
 	end
 
@@ -33871,8 +34266,17 @@ function state.survivalArbiterAcquire(kind, food, water, reason)
 
 	arbiter.owner = kind
 	arbiter.ownerSince = now
+	local transaction = supervisorAuthority and supervisorAuthority.transaction
+	arbiter.transactionGeneration = transaction
+		and transaction.owner == (kind == "food" and "Food" or "Water")
+		and transaction.generation
+		or nil
+	bindExecutorGeneration(arbiter.transactionGeneration)
 	arbiter.lastProgressAt = now
 	arbiter.lastValue = kind == "water" and water or food
+	if state.MMBAI and state.MMBAI.Blackboard then
+		state.MMBAI.Blackboard.survivalVerdict = nil
+	end
 
 	return true
 end
@@ -33964,6 +34368,38 @@ function state.survivalPriorityTakeover(
 
 	if preferred ~= kind then
 		return false
+	end
+
+	local supervisor = state.MMBAI
+	local authority = supervisor and supervisor.Authority
+	if authority and type(authority.Elect) == "function" then
+		local owner = kind == "food" and "Food" or "Water"
+		local value = kind == "food" and food or water
+		authority:Signal(
+			"LegacySurvivalRequest:" .. kind,
+			owner,
+			reason or "legacy Survival request",
+			value <= 25 and 990 or value <= 45 and 940 or 800,
+			3
+		)
+		authority:Elect(supervisor.Blackboard)
+		if authority.currentOwner ~= owner then return false end
+		local physicalOwner = authority:PhysicalOwner(supervisor.Blackboard)
+		if physicalOwner and physicalOwner ~= owner then
+			authority:RequestHandoff(
+				physicalOwner,
+				owner,
+				reason or "legacy Survival request",
+				supervisor.Blackboard
+			)
+			return false
+		end
+		return state.survivalArbiterAcquire(
+			kind,
+			food,
+			water,
+			reason or "Supervisor-approved Survival request"
+		)
 	end
 
 	local purpose =
@@ -34129,13 +34565,44 @@ end
 function state.survivalArbiterComplete(kind)
 	local arbiter = state.survivalArbiter
 	if arbiter.owner ~= kind then return false end
+	local executorThread = coroutine.running()
+	local completionGeneration = executorThread
+		and arbiter.executorGenerations[executorThread]
+		or arbiter.transactionGeneration
+	local authority = state.MMBAI and state.MMBAI.Authority
+	local authorityOwner = kind == "food" and "Food" or "Water"
+	local currentTransaction = authority and authority.transaction
+
+	if currentTransaction
+		and currentTransaction.owner == authorityOwner
+		and completionGeneration ~= nil
+		and currentTransaction.generation ~= completionGeneration then
+		return false
+	end
 
 	arbiter.lastOwner = kind
 	arbiter.owner = nil
 	arbiter.ownerSince = 0
+	arbiter.transactionGeneration = nil
 	arbiter.lastProgressAt = tick()
 	arbiter.lastValue = nil
 	arbiter.handoffNotBefore = tick() + 1.1
+	if state.MMBAI and state.MMBAI.Blackboard then
+		state.MMBAI.Blackboard.survivalVerdict = nil
+	end
+	if authority
+		and completionGeneration ~= nil
+		and type(authority.AdvanceTransaction) == "function" then
+		authority:AdvanceTransaction(
+			authorityOwner,
+			completionGeneration,
+			"COMPLETED",
+			"legacy executor verified Survival completion"
+		)
+	end
+	if state.questWakeAfterSurvival then
+		pcall(state.questWakeAfterSurvival, kind, "verified Survival transaction completed")
+	end
 	return true
 end
 
@@ -34366,7 +34833,6 @@ local function autoEatStep()
 	local priorityFoodNeed =
 		emergencyCharacter
 		and state.autoEat
-		and emergencyFood < 80
 		and state.survivalArbiterChoose(
 			emergencyFood,
 			emergencyWater
@@ -34605,7 +35071,6 @@ local function autoEatStep()
 
 	local foodPriority =
 		state.autoEat
-		and food < 80
 		and preferredSurvival == "food"
 
 	if foodPriority then
@@ -34673,7 +35138,8 @@ local function autoEatStep()
 		and state.autoGrowCurrentSlotComplete(character) then
 
 		if food >= 80
-			and water >= 70 then
+			and water >= 70
+			and state.authoritativeSurvivalOwner() ~= "food" then
 
 			if activeCarcass ~= nil
 				or activeCarcassCommitted
@@ -34839,20 +35305,18 @@ local function autoEatStep()
 					state.questCarnivoreFeeding == true
 
 				local releaseForQuest =
-					(not questFeedCommitted and food >= 80)
-					or (questFeedCommitted and food >= 100)
+					(not questFeedCommitted
+						and food >= 80
+						and state.authoritativeSurvivalOwner() ~= "food")
+					or (questFeedCommitted and food >= 99.5)
 
 				if releaseForQuest then
-					clearActiveCarcass(true)
-					eatingToFull = false
-					state.questCarnivoreFeeding = false
-					eatingStuckSince = nil
-					state.survivalArbiterComplete("food")
-					state.questForceFastRecheckUntil = tick() + 12
-					runtimeMessage =
+					state.finishQuestCarnivoreFeed(
+						character,
 						questFeedCommitted
-						and "Carnivore full; carcass released for Auto Quests"
-						or "Auto Quests priority: passive carcass released"
+							and "Carnivore full; carcass released for Auto Quests"
+							or "Auto Quests priority: passive carcass released"
+					)
 					return
 				end
 			end
@@ -34943,18 +35407,16 @@ local function autoEatStep()
 			and not giraffe
 			and not preSwitchFoodTarget
 
+	local travelFullRefillFood =
+		state.questTravelFullRefill
+		and state.questTravelFullRefill.active
+		and state.questTravelFullRefill.owner == "food"
+
 	if travelHerbivoreFeeding then
-		if not state.questTravelHerbivoreFeed.active
-			and food < 80 then
-
-			state.questTravelHerbivoreFeed.active = true
-
-		elseif state.questTravelHerbivoreFeed.active
-			and food >= 99.5 then
-
-			state.questTravelHerbivoreFeed.active = false
-		end
-	else
+		-- Auto Eat mirrors the authoritative Travel refill; it never promotes an
+		-- opportunistic bite into exclusive Food ownership from a local threshold.
+		state.questTravelHerbivoreFeed.active = travelFullRefillFood == true
+	elseif not travelFullRefillFood then
 		state.questTravelHerbivoreFeed.active = false
 	end
 
@@ -35075,16 +35537,11 @@ local function autoEatStep()
 		end
 
 		if state.questCarnivoreFeeding then
-			if food >= 100 then
-				state.questCarnivoreFeeding = false
-				eatingToFull = false
-				state.survivalArbiterComplete("food")
-				resetEatingSearch(food)
-				clearActiveCarcass(true)
-				eatingStuckSince = nil
-				state.questForceFastRecheckUntil = tick() + 12
-				runtimeMessage =
+			if food >= 99.5 then
+				state.finishQuestCarnivoreFeed(
+					character,
 					"Carnivore full; carcass released; returning to quests"
+				)
 				return
 			end
 		else
@@ -35095,11 +35552,6 @@ local function autoEatStep()
 	elseif state.questCarnivoreFeeding then
 		state.questCarnivoreFeeding = false
 	end
-
-	local travelFullRefillFood =
-		state.questTravelFullRefill
-		and state.questTravelFullRefill.active
-		and state.questTravelFullRefill.owner == "food"
 
 	local foodCap =
 		travelFullRefillFood
@@ -35279,8 +35731,10 @@ local function autoEatStep()
 		eatingToFull =
 			true
 
+		local foodProgressed = lastEatWatchdogFood ~= nil
+			and food > lastEatWatchdogFood + 0.01
 		if lastEatWatchdogFood == nil
-			or food > lastEatWatchdogFood then
+			or foodProgressed then
 
 			lastEatWatchdogFood =
 				food
@@ -35291,6 +35745,23 @@ local function autoEatStep()
 		elseif not eatingStuckSince then
 			eatingStuckSince =
 				tick()
+		end
+
+		local survivalOwner = state.activeAuthoritativeSurvivalTransaction()
+		local eatingHere = state.eatStopPromptVisible and state.eatStopPromptVisible()
+		if not giraffe and not baboon and not carnivore
+			and survivalOwner == "Food" and (foodProgressed or eatingHere) then
+			if state.safeMove and state.safeMove.active
+				and state.safeMove.reason == "food" then
+				state.safeMove.cancelToken += 1
+				state.safeMove.active, state.safeMove.target, state.safeMove.reason = false, nil, nil
+				state.busy = false
+				state.releaseMovementNow(character, true)
+			end
+			runtimeMessage = string.format(
+				"Food transaction: eating current grass (%d%% -> %d%%)",
+				math.floor(food), math.floor(foodCap))
+			return
 		end
 
 		if eatingStuckSince
@@ -35512,6 +35983,7 @@ local function autoEatStep()
 		end
 	end
 
+	local searchCharacter, searchFood = character, food
 	local grass,
 		grassDistance,
 		grassSamples =
@@ -35546,8 +36018,15 @@ local function autoEatStep()
 			local moved,
 				moveReason =
 					moveToGrass(
-						distantGrass
+						distantGrass,
+						nil,
+						searchCharacter,
+						searchFood
 					)
+			if moveReason == "grass_search_obsolete" then
+				runtimeMessage = "Food transaction: current Eat/contact already active"
+				return
+			end
 
 			if moved then
 				task.wait(0.12)
@@ -35596,6 +36075,11 @@ local function autoEatStep()
 
 			return
 		end
+	end
+
+	if state.foodSearchResultObsolete(searchCharacter, searchFood) then
+		runtimeMessage = "Food transaction: current Eat/contact already active"
+		return
 	end
 
 	if not grass then
@@ -35648,7 +36132,8 @@ local function autoEatStep()
 						"Sem grama na area permitida; prioridade de Zone/Growth mantida"
 				end
 			elseif searchReason ~= "cooldown"
-				and searchReason ~= "already_searching" then
+				and searchReason ~= "already_searching"
+				and searchReason ~= "grass_search_obsolete" then
 
 				runtimeMessage =
 					"Busca rumo ao Pride Rock interrompida: "
@@ -35674,8 +36159,16 @@ local function autoEatStep()
 	local moved,
 		moveReason =
 			moveToGrass(
-				grass
+				grass,
+				nil,
+				searchCharacter,
+				searchFood
 			)
+
+	if moveReason == "grass_search_obsolete" then
+		runtimeMessage = "Food transaction: current Eat/contact already active"
+		return
+	end
 
 	if not moved then
 		temporarilyIgnoreGrass(
@@ -38810,7 +39303,7 @@ function state.forceStopActiveDrink(
 		state.drinkSearch.surfaceTransitReason = reason or "drink_cancelled"
 	end
 
-	if state.questSetW then
+	if state.questSetW and drinkCleanupMayControlBody() then
 		pcall(
 			state.questSetW,
 			false
@@ -38820,7 +39313,7 @@ function state.forceStopActiveDrink(
 	-- Stop the game's actual Drinking substate.
 	-- Send once now and once shortly afterwards to defeat a stale drink worker
 	-- that was already mid-iteration when the emergency was raised.
-	if AskSubState then
+	if AskSubState and drinkCleanupMayControlBody() then
 		pcall(
 			AskSubState.InvokeServer,
 			AskSubState,
@@ -38830,7 +39323,9 @@ function state.forceStopActiveDrink(
 		mmbTaskDefer(function()
 			task.wait(0.12)
 
-			if player.Character == character then
+			if player.Character == character
+				and not state.questSwimActive
+				and drinkCleanupMayControlBody() then
 				blockClientSubState = false
 
 				pcall(
@@ -38842,10 +39337,12 @@ function state.forceStopActiveDrink(
 		end)
 	end
 
-	state.releaseMovementNow(
-		character,
-		true
-	)
+	if drinkCleanupMayControlBody() then
+		state.releaseMovementNow(
+			character,
+			true
+		)
+	end
 
 	if reason then
 		runtimeMessage =
@@ -44352,14 +44849,17 @@ local function sustainDrinkAtCurrentPrompt()
 		local finalTarget =
 			state.questTravelRefillWaterTarget()
 
-		if liveWater >= finalTarget
-			and state.forceStopActiveDrink then
-
+		if state.forceStopActiveDrink then
 			state.forceStopActiveDrink(
 				liveCharacter,
-				"Water target reached; Drinking substate released"
+				liveWater >= finalTarget
+					and "Water target reached; Drinking substate released"
+					or "Drink contact ended; native Drinking released for retry"
 			)
 		end
+
+		drinkingStuckSince = nil
+		lastDrinkWatchdogWater = liveWater
 	end
 
 	if liveCharacter
@@ -46450,7 +46950,7 @@ local function autoDrinkStep()
 		) or 100
 
 	local priorityWaterNeed =
-		earlyWater < 70
+		state.autoDrink
 		and state.survivalArbiterChoose(
 			earlyFood,
 			earlyWater
@@ -46577,6 +47077,11 @@ local function autoDrinkStep()
 
 	local authoritativeOwner =
 		state.authoritativeSurvivalOwner()
+
+	if authoritativeOwner == "water"
+		and earlyWater < state.questTravelRefillWaterTarget() then
+		drinkingToFull = true
+	end
 
 	if authoritativeOwner == "food"
 		and not priorityWaterNeed
@@ -47207,7 +47712,11 @@ local function autoDrinkStep()
 			and "Baboon: Water < 70%; drinking has priority"
 			or "Indo beber agua"
 	end
-	if drinkingToFull and water >= state.questTravelRefillWaterTarget() then
+	local completingWaterCommitment = drinkingToFull
+		or authoritativeOwner == "water"
+		or state.survivalArbiter.owner == "water"
+	if completingWaterCommitment
+		and water >= state.questTravelRefillWaterTarget() then
 		local wasUnderground = state.drinkSearch.undergroundMode
 
 		state.questTravelActive = false
@@ -54250,31 +54759,49 @@ state.questLandPermanentW = {
 	steerAt = 0,
 }
 
+function state.questHasPendingLandTravel()
+	return state.autoQuests == true
+		and (tonumber(state.questPendingLandCount) or 0) > 0
+end
+
 function state.questLandPermanentWAllowed()
 	local authority = state.MMBAI and state.MMBAI.Authority
+	local survivalOwner = state.activeAuthoritativeSurvivalTransaction()
+	local safeMove = state.safeMove
+	local safeMoveExecutor = safeMove
+		and safeMove.active == true
+		and safeMove.landQuestW == true
+	local slotSwitchExecutor = safeMoveExecutor
+		and safeMove.reason == "slot_switch"
+		and state.slotSwitchStagingActive == true
+	local autoRunExecutor = state.autoRunMoveOwnsInput == true
+		and questTravelWanted
+		and state.questTravelActive == true
+		and state.questLandInputActive == true
+	local executorOwner = safeMoveExecutor
+		and (safeMove.owner or state.aiSupervisorOwnerForPurpose(safeMove.reason))
+		or "Quest"
 	local safetyOwns = authority
 		and authority.exclusive == true
 		and authority.currentOwner == "Safety"
-	local supervisorAllowsQuest =
-		state.aiSupervisorCanDriveOwner("Quest")
+	local supervisorAllowsExecutor =
+		state.aiSupervisorCanDriveOwner(executorOwner)
 
 	return state.alive
-		and state.autoQuests
-		and questTravelWanted
-		and state.questTravelActive == true
-		and state.questLandInputActive
-		and state.autoRunMoveOwnsInput == true
+		and player.Character ~= nil
+		and state.questHasPendingLandTravel()
+		and (autoRunExecutor or safeMoveExecutor)
 		and not state.questSwimActive
-		and not state.questGrowthReset.exclusive
-		and not state.growthBusy
-		and not state.busy
-		and not questSwitchingAnimal
+		and (not state.questGrowthReset.exclusive or slotSwitchExecutor)
+		and (safeMoveExecutor or not state.growthBusy)
+		and (safeMoveExecutor or not state.busy)
+		and (not questSwitchingAnimal or slotSwitchExecutor)
 		and not criticalRecoveryActive
 		and not DAMAGE.active
 		and not forcingPostDrinkMove
 		and not safetyOwns
-		and supervisorAllowsQuest
-		and not (state.safeMove and state.safeMove.active)
+		and survivalOwner == nil
+		and supervisorAllowsExecutor
 		and not drinkingToFull
 		and not eatingToFull
 		and not state.questCarnivoreFeeding
@@ -54647,6 +55174,11 @@ function state.questSetW(active, forceReassert)
 end
 
 function state.questPulseWForAutoRun()
+	local hold = state.questLandPermanentW
+	if hold and (hold.active or hold.bound or hold.steerBound) then
+		return false
+	end
+
 	if state.questAutoRunWPulseBusy
 		or not state.alive then
 		return false
@@ -54655,6 +55187,13 @@ function state.questPulseWForAutoRun()
 	state.questAutoRunWPulseBusy = true
 
 	task.spawn(function()
+		local permanentW = state.questLandPermanentW
+		if permanentW
+			and (permanentW.active or permanentW.bound or permanentW.steerBound) then
+			state.questAutoRunWPulseBusy = false
+			return
+		end
+
 		-- Kill any old held-W state first. Pure AutoRun steering is MoveTo.
 		state.questSetW(false)
 
@@ -54748,7 +55287,12 @@ function state.questHardRefreshW(reason, silent)
 
 	-- LAND: a true release -> settle -> rebind -> press transaction. The whole body
 	-- is protected so questLandRefreshingW is ALWAYS cleared, even if a helper errors.
-	if state.questLandInputActive and not state.questSwimActive then
+	local safeMoveLandExecutor = state.safeMove
+		and state.safeMove.active == true
+		and state.safeMove.landQuestW == true
+
+	if (state.questLandInputActive or safeMoveLandExecutor)
+		and not state.questSwimActive then
 		if not state.questLandPermanentWAllowed() then
 			if state.questSetLandPermanentW then state.questSetLandPermanentW(false) end
 			return false
@@ -58139,10 +58683,19 @@ function state.survivalBrainTakeover(kind, reason)
 				tostring(reason or "no progress")
 			)
 
-		mmbTaskDefer(function()
-			task.wait(0.12)
-			pcall(autoDrinkStep)
-		end)
+		local supervisor = state.MMBAI
+		if supervisor and type(supervisor.RequestWorker) == "function" then
+			supervisor:RequestWorker(
+				"AutoDrink",
+				reason or "Survival Brain Water recovery",
+				0.12
+			)
+		else
+			mmbTaskDefer(function()
+				task.wait(0.12)
+				pcall(autoDrinkStep)
+			end)
+		end
 	else
 		drinkingToFull = false
 		drinkingSourcePosition = nil
@@ -58186,10 +58739,19 @@ function state.survivalBrainTakeover(kind, reason)
 				tostring(reason or "no progress")
 			)
 
-		mmbTaskDefer(function()
-			task.wait(0.12)
-			pcall(autoEatStep)
-		end)
+		local supervisor = state.MMBAI
+		if supervisor and type(supervisor.RequestWorker) == "function" then
+			supervisor:RequestWorker(
+				"AutoEat",
+				reason or "Survival Brain Food recovery",
+				0.12
+			)
+		else
+			mmbTaskDefer(function()
+				task.wait(0.12)
+				pcall(autoEatStep)
+			end)
+		end
 	end
 
 	return true
@@ -61997,13 +62559,18 @@ function state.updateQuestAutomation()
 		focusAnimal = nil
 	end
 
-	-- Growth policy runs BEFORE a specific-animal switch. This guarantees that a
-	-- mature Baboon/Elephant/etc. can never steal priority from ANY existing
-	-- <100% slot just because a PlayTime quest also exists.
+	-- GrowTime is passive under Auto Quests alone. Only an explicitly launched
+	-- Growth pipeline (or its already-created reset debt) may orchestrate slots.
+	local activeGrowAutomation = state.autoGrowModeActive
+		and state.autoGrowModeActive() == true
+	local existingGrowthDebt = state.questGrowthReset.active ~= nil
+		or state.questGrowthReset.busy == true
+		or state.questGrowthReset.exclusive == true
+	local incompleteGrowTime = state.questHasIncompleteGrowth(quests)
+
 	if not growQuestConcurrent
-		and state.questHasIncompleteGrowth(
-			quests
-		) then
+		and incompleteGrowTime
+		and (activeGrowAutomation or existingGrowthDebt) then
 
 		-- RUN + GROWTH COORDINATION:
 		-- When a terrestrial TravelDistance is pending, Growth must be stacked onto
@@ -62029,6 +62596,12 @@ function state.updateQuestAutomation()
 				or "Growth policy: using existing <100% slot"
 			return
 		end
+	elseif not growQuestConcurrent
+		and incompleteGrowTime
+		and not activeGrowAutomation
+		and not existingGrowthDebt
+		and not focusQuest then
+		questStatusText = "GrowTime pending passively; Grow automation is OFF"
 	end
 
 	if not growQuestConcurrent
@@ -62656,22 +63229,38 @@ function state.questLandWWatchReset()
 	watch.lastRootPosition = nil
 	watch.lastPhysicalProgressAt = 0
 	watch.lastQuestValueProgressAt = 0
+	watch.resumePending = false
 end
 
 function state.questLandWWatchStep()
 	local watch = state.questLandWWatch
 	local now = tick()
+	local authority = state.MMBAI and state.MMBAI.Authority
+	local survivalOwner = state.activeAuthoritativeSurvivalTransaction()
+	local safeMoveSidecar = state.safeMove
+		and state.safeMove.active == true
+		and state.safeMove.landQuestW == true
+	local slotSwitchSidecar = safeMoveSidecar
+		and state.safeMove.reason == "slot_switch"
+		and state.slotSwitchStagingActive == true
 
-	-- Hard blockers. Unlike v3.1, questTravelWanted / questLandInputActive are NOT
+	-- Terminal blockers. Unlike v3.1, questTravelWanted / questLandInputActive are NOT
 	-- blockers here: they are derived state and this watchdog must be able to repair
 	-- them if they were accidentally cleared while a real Land Travel quest remains.
-	if state.questGrowthReset.exclusive
+	if (state.questGrowthReset.exclusive and not slotSwitchSidecar)
 		or not state.autoQuests
 		or state.questSwimActive
 		or (state.questPostSwimHandoff and state.questPostSwimHandoff.active)
-		or questSwitchingAnimal
-		or criticalRecoveryActive
+		or (questSwitchingAnimal and not slotSwitchSidecar) then
+		state.questLandWWatchReset()
+		return
+	end
+
+	-- Food/Water/Safety/Damage are resumable pauses. Preserve the fact that an
+	-- incomplete Land Travel owned W so the same watchdog can rebuild it promptly.
+	if criticalRecoveryActive
 		or DAMAGE.active
+		or survivalOwner ~= nil
 		or drinkingToFull
 		or eatingToFull
 		or state.questCarnivoreFeeding
@@ -62681,7 +63270,13 @@ function state.questLandWWatchStep()
 		or BABOON.busy
 		or GIRAFFE.busy
 		or (state.questTravelFullRefill and state.questTravelFullRefill.active) then
-		state.questLandWWatchReset()
+		watch.resumePending = watch.resumePending == true
+			or watch.lastQuestCount > 0
+			or questTravelWanted
+			or state.questTravelActive
+		watch.activeSince = 0
+		watch.lastProgressAt = now
+		watch.lastSampleAt = now
 		return
 	end
 
@@ -62695,19 +63290,25 @@ function state.questLandWWatchStep()
 	-- currently owns the animal (especially after accidental river entry), it must
 	-- NOT reconstruct Travel intent/W behind Safety's back. That exact race produced
 	-- "lost W/intent ... rebuilt" while the Giraffe was still in water.
-	local authority = state.MMBAI and state.MMBAI.Authority
 	local safetyOwns = authority
 		and authority.exclusive == true
 		and authority.currentOwner == "Safety"
 	local safetyRoute = state.safeMove
 		and state.safeMove.active
 		and state.safeMove.reason == "safety"
+	local intentionalTransit = state.intentionalWaterTransitActive
+		and state.intentionalWaterTransitActive(character, root)
 	local landWaterIntrusion =
 		not isAquaticCharacter(character)
 		and state.isCharacterSwimmingState
 		and state.isCharacterSwimmingState(character)
+		and not intentionalTransit
 
 	if safetyOwns or safetyRoute or forcingPostDrinkMove or landWaterIntrusion then
+		watch.resumePending = watch.resumePending == true
+			or watch.lastQuestCount > 0
+			or questTravelWanted
+			or state.questTravelActive
 		state.autoRunMoveOwnsInput = false
 		if state.questLandPermanentWClearSteer then
 			state.questLandPermanentWClearSteer(true)
@@ -62896,14 +63497,26 @@ function state.questLandWWatchStep()
 
 	local canOwnLandNow = not state.busy
 		and not state.growthBusy
+		and not (state.safeMove and state.safeMove.active)
 		and not incompatibleQuestMove
+		and state.aiSupervisorCanDriveOwner("Quest")
+	local canRepairW = safeMoveSidecar
+		and state.questLandPermanentWAllowed()
+		or (not safeMoveSidecar and canOwnLandNow)
 
-	if canOwnLandNow and (not questTravelWanted or not state.questLandInputActive) then
+	if canOwnLandNow and not safeMoveSidecar and (watch.resumePending
+		or not questTravelWanted
+		or not state.questTravelActive
+		or not state.questLandInputActive
+		or not state.autoRunMoveOwnsInput) then
 		questTravelWanted = true
 		state.questTravelActive = true
 		state.questLandInputActive = true
+		state.autoRunMoveOwnsInput = true
 		state.questMoveSubState = state.questMoveSubState or "Running"
 		state.questForceFastRecheckUntil = math.max(state.questForceFastRecheckUntil or 0, now + 8)
+		watch.resumePending = false
+		watch.lastProgressAt = now
 
 		if now - (watch.lastIntentRepairAt or 0) >= 0.75 then
 			watch.lastIntentRepairAt = now
@@ -62949,7 +63562,7 @@ function state.questLandWWatchStep()
 
 	if forceHealthy then
 		watch.lastHealthyForceAt = now
-	elseif canOwnLandNow and now - (watch.lastIntegrityRepairAt or 0) >= 0.45 then
+	elseif canRepairW and now - (watch.lastIntegrityRepairAt or 0) >= 0.45 then
 		watch.lastIntegrityRepairAt = now
 		watch.lastHardRefreshAt = now
 		watch.hardRefreshCount += 1
@@ -62976,7 +63589,7 @@ function state.questLandWWatchStep()
 
 		local stalledFor = now - (watch.lastProgressAt or now)
 		local refreshAfter = planarSpeed >= 3 and 2.6 or 3.2
-		if canOwnLandNow
+		if canRepairW
 			and stalledFor >= refreshAfter
 			and now - (watch.lastHardRefreshAt or 0) >= 1.45 then
 			watch.lastHardRefreshAt = now
@@ -62991,7 +63604,7 @@ function state.questLandWWatchStep()
 			)
 		end
 	else
-		if canOwnLandNow and now - (watch.lastHardRefreshAt or 0) >= 4 then
+		if canRepairW and now - (watch.lastHardRefreshAt or 0) >= 4 then
 			watch.lastHardRefreshAt = now
 			watch.hardRefreshCount += 1
 			state.questHardRefreshW(
@@ -63290,8 +63903,7 @@ function state.questBuildActiveStatus(quests)
 		return state.hudEnglishStatus(questStatusText), 1
 	end
 
-	return table.concat(lines, "
-"), #lines
+	return table.concat(lines, "\n"), #lines
 end
 
 function state.getQuestNativePlanarSpeed(root)
@@ -65157,6 +65769,8 @@ function state.growthPrideReturnStep()
 		return
 	end
 
+	if state.activeAuthoritativeSurvivalTransaction() then return end
+
 	local excursion = state.growthPride.waterExcursion
 	local excursionActive =
 		excursion
@@ -65168,6 +65782,14 @@ function state.growthPrideReturnStep()
 		and excursion.character ~= character then
 		state.growthPrideClearWaterExcursion("character_changed")
 		excursionActive = false
+	end
+
+	local function prideMembershipConfirmed(liveCharacter, liveRoot)
+		if state.growthPridePositionInsideZone(
+			liveRoot.Position, tonumber(state.growthPride.zoneMargin) or 7
+		) == true then return true end
+		local inside, source = state.growthPrideLiveZoneStatus(liveCharacter, liveRoot)
+		return inside == true and source ~= "PrideRockSpawn1_bootstrap"
 	end
 
 	local physicalInside =
@@ -65182,7 +65804,7 @@ function state.growthPrideReturnStep()
 	end
 
 	if not excursionActive
-		and state.growthPrideInside(character, root) then
+		and prideMembershipConfirmed(character, root) then
 		state.growthPride.returning = false
 		state.growthPride.returnRequested = false
 		return
@@ -65272,19 +65894,23 @@ function state.growthPrideReturnStep()
 	end
 
 	local target
+	local spawnSteering = false
 	if excursionActive
 		and typeof(excursion.anchor) == "Vector3" then
 		target = excursion.anchor
 	else
-		target = state.growthPrideNearestZonePoint(
-			root.Position,
-			character
-		)
+		local spawn1 = state.growthPrideSpawnReference()
+		if spawn1 then
+			target = spawn1.Position
+			spawnSteering = true
+		else
+			target = state.growthPrideNearestZonePoint(root.Position, character)
+		end
 	end
 
 	if typeof(target) ~= "Vector3" then
 		runtimeMessage =
-			"Growth: Pride zone target unavailable; waiting for zone geometry"
+			"Growth: PrideRockSpawn1 and geometry fallback unavailable"
 		return
 	end
 
@@ -65292,8 +65918,10 @@ function state.growthPrideReturnStep()
 	state.growthPride.returnRequested = false
 	state.growthPride.lastReturnAt = tick()
 
-	runtimeMessage =
-		"Growth herbivore: returning to nearest Pride Rock zone edge"
+	runtimeMessage = spawnSteering
+		and "Growth herbivore: moving toward PrideRockSpawn1 until Pride zone is entered"
+		or excursionActive and "Growth herbivore: returning to stored Pride anchor"
+		or "Growth: PrideRockSpawn1 unavailable; using geometry fallback"
 
 	task.spawn(function()
 		safeMoveToPosition(
@@ -65303,7 +65931,7 @@ function state.growthPrideReturnStep()
 			{
 				purpose = "growth_home",
 				forceMoveToLand = true,
-				tolerance = 16,
+				tolerance = spawnSteering and 8 or 16,
 				speedScale = 1,
 				maxDuration = 180,
 				routeCheckInterval = 0.20,
@@ -65313,6 +65941,10 @@ function state.growthPrideReturnStep()
 
 					if liveCharacter ~= character or not liveRoot then
 						return true, "growth_character_changed"
+					end
+
+					if state.activeAuthoritativeSurvivalTransaction() then
+						return true, "growth_survival_transaction"
 					end
 
 					if not state.growthPrideRestrictionActive(liveCharacter) then
@@ -65337,10 +65969,11 @@ function state.growthPrideReturnStep()
 								liveRoot.Position.Z - anchor.Z
 							).Magnitude <= 18
 
-						if physicalInsideNow or nearAnchor then
+						if physicalInsideNow or nearAnchor
+							or prideMembershipConfirmed(liveCharacter, liveRoot) then
 							return true, "pride_water_excursion_returned"
 						end
-					elseif state.growthPrideInside(liveCharacter, liveRoot) then
+					elseif prideMembershipConfirmed(liveCharacter, liveRoot) then
 						return true, "pride_zone_entered"
 					end
 
@@ -65393,7 +66026,7 @@ function state.growthPrideReturnStep()
 			end
 
 			if returnedExcursion
-				or state.growthPrideInside(liveCharacter, liveRoot) then
+				or prideMembershipConfirmed(liveCharacter, liveRoot) then
 
 				runtimeMessage =
 					"Growth herbivore: Pride Rock zone confirmed"
@@ -65682,7 +66315,8 @@ function state.growthTopUpForceFood(
 	-- Comfortable Water >=70 must not keep Giraffe blocked while Food owns.
 	if state.survivalArbiter
 		and state.survivalArbiter.owner == "water"
-		and water >= 70 then
+		and water >= 70
+		and state.authoritativeSurvivalOwner() ~= "water" then
 
 		state.survivalArbiterComplete(
 			"water"
@@ -65711,7 +66345,7 @@ function state.growthTopUpForceFood(
 
 	-- If Water is critical, let Drink save the slot first. Growth will return to
 	-- Food top-up immediately afterwards.
-	if water < 70
+	if (water < 70 or state.authoritativeSurvivalOwner() == "water")
 		and state.autoDrink then
 
 		drinkingToFull = true
@@ -66352,6 +66986,9 @@ function state.moveBeforeSlotChange()
 	state.slotSwitchStagingActive = false
 	state.slotSwitchStagingTarget = nil
 	state.slotStagingOpportunisticEat = false
+	if staged and state.questSetLandPermanentW then
+		pcall(state.questSetLandPermanentW, false)
+	end
 
 	if staged then
 		runtimeMessage = "Slot staging confirmed at " .. tostring(label or "switch point")
@@ -67338,8 +67975,9 @@ function state.growthStep()
 	-- needed, finish the normal Food/Water transaction (92/98), not a 61% top-up.
 	local food = tonumber(character:GetAttribute("Food")) or 100
 	local water = tonumber(character:GetAttribute("Water")) or 100
-	local foodSafe = food >= 80
-	local waterSafe = water >= 70
+	local committedOwner = state.authoritativeSurvivalOwner()
+	local foodSafe = food >= 80 and committedOwner ~= "food"
+	local waterSafe = water >= 70 and committedOwner ~= "water"
 	local preferred = state.survivalArbiterChoose(food, water)
 
 	if not waterSafe and preferred == "water" then
@@ -67641,7 +68279,7 @@ end
 ;(function()
 local ai = {
 	Name = "MMB AI Supervisor",
-	Version = "5.4.0-carcass-search-river-transit",
+	Version = "5.5.0-authoritative-stability",
 	Enabled = true,
 	StartedAt = tick(),
 	Phase = "OBSERVE",
@@ -67670,6 +68308,34 @@ local ai = {
 }
 
 state.MMBAI = ai
+
+-- Authoritative decision policy. Legacy thresholds remain compatibility inputs,
+-- but only this table drives Supervisor need, commitment and handoff decisions.
+ai.Policy = {
+	Survival = {
+		foodNeed = 80,
+		waterNeed = 70,
+		foodRelease = 92,
+		waterRelease = 98,
+		critical = 25,
+		emergency = 45,
+		foodPrepare = 88,
+		waterPrepare = 82,
+		foodPrepareRate = -0.15,
+		waterPrepareRate = -0.12,
+		foodPrepareETA = 75,
+		waterPrepareETA = 80,
+		dualTieMargin = 0.035,
+	},
+	Decision = {
+		minimumOwnerDwell = 2.4,
+		challengerMargin = 225,
+		progressRetention = 5.0,
+	},
+	Recovery = {
+		minimumVerification = 5.0,
+	},
+}
 
 function ai:Now()
 	return tick()
@@ -68187,6 +68853,8 @@ ai.Authority = {
 	lastDeniedOwner = nil,
 	lastDeniedReason = nil,
 	lastDeniedAt = 0,
+	transactionGeneration = 0,
+	transaction = nil,
 }
 
 local Authority = ai.Authority
@@ -68235,6 +68903,182 @@ function Authority:Vitals(context)
 		and humanoid.Health / humanoid.MaxHealth
 		or tonumber(context.healthFraction) or 1
 	return character, food, water, healthFraction
+end
+
+function Authority:SurvivalVerdict(context)
+	context = context or ai.Blackboard
+	local cached = context.survivalVerdict
+	if cached
+		and cached.timestamp == context.timestamp
+		and cached.authorityEpoch == self.epoch then
+		return cached
+	end
+
+	local _, food, water = self:Vitals(context)
+	local policy = ai.Policy.Survival
+	local physicalOwner = self:PhysicalOwner(context)
+	local legacyOwner = state.survivalArbiter and state.survivalArbiter.owner
+
+	local foodCommitted = eatingToFull
+		or carcassEatBusy
+		or state.herbivoreFoodRecovery and state.herbivoreFoodRecovery.active
+		or GIRAFFE and GIRAFFE.exclusiveRecovery and GIRAFFE.exclusiveRecovery.active
+		or physicalOwner == "Food"
+		or self.currentOwner == "Food" and legacyOwner == "food"
+	local waterCommitted = drinkingToFull
+		or state.drinkTest.active
+		or CROC.approachBusy
+		or physicalOwner == "Water"
+		or self.currentOwner == "Water" and legacyOwner == "water"
+
+	local foodNeed = state.autoEat == true and food < policy.foodNeed
+	local waterNeed = state.autoDrink == true and water < policy.waterNeed
+	local foodPrepared = state.autoEat == true
+		and not foodNeed
+		and food <= policy.foodPrepare
+		and ((tonumber(context.foodRate) or 0) < policy.foodPrepareRate
+			or (tonumber(context.foodETA) or math.huge) < policy.foodPrepareETA)
+	local waterPrepared = state.autoDrink == true
+		and not waterNeed
+		and water <= policy.waterPrepare
+		and ((tonumber(context.waterRate) or 0) < policy.waterPrepareRate
+			or (tonumber(context.waterETA) or math.huge) < policy.waterPrepareETA)
+	local foodRatio = food / policy.foodNeed
+	local waterRatio = water / policy.waterNeed
+	local foodEmergencyAgainstWater = foodNeed
+		and (food <= policy.critical
+			or food <= policy.emergency and foodRatio + 0.12 < waterRatio)
+	local waterEmergencyAgainstFood = waterNeed
+		and (water <= policy.critical
+			or water <= policy.emergency and waterRatio + 0.12 < foodRatio)
+
+	local selected
+	if self.currentOwner == "Water"
+		and waterCommitted
+		and water < policy.waterRelease
+		and not foodEmergencyAgainstWater then
+		selected = "Water"
+	elseif self.currentOwner == "Food"
+		and foodCommitted
+		and food < policy.foodRelease
+		and not waterEmergencyAgainstFood then
+		selected = "Food"
+	elseif foodNeed and waterNeed then
+		if math.abs(foodRatio - waterRatio) <= policy.dualTieMargin
+			and (self.currentOwner == "Food" or self.currentOwner == "Water") then
+			selected = self.currentOwner
+		else
+			selected = foodRatio <= waterRatio and "Food" or "Water"
+		end
+	elseif waterNeed then
+		selected = "Water"
+	elseif foodNeed then
+		selected = "Food"
+	elseif waterCommitted and water < policy.waterRelease then
+		selected = "Water"
+	elseif foodCommitted and food < policy.foodRelease then
+		selected = "Food"
+	end
+
+	local verdict = {
+		timestamp = context.timestamp,
+		authorityEpoch = self.epoch,
+		food = food,
+		water = water,
+		foodNeed = foodNeed,
+		waterNeed = waterNeed,
+		foodPrepared = foodPrepared,
+		waterPrepared = waterPrepared,
+		foodCommitted = foodCommitted,
+		waterCommitted = waterCommitted,
+		selected = selected,
+		commitment = selected == "Food" and foodCommitted and "Food"
+			or selected == "Water" and waterCommitted and "Water"
+			or nil,
+	}
+	context.survivalVerdict = verdict
+	context.survivalNeed = selected
+	context.survivalCommitment = verdict.commitment
+	return verdict
+end
+
+function Authority:BeginTransaction(owner, objective, reason)
+	local current = self.transaction
+	if current
+		and current.owner == owner
+		and current.objective == objective
+		and current.phase ~= "COMPLETED"
+		and current.phase ~= "FAILED" then
+		current.reason = reason or current.reason
+		current.updatedAt = tick()
+		return current, false
+	end
+
+	self.transactionGeneration += 1
+	self.transaction = {
+		owner = owner,
+		objective = objective,
+		phase = "REQUESTED",
+		generation = self.transactionGeneration,
+		authorityEpoch = self.epoch,
+		reason = reason,
+		startedAt = tick(),
+		updatedAt = tick(),
+	}
+	return self.transaction, true
+end
+
+function Authority:AdvanceTransaction(owner, generation, phase, reason)
+	local transaction = self.transaction
+	if not transaction or transaction.owner ~= owner then return false end
+	if generation and transaction.generation ~= generation then return false end
+	transaction.phase = phase or transaction.phase
+	transaction.reason = reason or transaction.reason
+	transaction.updatedAt = tick()
+	return true
+end
+
+function Authority:SyncLegacySurvival(context)
+	local arbiter = state.survivalArbiter
+	if not arbiter then return end
+	local verdict = self:SurvivalVerdict(context)
+	local owner = self.exclusive
+		and (self.currentOwner == "Food" or self.currentOwner == "Water")
+		and verdict.selected == self.currentOwner
+		and self.currentOwner:lower()
+		or nil
+
+	if owner then
+		if arbiter.owner ~= owner then
+			arbiter.owner = owner
+			arbiter.ownerSince = tick()
+			arbiter.transactionGeneration = nil
+			arbiter.lastProgressAt = tick()
+			arbiter.lastValue = owner == "food" and verdict.food or verdict.water
+		end
+		local transaction = self.transaction
+		if arbiter.transactionGeneration == nil
+			and transaction
+			and transaction.owner == self.currentOwner then
+			arbiter.transactionGeneration = transaction.generation
+		end
+		if owner == "food" then
+			verdict.foodCommitted = true
+			verdict.commitment = "Food"
+		else
+			verdict.waterCommitted = true
+			verdict.commitment = "Water"
+		end
+		context.survivalCommitment = verdict.commitment
+	elseif (arbiter.owner == "food" and not verdict.foodCommitted)
+		or (arbiter.owner == "water" and not verdict.waterCommitted) then
+		arbiter.lastOwner = arbiter.owner
+		arbiter.owner = nil
+		arbiter.ownerSince = 0
+		arbiter.transactionGeneration = nil
+		arbiter.lastValue = nil
+		arbiter.lastProgressAt = tick()
+	end
 end
 
 function Authority:PhysicalOwner(context)
@@ -68372,33 +69216,33 @@ function Authority:CriticalPreemption(candidateOwner, currentOwner, context)
 			or state.coinFarmSwitching
 		) then
 
-		if food < 80 or water < 70 then
+		if food < ai.Policy.Survival.foodNeed
+			or water < ai.Policy.Survival.waterNeed then
 			return false, "Slots waiting for Survival 80/70"
 		end
 
 		return true, "verified slot transaction"
 	end
 
-	local dual = state.survivalDualCriticalChoice(food, water)
-	local selected = state.survivalArbiter and state.survivalArbiter.owner
+	local survival = self:SurvivalVerdict(context)
 
 	if candidateOwner == "Water" then
 		if context.drinkingProtected == true
 			or state.drinkTest.active
-			or dual == "water"
-			or (water < 70 and (selected == nil or selected == "water")) then
+			or survival.selected == "Water" then
 
-			return true, "Water <70%; Survival handoff required"
+			return true, "Water <" .. ai.Policy.Survival.waterNeed
+				.. "%; Survival handoff required"
 		end
 	end
 
 	if candidateOwner == "Food" then
 		if state.herbivoreFoodRecovery and state.herbivoreFoodRecovery.active
 			or (GIRAFFE and GIRAFFE.exclusiveRecovery and GIRAFFE.exclusiveRecovery.active)
-			or dual == "food"
-			or (food < 80 and (selected == nil or selected == "food")) then
+			or survival.selected == "Food" then
 
-			return true, "Food <80%; Survival handoff required"
+			return true, "Food <" .. ai.Policy.Survival.foodNeed
+				.. "%; Survival handoff required"
 		end
 	end
 
@@ -68432,6 +69276,33 @@ function Authority:OwnerStillValid(owner, context)
 		return false
 	end
 	return true
+end
+
+function Authority:SemanticProgressAge(owner, context)
+	context = context or ai.Blackboard
+	local physicalOwner = self:PhysicalOwner(context)
+	if physicalOwner == owner then
+		return self:PhysicalProgressAge(owner, context)
+	end
+
+	local moduleByOwner = {
+		Safety = "Safety",
+		Water = "AutoDrink",
+		Food = "AutoEat",
+		Quest = "AutoQuests",
+		Growth = "GrowSlots",
+		AFKCoins = "AFKCoins",
+		Slots = "Slots",
+	}
+	local module = ai.ModuleRegistry
+		and ai.ModuleRegistry:Get(moduleByOwner[owner])
+	local progressAt = module and module.runtime
+		and tonumber(module.runtime.lastProgressAt)
+		or 0
+	if owner == "Quest" and ai.QuestTracker then
+		progressAt = math.max(progressAt, tonumber(ai.QuestTracker.lastAggregateProgressAt) or 0)
+	end
+	return progressAt > 0 and math.max(0, tick() - progressAt) or math.huge
 end
 
 function Authority:ShouldKeepPhysicalOwner(physicalOwner, candidateOwner, context)
@@ -68660,16 +69531,17 @@ function Authority:SafetyHazard(context)
 	-- from every Elect()/Enforce()/OwnerScore pass.
 	local drinkProtected = context.drinkingProtected == true
 
-	local savannahNoGoRegion =
-		state.movementSavannahNoGoRegionAt
-		and state.movementSavannahNoGoRegionAt(
-			context.position,
-			0
-		)
-		or nil
+	local environmentFresh = tick() - (tonumber(context.environmentEvidenceAt) or 0) <= 3
+	local savannahNoGoRegion = environmentFresh and context.savannahNoGoRegion or nil
+	local transitOwner = context.intentionalWaterTransit and self:PhysicalOwner(context) or nil
+	local healthyIntentionalTransit = state.questSwimActive == true
+		or transitOwner ~= nil
+			and self:PhysicalProgressAge(transitOwner, context)
+				<= ai.Policy.Decision.progressRetention
 
 	if savannahNoGoRegion
-		and not drinkProtected then
+		and not drinkProtected
+		and not healthyIntentionalTransit then
 
 		return true,
 			"Savannah blocked rock/water region"
@@ -68680,14 +69552,10 @@ function Authority:SafetyHazard(context)
 	-- actually stopped progressing. A healthy legal quest is never expelled.
 	if isSavannahLife
 		and not drinkProtected
-		and state.savannahCanyonPointInsideZone
-		and state.savannahCanyonPointInsideZone(context.position, 4) then
+		and environmentFresh
+		and context.canyonInside == true then
 
-		local canyonCharacter = context.character or player.Character
-		local authorized =
-			state.savannahCanyonEntryAuthorized
-			and state.savannahCanyonEntryAuthorized(canyonCharacter)
-			or false
+		local authorized = context.canyonAuthorized == true
 
 		if not authorized then
 			return true, "Tshukudu Canyon forbidden/trap region"
@@ -68753,7 +69621,8 @@ function Authority:SafetyHazard(context)
 
 	if DAMAGE.active then
 		local _, food, water = self:Vitals(context)
-		if food > 45 and water > 45 then
+		if food > ai.Policy.Survival.emergency
+			and water > ai.Policy.Survival.emergency then
 			return true, "confirmed damage Safety recovery"
 		end
 	end
@@ -68973,6 +69842,12 @@ function Authority:ReleaseStaleSafety(context, reason)
 		self.currentOwner == "Safety"
 
 	if wasSafety then
+		self:AdvanceTransaction(
+			"Safety",
+			nil,
+			"COMPLETED",
+			reason or "verified safe state"
+		)
 		self.currentOwner =
 			"None"
 
@@ -69035,6 +69910,8 @@ end
 function Authority:OwnerScore(owner, context)
 	context = context or ai.Blackboard
 	local _, food, water, health = self:Vitals(context)
+	local survival = self:SurvivalVerdict(context)
+	local policy = ai.Policy.Survival
 
 	if owner == "Safety" then
 		local hazard, reason = self:SafetyHazard(context)
@@ -69051,12 +69928,12 @@ function Authority:OwnerScore(owner, context)
 			and state.autoGrowModeActive()
 			and state.autoGrowCurrentSlotComplete
 			and state.autoGrowCurrentSlotComplete(context.character)
-			and food >= 80
-			and water >= 70
+			and food >= policy.foodNeed
+			and water >= policy.waterNeed
 
 		if (state.slotSwitchStagingActive == true
 			or completedSlotAwaitingReset)
-			and food >= 80 then
+			and food >= policy.foodNeed then
 			return -math.huge, "Reset Point pipeline owns comfortable Food", false
 		end
 
@@ -69070,40 +69947,34 @@ function Authority:OwnerScore(owner, context)
 			)
 
 		local enabled = state.autoEat == true
-			or eatingToFull or carcassEatBusy
+			or survival.foodCommitted
 			or state.herbivoreFoodRecovery and state.herbivoreFoodRecovery.active
 			or giraffeRecoveryNeedsFood
 		if not enabled then return -math.huge, "Food disabled", false end
 		local score, exclusive
-		if food < 80 then
-			score = 10100 + math.max(0, 80 - food) * 16
+		if survival.foodNeed then
+			score = 10100 + math.max(0, policy.foodNeed - food) * 16
 			exclusive = true
-		elseif eatingToFull or carcassEatBusy then
+		elseif survival.foodCommitted and food < policy.foodRelease then
 			score, exclusive = 10820, true
 		else
-			score, exclusive = 2500, false
+			return -math.huge, survival.foodPrepared
+				and "Food preparation only" or "Food satisfied", false
 		end
 
-		if state.survivalArbiter
-			and state.survivalArbiter.owner == "water"
-			and food < 80
-			and water < 70 then
+		if survival.selected == "Water"
+			and survival.foodNeed
+			and survival.waterNeed then
 
 			score = math.min(score, 8900)
 			exclusive = false
-		elseif state.survivalArbiter
-			and state.survivalArbiter.owner == "food" then
+		elseif survival.selected == "Food" then
 
 			score = math.max(score, 10880)
 			exclusive = true
 		end
 		if state.herbivoreFoodRecovery and state.herbivoreFoodRecovery.active then
 			score, exclusive = math.max(score, 10600), true
-		end
-		local dualCritical = state.survivalDualCriticalChoice(food, water)
-		if dualCritical == "food" then
-			score += 260 + math.max(0, water - food) * 4
-			exclusive = true
 		end
 		if giraffeRecoveryNeedsFood then
 			score, exclusive = math.max(score, 10550), true
@@ -69126,8 +69997,7 @@ function Authority:OwnerScore(owner, context)
 	if owner == "Water" then
 		local enabled =
 			state.autoDrink == true
-			or drinkingToFull
-			or state.drinkTest.active
+			or survival.waterCommitted
 
 		if not enabled then
 			return -math.huge,
@@ -69141,31 +70011,25 @@ function Authority:OwnerScore(owner, context)
 
 		local score,
 			exclusive
-		if water < 70 then
-			score = 10120 + math.max(0, 70 - water) * 16
+		if survival.waterNeed then
+			score = 10120 + math.max(0, policy.waterNeed - water) * 16
 			exclusive = true
-		elseif drinkingToFull or state.drinkTest.active then
+		elseif survival.waterCommitted and water < policy.waterRelease then
 			score, exclusive = 10850, true
 		else
-			score, exclusive = 2450, false
+			return -math.huge, survival.waterPrepared
+				and "Water preparation only" or "Water satisfied", false
 		end
 
-		if state.survivalArbiter
-			and state.survivalArbiter.owner == "food"
-			and food < 80
-			and water < 70 then
+		if survival.selected == "Food"
+			and survival.foodNeed
+			and survival.waterNeed then
 
 			score = math.min(score, 8900)
 			exclusive = false
-		elseif state.survivalArbiter
-			and state.survivalArbiter.owner == "water" then
+		elseif survival.selected == "Water" then
 
 			score = math.max(score, 10900)
-			exclusive = true
-		end
-		local dualCritical = state.survivalDualCriticalChoice(food, water)
-		if dualCritical == "water" then
-			score += 260 + math.max(0, food - water) * 4
 			exclusive = true
 		end
 
@@ -69236,12 +70100,19 @@ function Authority:OwnerScore(owner, context)
 		local active = state.safeMove and (state.safeMove.reason == "manual" or state.safeMove.manualRequestPending)
 		return active and 6500 or -math.huge, "Manual Move", false
 	end
-	if owner == "Quest" then return state.autoQuests and 4500 or -math.huge, "Auto Quests", false end
+	if owner == "Quest" then
+		local score = context.desiredOwner == "Quest" and 4850 or 4500
+		return state.autoQuests and score or -math.huge, "Auto Quests", false
+	end
 	if owner == "Growth" then
 		local active = state.growthModeActive and state.growthModeActive()
-		return active and 4300 or -math.huge, "Growth", false
+		local score = context.desiredOwner == "Growth" and 4650 or 4300
+		return active and score or -math.huge, "Growth", false
 	end
-	if owner == "AFKCoins" then return state.farmCoins and 3000 or -math.huge, "AFK Coins", false end
+	if owner == "AFKCoins" then
+		local score = context.desiredOwner == "AFKCoins" and 3350 or 3000
+		return state.farmCoins and score or -math.huge, "AFK Coins", false
+	end
 	return -math.huge, "inactive", false
 end
 
@@ -69275,7 +70146,13 @@ function Authority:Elect(context)
 		self.controllerLeaseUntil = tick() + 1.5
 		if changed then
 			self.epoch = (self.epoch or 0) + 1
+			self:BeginTransaction(
+				"Water",
+				"Survival: Underground Drink",
+				self.currentReason
+			)
 		end
+		self:SyncLegacySurvival(context)
 
 		context.supervisorOwner = self.currentOwner
 		context.supervisorController = self.currentController
@@ -69360,7 +70237,7 @@ function Authority:Elect(context)
 
 	if waterTransaction
 		and water < state.questTravelRefillWaterTarget()
-		and food > 25
+		and food > ai.Policy.Survival.critical
 		and (
 			self.currentOwner == "Water"
 			or physicalOwner == "Water"
@@ -69386,7 +70263,7 @@ function Authority:Elect(context)
 
 	elseif foodTransaction
 		and food < state.questTravelRefillFoodTarget()
-		and water > 25
+		and water > ai.Policy.Survival.critical
 		and (
 			self.currentOwner == "Food"
 			or physicalOwner == "Food"
@@ -69450,6 +70327,35 @@ function Authority:Elect(context)
 			physicalExclusive == true
 	end
 
+	-- Bounded hysteresis applies only to a still-valid, semantically progressing
+	-- owner. Verified emergencies and transactional handoffs bypass it.
+	if self.currentOwner ~= "None"
+		and bestOwner ~= self.currentOwner
+		and self:OwnerStillValid(self.currentOwner, context) then
+		local mustPreempt = self:CriticalPreemption(
+			bestOwner,
+			self.currentOwner,
+			context
+		)
+		local currentScore, currentReason, currentExclusive =
+			self:OwnerScore(self.currentOwner, context)
+		local decisionPolicy = ai.Policy.Decision
+		local dwell = tick() - (self.currentSince or tick())
+		local progressAge = self:SemanticProgressAge(self.currentOwner, context)
+		local retainForDwell = dwell < decisionPolicy.minimumOwnerDwell
+		local retainForProgress = progressAge <= decisionPolicy.progressRetention
+			and bestScore < currentScore + decisionPolicy.challengerMargin
+		if not mustPreempt
+			and currentScore > -math.huge
+			and (retainForDwell or retainForProgress) then
+			bestOwner = self.currentOwner
+			bestScore = currentScore
+			bestReason = "Continuing stable " .. tostring(self.currentOwner)
+				.. " objective · " .. tostring(currentReason)
+			bestExclusive = currentExclusive == true
+		end
+	end
+
 	self.movementOwner =
 		physicalOwner or bestOwner or "None"
 	self.movementReason =
@@ -69464,12 +70370,32 @@ function Authority:Elect(context)
 	local changed = bestOwner ~= self.currentOwner or bestExclusive ~= self.exclusive
 	if changed then
 		local previous = self.currentOwner
+		if previous ~= "None" and previous ~= bestOwner
+			and (not self.transaction
+				or self.transaction.owner ~= previous
+				or self.transaction.phase ~= "COMPLETED"
+					and self.transaction.phase ~= "FAILED") then
+			self:AdvanceTransaction(
+				previous,
+				nil,
+				"VERIFYING",
+				"serialized handoff to " .. tostring(bestOwner)
+			)
+		end
 		self.currentOwner = bestOwner
 		self.currentReason = bestReason
 		self.currentScore = bestScore
 		self.currentSince = tick()
 		self.exclusive = bestExclusive
 		self.epoch += 1
+		local transactionObjective = bestOwner == "Safety" and "Survival: Safety"
+			or bestOwner == "Water" and "Survival: Water"
+			or bestOwner == "Food" and "Survival: Food"
+			or bestOwner == "Slots" and "Slot Pipeline"
+			or nil
+		if bestExclusive and transactionObjective then
+			self:BeginTransaction(bestOwner, transactionObjective, bestReason)
+		end
 		if bestOwner ~= previous then self.currentController = "DecisionEngine"; self.controllerLeaseUntil = 0 end
 		if ai.Telemetry then
 			ai.Telemetry:Push("SupervisorAuthority", "authority", {
@@ -69484,10 +70410,27 @@ function Authority:Elect(context)
 		self.currentScore = bestScore
 		self.exclusive = bestExclusive
 	end
+	local liveTransactionObjective = self.currentOwner == "Safety" and "Survival: Safety"
+		or self.currentOwner == "Water" and "Survival: Water"
+		or self.currentOwner == "Food" and "Survival: Food"
+		or self.currentOwner == "Slots" and "Slot Pipeline"
+		or nil
+	if self.exclusive and liveTransactionObjective
+		and (not self.transaction
+			or self.transaction.owner ~= self.currentOwner
+			or self.transaction.phase == "COMPLETED"
+			or self.transaction.phase == "FAILED") then
+		self:BeginTransaction(
+			self.currentOwner,
+			liveTransactionObjective,
+			self.currentReason
+		)
+	end
 	context.supervisorOwner = self.currentOwner
 	context.supervisorExclusive = self.exclusive
 	context.supervisorReason = self.currentReason
 	context.supervisorEpoch = self.epoch
+	self:SyncLegacySurvival(context)
 	self.lastElectionAt = tick()
 	return self.currentOwner, self.currentScore, self.exclusive
 end
@@ -69553,6 +70496,7 @@ function Authority:RequestController(owner, controller, reason, severity)
 		end
 		self.currentController = controller
 		self.controllerLeaseUntil = now + 3.5
+		self:AdvanceTransaction(owner, nil, "ACQUIRED", reason)
 	end
 
 	return true
@@ -69571,6 +70515,9 @@ function Authority:PermitMovement(owner, purpose, target, options)
 
 	if self.exclusive and self.currentOwner ~= owner then
 		return false, "Supervisor exclusive owner: " .. tostring(self.currentOwner)
+	end
+	if self.currentOwner ~= "None" and self.currentOwner ~= owner then
+		return false, "Supervisor selected owner: " .. tostring(self.currentOwner)
 	end
 
 	local physicalOwner =
@@ -69606,6 +70553,7 @@ function Authority:PermitMovement(owner, purpose, target, options)
 	if self.handoffFrom then
 		return false, "waiting for previous movement owner to release"
 	end
+	self:AdvanceTransaction(owner, nil, "ACQUIRED", purpose)
 
 	return true,
 		self.exclusive
@@ -69615,12 +70563,16 @@ end
 
 function Authority:PermitsWorker(module, context)
 	if not module or module.needsMovement ~= true then return true end
+	if module.owner == "Movement" then return true end
 	context = context or ai.Blackboard
 	if tick() - (self.lastElectionAt or 0) > 0.08 then
 		self:Elect(context)
 	end
 
 	if self.exclusive and module.owner ~= self.currentOwner then
+		return false
+	end
+	if self.currentOwner ~= "None" and module.owner ~= self.currentOwner then
 		return false
 	end
 
@@ -69714,15 +70666,18 @@ function Authority:ProgressTimeout(owner, context)
 			and state.herbivoreFoodRecovery.character == context.character then
 			-- SafeMove has its own sub-second stall detector. Give a long Pride transit
 			-- enough time to negotiate one obstacle before asking for a local replan.
-			return food <= 25 and 8 or food <= 45 and 11 or 14
+			return food <= ai.Policy.Survival.critical and 8
+				or food <= ai.Policy.Survival.emergency and 11 or 14
 		end
-		return food <= 25 and 5.5 or food <= 45 and 8 or 10
+		return food <= ai.Policy.Survival.critical and 5.5
+			or food <= ai.Policy.Survival.emergency and 8 or 10
 	end
 
 	-- SafeMove already owns physical stall detection. The Supervisor must not
 	-- destroy a valid Dino Water route after a 2-3 second frame/movement delay.
 	if owner == "Water" then
-		return water <= 25 and 8 or water <= 45 and 11 or 14
+		return water <= ai.Policy.Survival.critical and 8
+			or water <= ai.Policy.Survival.emergency and 11 or 14
 	end
 
 	if owner == "Manual" then return 9 end
@@ -69877,7 +70832,9 @@ function Authority:ObserveProgress(context)
 			or context.dinoShorelineFoodDeadlock
 			or (context.dangerousWater and not context.intentionalWaterTransit)
 			or (tonumber(context.healthRate) or 0) < -0.8
-		if not physicalHazard and food > 45 and water > 45 then
+		if not physicalHazard
+			and food > ai.Policy.Survival.emergency
+			and water > ai.Policy.Survival.emergency then
 			-- Intentional post-damage protection/heal window: stable waiting is valid.
 			progressed = true
 		end
@@ -69901,6 +70858,12 @@ function Authority:ObserveProgress(context)
 		self.progressWater = context.water
 		self.progressHealth = context.healthFraction
 		self.progressAt = tick()
+		self:AdvanceTransaction(
+			self.currentOwner,
+			nil,
+			"EXECUTING",
+			"verified semantic/physical progress"
+		)
 		return
 	end
 	local stalled = now - (self.progressAt or now)
@@ -69919,6 +70882,8 @@ function Authority:Escalate(context, stalledFor)
 		ai.Telemetry:Push("SupervisorAuthority", "escalate", {reason=reason,owner=owner,result="authoritative escalation",debounce=1.5},
 			"authority-stall:"..tostring(owner), "Supervisor escalation: "..tostring(owner))
 	end
+	self:AdvanceTransaction(owner, nil, "STALLED", reason)
+	self:AdvanceTransaction(owner, nil, "RECOVERING", reason)
 
 	if owner == "Safety" then
 		if not self:SafetyHazard(
@@ -70175,6 +71140,7 @@ function ai.ModuleRegistry:Register(name, specification)
 		circuitReason = nil,
 		circuitTrips = 0,
 		vitalFallbackUntil = 0,
+		recoveryGeneration = 0,
 	}
 
 	self.modules[name] = specification
@@ -70278,8 +71244,18 @@ function ai.ModuleRegistry:IsOperational(name, context)
 		and ai.Authority.exclusive
 		and module.vital
 		and module.owner == ai.Authority.currentOwner
+	local vitalNeedBypass = module.vital and (
+		module.owner == "Safety" and ai.Authority
+			and ai.Authority:SafetyHazard(context or ai.Blackboard)
+		or module.owner == "Water" and state.autoDrink == true
+			and (tonumber((context or ai.Blackboard).water) or 100)
+				< ai.Policy.Survival.waterNeed
+		or module.owner == "Food" and state.autoEat == true
+			and (tonumber((context or ai.Blackboard).food) or 100)
+				< ai.Policy.Survival.foodNeed
+	)
 
-	if authorityBypass then return true end
+	if authorityBypass or vitalNeedBypass then return true end
 
 	if module.circuitPersistsWhenIdle then
 		local blocked = self:CircuitBlocked(module)
@@ -70325,7 +71301,8 @@ function ai.ModuleRegistry:DependenciesReady(module, context)
 						and (
 							drinkingToFull
 							or state.drinkTest.active
-							or (tonumber(context.water) or 100) <= 75
+							or (tonumber(context.water) or 100)
+								<= ai.Policy.Survival.waterNeed
 						)
 					)
 					or (
@@ -70334,7 +71311,8 @@ function ai.ModuleRegistry:DependenciesReady(module, context)
 						and (
 							eatingToFull
 							or carcassEatBusy
-							or (tonumber(context.food) or 100) <= 70
+							or (tonumber(context.food) or 100)
+								<= ai.Policy.Survival.foodNeed
 						)
 					)
 				)
@@ -70381,6 +71359,7 @@ function ai.ModuleRegistry:ResetRuntime(name, reason)
 	runtime.circuitReason = nil
 	runtime.circuitTrips = 0
 	runtime.vitalFallbackUntil = 0
+	runtime.recoveryGeneration = (runtime.recoveryGeneration or 0) + 1
 end
 
 ai.MovementManager = {
@@ -70544,6 +71523,7 @@ end
 
 function ai.MovementManager:ScoreOwner(owner, context, target)
 	context = context or ai.Blackboard
+	local survival = ai.Authority and ai.Authority:SurvivalVerdict(context)
 	local food = tonumber(context.food) or 100
 	local water = tonumber(context.water) or 100
 	local healthFraction = tonumber(context.healthFraction) or 1
@@ -70580,7 +71560,9 @@ function ai.MovementManager:ScoreOwner(owner, context, target)
 		if tonumber(context.waterETA) and context.waterETA < 90 then
 			score += math.max(0, (90 - context.waterETA) * 0.35)
 		end
-		if drinkingToFull or state.survivalArbiter.owner == "water" then score += 12 end
+		if drinkingToFull or survival and survival.selected == "Water" then
+			score += 12
+		end
 	elseif owner == "Food" then
 		score = 61 + (100 - food) * 0.86
 		if food <= 55 then score += 32 end
@@ -70589,7 +71571,9 @@ function ai.MovementManager:ScoreOwner(owner, context, target)
 		if tonumber(context.foodETA) and context.foodETA < 90 then
 			score += math.max(0, (90 - context.foodETA) * 0.30)
 		end
-		if eatingToFull or state.survivalArbiter.owner == "food" then score += 10 end
+		if eatingToFull or survival and survival.selected == "Food" then
+			score += 10
+		end
 	elseif owner == "Slots" then
 		score = state.questGrowthReset.exclusive and 104 or 74
 		if state.slotGuardian.recovering then score += 20 end
@@ -70618,7 +71602,7 @@ function ai.MovementManager:StrongestUrgentOwner(context)
 	context = context or ai.Blackboard
 	if ai.Authority then
 		local owner, score, exclusive = ai.Authority:Elect(context)
-		if exclusive and owner ~= "None" then return owner, score end
+		return owner ~= "None" and owner or nil, score, exclusive
 	end
 
 	-- Non-exclusive behavior remains compatible with the existing Hub.
@@ -70668,12 +71652,14 @@ function ai.MovementManager:Acquire(owner, reason, target, requestedPriority, op
 		or owner == "Water" and state.autoDrink == true and (
 			drinkingToFull
 			or state.drinkTest.active
-			or (tonumber(context.water) or 100) <= 75
+			or (tonumber(context.water) or 100)
+				<= ai.Policy.Survival.waterNeed
 		)
 		or owner == "Food" and state.autoEat == true and (
 			eatingToFull
 			or carcassEatBusy
-			or (tonumber(context.food) or 100) <= 70
+			or (tonumber(context.food) or 100)
+				<= ai.Policy.Survival.foodNeed
 		)
 	if not vitalMovementBypass
 		and not ai.ModuleRegistry:IsOperational("Movement", context) then
@@ -70718,11 +71704,6 @@ function ai.MovementManager:Acquire(owner, reason, target, requestedPriority, op
 
 	local priority = tonumber(requestedPriority)
 		or self:ScoreOwner(owner, context, target)
-	local urgentOwner, urgentPriority = self:StrongestUrgentOwner(context)
-	if urgentOwner and urgentOwner ~= owner and urgentPriority > priority + 1 then
-		return false, nil, "higher priority: " .. urgentOwner
-	end
-
 	local now = tick()
 	local current = self.lease
 	if current and current.owner ~= owner then
@@ -70763,7 +71744,22 @@ function ai.MovementManager:Acquire(owner, reason, target, requestedPriority, op
 		cancelToken = state.safeMove.cancelToken,
 		controllerKind = options.controllerKind or "direct",
 		token = self.nextToken,
+		authorityEpoch = ai.Authority and ai.Authority.epoch or 0,
+		transactionGeneration = ai.Authority
+			and ai.Authority.transaction
+			and ai.Authority.transaction.owner == owner
+			and ai.Authority.transaction.generation
+			or nil,
 	}
+	ai.Blackboard.survivalVerdict = nil
+	if ai.Authority then
+		ai.Authority:AdvanceTransaction(
+			owner,
+			self.lease.transactionGeneration,
+			"EXECUTING",
+			reason
+		)
+	end
 	table.insert(self.ownerHistory, 1, {
 		owner = owner,
 		reason = reason,
@@ -70804,6 +71800,14 @@ function ai.MovementManager:Pulse(owner, reason, target, requestedPriority)
 		end
 		self.lease.lastPulseAt = tick()
 		if typeof(target) == "Vector3" then self.lease.target = target end
+		if ai.Authority then
+			ai.Authority:AdvanceTransaction(
+				owner,
+				self.lease.transactionGeneration,
+				"EXECUTING",
+				reason
+			)
+		end
 		return true, self.lease.token
 	end
 	return self:Acquire(owner, reason, target, requestedPriority)
@@ -70822,6 +71826,14 @@ function ai.MovementManager:Complete(token, success, reason)
 		)
 
 	if success then
+		if ai.Authority then
+			ai.Authority:AdvanceTransaction(
+				lease.owner,
+				lease.transactionGeneration,
+				"VERIFYING",
+				reason or "movement completed"
+			)
+		end
 		ai.Memory:MarkSuccess("route", lease.target)
 		local movementModule = ai.ModuleRegistry:Get("Movement")
 		if movementModule and (
@@ -70847,6 +71859,14 @@ function ai.MovementManager:Complete(token, success, reason)
 			result = "success",
 		})
 	elseif cancelled then
+		if ai.Authority then
+			ai.Authority:AdvanceTransaction(
+				lease.owner,
+				lease.transactionGeneration,
+				"VERIFYING",
+				reason or "movement release acknowledged"
+			)
+		end
 		ai.Telemetry:Push("MovementManager", "cancel", {
 			owner = lease.owner,
 			reason = reason or lease.reason,
@@ -70854,6 +71874,14 @@ function ai.MovementManager:Complete(token, success, reason)
 			result = "cancelled",
 		})
 	else
+		if ai.Authority then
+			ai.Authority:AdvanceTransaction(
+				lease.owner,
+				lease.transactionGeneration,
+				"STALLED",
+				reason or lease.reason
+			)
+		end
 		ai.Memory:MarkFailure("route", lease.target, reason or lease.reason, 35)
 		ai.Telemetry:Push("MovementManager", "failure", {
 			owner = lease.owner,
@@ -70866,6 +71894,7 @@ function ai.MovementManager:Complete(token, success, reason)
 	self.lease = nil
 	self.pendingCancellation = nil
 	self.lastReleaseAt = tick()
+	ai.Blackboard.survivalVerdict = nil
 	return true
 end
 
@@ -71108,6 +72137,7 @@ function ai.MovementManager:CancelOwner(owner, reason, force)
 			self.lease = nil
 			self.pendingCancellation = nil
 			self.lastReleaseAt = tick()
+			ai.Blackboard.survivalVerdict = nil
 		end
 	end
 	return awaitingRelease
@@ -71290,14 +72320,15 @@ function ai.MovementManager:Reconcile(context)
 			self.pendingCancellation = nil
 			self.lastReleaseAt = tick()
 			actual = nil
-			local actualScore = -math.huge
+			local elected = ai.Authority
+				and ai.Authority.currentOwner ~= "None"
+				and ai.Authority.currentOwner
+				or nil
 			for _, entry in ipairs(owners) do
-				if entry.owner ~= releasedOwner then
-					local score = self:ScoreOwner(entry.owner, context)
-					if score > actualScore then
-						actual = entry.owner
-						actualScore = score
-					end
+				if entry.owner ~= releasedOwner
+					and (not elected or entry.owner == elected) then
+					actual = entry.owner
+					break
 				end
 			end
 		elseif tick() - self.lease.cancelRequestedAt > 8
@@ -71381,6 +72412,9 @@ ai.Context = {
 	lastEnvironmentProbeAt = 0,
 	cachedBuried = false,
 	cachedDangerousWater = false,
+	cachedSavannahNoGoRegion = nil,
+	cachedCanyonInside = false,
+	cachedCanyonAuthorized = false,
 }
 
 function ai.Context:Rate(field, seconds)
@@ -71613,6 +72647,19 @@ function ai.Context:Update(sampleVitals)
 				root
 			)
 			or false
+		self.cachedSavannahNoGoRegion = isSavannahLife
+			and state.movementSavannahNoGoRegionAt
+			and state.movementSavannahNoGoRegionAt(root.Position, 0)
+			or nil
+		self.cachedCanyonInside = isSavannahLife
+			and state.savannahCanyonPointInsideZone
+			and state.savannahCanyonPointInsideZone(root.Position, 4)
+			or false
+		self.cachedCanyonAuthorized = self.cachedCanyonInside
+			and state.savannahCanyonEntryAuthorized
+			and state.savannahCanyonEntryAuthorized(character)
+			or false
+		board.environmentEvidenceAt = now
 
 		board.intentionalWaterTransit =
 			intentionalWaterTransit
@@ -71620,6 +72667,9 @@ function ai.Context:Update(sampleVitals)
 		self.environmentCharacter = character
 		self.cachedBuried = false
 		self.cachedDangerousWater = false
+		self.cachedSavannahNoGoRegion = nil
+		self.cachedCanyonInside = false
+		self.cachedCanyonAuthorized = false
 	end
 	local undergroundDrinkTerrainProtected =
 		state.undergroundDrinkTerrainProtected
@@ -71647,6 +72697,9 @@ function ai.Context:Update(sampleVitals)
 		and not board.drinking
 		and not board.drinkingProtected
 		and not state.questSwimActive
+	board.savannahNoGoRegion = self.cachedSavannahNoGoRegion
+	board.canyonInside = self.cachedCanyonInside == true
+	board.canyonAuthorized = self.cachedCanyonAuthorized == true
 
 	board.dinoShorelineFoodDeadlock =
 		not board.drinkingProtected
@@ -71676,6 +72729,7 @@ ai.GoalManager = {
 	previous = nil,
 	currentSince = tick(),
 	suspended = {},
+	suspendedKeys = {},
 	lastChoice = nil,
 	lastScore = 0,
 }
@@ -71724,59 +72778,45 @@ function ai.GoalManager:Candidates(context)
 	end
 
 	local protectedController = state.hasProtectedMovementController()
-	local undergroundDrinkTerrainProtected =
-		state.undergroundDrinkTerrainProtected
-		and state.undergroundDrinkTerrainProtected(context.character)
-		or false
-	local criticalVitalOwnsHealth =
-		state.survivalCriticalVitalOwnsLowHealth
-		and state.survivalCriticalVitalOwnsLowHealth(
-			context.character,
-			context
-		)
-		or nil
-	local healthRisk = (
-		(context.inVoid and not undergroundDrinkTerrainProtected)
-		or (context.buried and not undergroundDrinkTerrainProtected)
-		or (
-			context.dangerousWater
-				and not context.intentionalWaterTransit
-		)
-		or context.dinoRockTrapped
-		or context.dinoShorelineFoodDeadlock
-		or forcingPostDrinkMove
-		or (state.dinoPostDrinkExit and state.dinoPostDrinkExit.active)
-		or (context.healthFraction <= 0.35 and not criticalVitalOwnsHealth)
-		or (context.healthRate < -0.8 and not criticalVitalOwnsHealth)
-	)
-	if (healthRisk or DAMAGE.active) and operational("Safety") then
+	local healthRisk, healthRiskReason = ai.Authority:SafetyHazard(context)
+	if healthRisk and operational("Safety") then
 		add(
 			"Survival: Safety",
 			"Safety",
-			protectedController and "Supervisor monitoring subordinate recovery" or "health/environment risk",
+			protectedController and "Supervisor monitoring subordinate recovery"
+				or healthRiskReason or "health/environment risk",
 			context.position,
 			"Safety"
 		)
 	end
 
-	local waterNeed = state.autoDrink and (
-		context.water < 70
-		or drinkingToFull
-		or (context.water <= 82 and context.waterRate < -0.12)
-		or context.waterETA < 80
-	)
+	local survival = ai.Authority:SurvivalVerdict(context)
+	local waterNeed = survival.waterNeed or survival.waterCommitted
 	local foodEnabled =
 		state.autoEat
 		or (
 			state.herbivoreFoodRecoveryEatWanted
 			and state.herbivoreFoodRecoveryEatWanted()
 		)
-	local foodNeed = foodEnabled and (
-		context.food < 80
-		or eatingToFull
-		or (context.food <= 88 and context.foodRate < -0.15)
-		or context.foodETA < 75
-	)
+	local foodNeed = foodEnabled and (survival.foodNeed or survival.foodCommitted)
+	if survival.waterPrepared then
+		ai.Authority:Signal(
+			"PrepareWater",
+			"Water",
+			"falling Water trend; preparation only",
+			120,
+			1.5
+		)
+	end
+	if survival.foodPrepared then
+		ai.Authority:Signal(
+			"PrepareFood",
+			"Food",
+			"falling Food trend; preparation only",
+			120,
+			1.5
+		)
+	end
 	if waterNeed and operational("AutoDrink") then
 		add("Survival: Water", "Water", "thirst trend/commitment", state.drinkSearch.currentWaterPoint, "AutoDrink")
 	end
@@ -71916,6 +72956,31 @@ function ai.GoalManager:SnapshotGoal(context)
 	}
 end
 
+function ai.GoalManager:SnapshotKey(snapshot)
+	if type(snapshot) ~= "table" then return nil end
+	local targetKey = snapshot.target and ai.Memory:Fingerprint(snapshot.target) or "none"
+	return table.concat({
+		tostring(snapshot.goal),
+		tostring(snapshot.owner),
+		tostring(snapshot.slot),
+		targetKey,
+	}, "|")
+end
+
+function ai.GoalManager:SuspendOnce(context)
+	local snapshot = self:SnapshotGoal(context)
+	local key = self:SnapshotKey(snapshot)
+	if key and self.suspendedKeys[key] then return false end
+	snapshot.key = key
+	table.insert(self.suspended, snapshot)
+	if key then self.suspendedKeys[key] = true end
+	while #self.suspended > 8 do
+		local removed = table.remove(self.suspended, 1)
+		if removed and removed.key then self.suspendedKeys[removed.key] = nil end
+	end
+	return true
+end
+
 function ai.GoalManager:ModuleForGoal(goal)
 	if ai.ModuleRegistry:Get(goal) then return goal end
 	if goal == "Auto Quests" then return "AutoQuests" end
@@ -71926,6 +72991,64 @@ function ai.GoalManager:ModuleForGoal(goal)
 	if goal == "Survival: Safety" then return "Safety" end
 	if goal == "Slot Pipeline" then return "Slots" end
 	return nil
+end
+
+function ai.GoalManager:SelectStableCandidate(candidates, context)
+	local best = candidates[1]
+	local authority = ai.Authority
+	local authorityForced = false
+	if authority and authority.currentOwner ~= "None" then
+		for _, candidate in ipairs(candidates) do
+			if candidate.owner == authority.currentOwner then
+				if authority.exclusive then
+					best = candidate
+					authorityForced = true
+					break
+				end
+				local physicalOwner = authority:PhysicalOwner(context)
+				if physicalOwner == candidate.owner
+					and authority:PhysicalProgressAge(candidate.owner, context)
+						<= ai.Policy.Decision.progressRetention then
+					best = candidate
+				end
+				break
+			end
+		end
+	end
+
+	local currentCandidate
+	for _, candidate in ipairs(candidates) do
+		if candidate.name == self.current then
+			currentCandidate = candidate
+			break
+		end
+	end
+	if not authorityForced and currentCandidate and best ~= currentCandidate then
+		local emergency = authority and authority:CriticalPreemption(
+			best.owner,
+			currentCandidate.owner,
+			context
+		)
+		local dwell = tick() - (self.currentSince or tick())
+		local progressAge = authority
+			and authority:SemanticProgressAge(currentCandidate.owner, context)
+			or math.huge
+		local policy = ai.Policy.Decision
+		if not emergency
+			and (dwell < policy.minimumOwnerDwell
+				or progressAge <= policy.progressRetention
+					and best.score < currentCandidate.score + policy.challengerMargin) then
+			best = currentCandidate
+		end
+	end
+
+	local second
+	for _, candidate in ipairs(candidates) do
+		if candidate ~= best and (not second or candidate.score > second.score) then
+			second = candidate
+		end
+	end
+	return best, second
 end
 
 function ai.GoalManager:CanResume(snapshot, context)
@@ -71946,6 +73069,12 @@ function ai.GoalManager:CanResume(snapshot, context)
 end
 
 function ai.GoalManager:Resume(context, reason)
+	if ai.Authority and ai.Authority.exclusive
+		and (ai.Authority.currentOwner == "Safety"
+			or ai.Authority.currentOwner == "Food"
+			or ai.Authority.currentOwner == "Water") then
+		return nil
+	end
 	for index = #self.suspended, 1, -1 do
 		local snapshot = self.suspended[index]
 		local waitingForCircuit = snapshot.goal == "Manual Move"
@@ -71960,6 +73089,7 @@ function ai.GoalManager:Resume(context, reason)
 		end
 		if waitingForCircuit then continue end
 		table.remove(self.suspended, index)
+		if snapshot.key then self.suspendedKeys[snapshot.key] = nil end
 		if self:CanResume(snapshot, context) then
 			if snapshot.goal == "Manual Move" then
 				task.spawn(function()
@@ -72043,15 +73173,13 @@ end
 
 function ai.GoalManager:Update(context)
 	local candidates = self:Candidates(context)
-	local best = candidates[1]
-	local second = candidates[2]
+	local best, second = self:SelectStableCandidate(candidates, context)
 	local previous = self.current
 	local enteringSurvival = best.name:match("^Survival:") ~= nil
 	local previousSurvival = previous:match("^Survival:") ~= nil
 
 	if enteringSurvival and not previousSurvival and previous ~= "Idle" then
-		table.insert(self.suspended, self:SnapshotGoal(context))
-		while #self.suspended > 8 do table.remove(self.suspended, 1) end
+		self:SuspendOnce(context)
 	end
 
 	if best.name ~= previous then
@@ -72089,6 +73217,8 @@ function ai.GoalManager:Update(context)
 	self.lastScore = best.score
 	self.currentModule = best.moduleName or self:ModuleForGoal(best.name)
 	context.primaryModule = self.currentModule
+	context.desiredOwner = best.owner
+	context.desiredGoal = best.name
 	if previousSurvival and not enteringSurvival then
 		self:Resume(context, "survival objective completed")
 	elseif not enteringSurvival and #self.suspended > 0 then
@@ -72114,6 +73244,8 @@ function ai.SurvivalManager:Act(choice, context)
 	end
 
 	local now = tick()
+	local policy = ai.Policy.Survival
+	local survival = ai.Authority and ai.Authority:SurvivalVerdict(context)
 	if now - self.lastActionAt < 0.65 then return false end
 
 	if choice.owner == "Safety" then
@@ -72307,8 +73439,7 @@ function ai.SurvivalManager:Act(choice, context)
 	elseif choice.owner == "Water"
 		and ai.MovementManager:IsOwnerEnabled("Water", context) then
 		self.lastActionAt = now
-		if context.water >= 70 and context.water <= 82
-			and (context.waterRate < -0.12 or context.waterETA < 80) then
+		if survival and survival.waterPrepared then
 			-- Trend prediction is advisory only. Do NOT turn a safe 76-82% Water
 			-- reading into a committed Drink transaction: drinkingToFull is a hard
 			-- movement lock and previously prevented Growth/PlayTime pairing from even
@@ -72325,18 +73456,17 @@ function ai.SurvivalManager:Act(choice, context)
 
 		-- Movement preemption is owned only by Authority. SurvivalManager observes
 		-- the need and asks its worker/takeover; it never cancels another route itself.
-		if context.water <= 55
-			or context.noMotionFor >= 4 and context.water < 70 then
+		if context.water <= policy.emergency
+			or context.noMotionFor >= 4 and context.water < policy.waterNeed then
 			state.survivalBrainTakeover("water", "MMB AI Water priority")
 		else
-			ai:RequestWorker("AutoDrink", "Water trend preparation")
+			ai:RequestWorker("AutoDrink", "Supervisor selected Water transaction")
 		end
 		return true
 	elseif choice.owner == "Food"
 		and ai.MovementManager:IsOwnerEnabled("Food", context) then
 		self.lastActionAt = now
-		if context.food >= 80 and context.food <= 88
-			and (context.foodRate < -0.15 or context.foodETA < 75) then
+		if survival and survival.foodPrepared then
 			-- Same rule as Water: trend prediction may pre-warm the worker, but it
 			-- cannot create a hard Eat commitment above the real quest-survival
 			-- threshold. This keeps passive Growth/PlayTime concurrency runnable.
@@ -72344,11 +73474,11 @@ function ai.SurvivalManager:Act(choice, context)
 		end
 
 		-- Same rule for Food: request ownership through Authority; no local preemption.
-		if context.food <= 45
-			or context.noMotionFor >= 4 and context.food < 80 then
+		if context.food <= policy.emergency
+			or context.noMotionFor >= 4 and context.food < policy.foodNeed then
 			state.survivalBrainTakeover("food", "MMB AI Food priority")
 		else
-			ai:RequestWorker("AutoEat", "Food trend preparation")
+			ai:RequestWorker("AutoEat", "Supervisor selected Food transaction")
 		end
 		return true
 	end
@@ -72417,6 +73547,14 @@ function ai:ReportSlotConfirmed(characterName, animalName)
 		self.SlotVerification.sequence + self.SlotVerification.positionSequence * 0.001,
 		"expected slot confirmed"
 	)
+	if self.Authority then
+		self.Authority:AdvanceTransaction(
+			"Slots",
+			nil,
+			"COMPLETED",
+			"expected slot identity confirmed"
+		)
+	end
 end
 
 function ai:ApplyUserIntent(changes, reason)
@@ -72471,29 +73609,187 @@ function ai:SyncUserIntentFromState(keys, reason)
 end
 
 ai.WorkerRequests = {}
+ai.WorkerAdvisories = {}
+ai.WorkerDispatch = {}
+ai.WorkerRequestGeneration = 0
+ai.WorkerRequestPolicy = {
+	Safety = { owner = "Safety", consumer = "Supervisor" },
+	AutoDrink = { owner = "Water", consumer = "Supervisor" },
+	AutoEat = { owner = "Food", consumer = "Supervisor" },
+	AutoQuests = { owner = "Quest", consumer = "LegacyScheduler" },
+	GrowSlots = { owner = "Growth", consumer = "LegacyScheduler" },
+	Slots = { owner = "Slots", consumer = "LegacyScheduler" },
+	AFKCoins = { owner = "AFKCoins", consumer = "LegacyScheduler" },
+	AutoGroup = { owner = "Quest", consumer = "LegacyScheduler" },
+}
 
 function ai:RequestWorker(name, reason, delaySeconds)
 	if type(name) ~= "string" then return false end
 	local now = tick()
-	local existing = self.WorkerRequests[name]
-	if existing and now - (existing.requestedAt or 0) < 0.35 then
+	local policy = self.WorkerRequestPolicy[name]
+		or { owner = name, consumer = "LegacyScheduler" }
+	local module = self.ModuleRegistry and self.ModuleRegistry:Get(name)
+
+	-- Legacy schedulers already run their own bounded loops. Their requests are
+	-- explicit wake hints, not a second central spawn queue.
+	if policy.consumer ~= "Supervisor" then
+		self.WorkerAdvisories[name] = {
+			requestedAt = now,
+			reason = reason,
+			owner = policy.owner,
+			consumer = policy.consumer,
+		}
+		if module and module.runtime then
+			module.runtime.requestedAt = now
+			module.runtime.requestReason = reason
+		end
+		return true
+	end
+
+	local authority = self.Authority
+	if authority and authority.currentOwner ~= "None"
+		and authority.currentOwner ~= policy.owner then
 		return false
 	end
+	local liveTransaction = authority and authority.transaction
+	local runtimeStatus = module and module.runtime and module.runtime.status
+	local healthyTransaction = liveTransaction
+		and liveTransaction.owner == policy.owner
+		and (liveTransaction.phase == "ACQUIRED"
+			or liveTransaction.phase == "EXECUTING"
+			or liveTransaction.phase == "VERIFYING")
+		and now - (liveTransaction.updatedAt or 0)
+			<= ai.Policy.Decision.progressRetention
+		and runtimeStatus ~= "stalled"
+		and runtimeStatus ~= "recovering"
+	if healthyTransaction then
+		liveTransaction.reason = reason or liveTransaction.reason
+		return false
+	end
+
+	local activeDispatch = self.WorkerDispatch[name]
+	if activeDispatch
+		and now < (activeDispatch.expiresAt or 0)
+		and activeDispatch.owner == policy.owner then
+		activeDispatch.reason = reason or activeDispatch.reason
+		return false
+	end
+
+	local existing = self.WorkerRequests[name]
+	if existing then
+		local transaction = authority and authority.transaction
+		existing.requestedAt = now
+		existing.runAfter = math.min(
+			existing.runAfter or now,
+			now + math.max(0, tonumber(delaySeconds) or 0)
+		)
+		existing.reason = reason or existing.reason
+		existing.authorityEpoch = authority and authority.epoch or 0
+		existing.transactionGeneration = transaction
+			and transaction.owner == policy.owner
+			and transaction.generation
+			or nil
+		existing.character = self.Blackboard.character or player.Character
+		existing.recoveryGeneration = module and module.runtime
+			and module.runtime.recoveryGeneration or 0
+		return false
+	end
+
+	self.WorkerRequestGeneration += 1
+	local transaction = authority and authority.transaction
 	self.WorkerRequests[name] = {
+		generation = self.WorkerRequestGeneration,
 		requestedAt = now,
 		runAfter = now + math.max(0, tonumber(delaySeconds) or 0),
 		reason = reason,
+		owner = policy.owner,
+		consumer = policy.consumer,
+		authorityEpoch = authority and authority.epoch or 0,
+		transactionGeneration = transaction
+			and transaction.owner == policy.owner
+			and transaction.generation
+			or nil,
+		character = self.Blackboard.character or player.Character,
+		recoveryGeneration = module and module.runtime
+			and module.runtime.recoveryGeneration or 0,
 	}
+	return true
+end
+
+function ai:WorkerRequestCurrent(request)
+	if type(request) ~= "table" then return false end
+	if request.character ~= (self.Blackboard.character or player.Character) then
+		return false
+	end
+	local authority = self.Authority
+	if authority then
+		if authority.currentOwner ~= request.owner then return false end
+		if authority.epoch ~= request.authorityEpoch then return false end
+		if request.transactionGeneration then
+			local transaction = authority.transaction
+			if not transaction
+				or transaction.owner ~= request.owner
+				or transaction.generation ~= request.transactionGeneration then
+				return false
+			end
+		end
+	end
+	local module = self.ModuleRegistry and self.ModuleRegistry:Get(
+		request.owner == "Water" and "AutoDrink"
+		or request.owner == "Food" and "AutoEat"
+		or request.owner == "Safety" and "Safety"
+		or request.owner
+	)
+	if module and module.runtime
+		and (module.runtime.recoveryGeneration or 0)
+			~= (request.recoveryGeneration or 0) then
+		return false
+	end
 	return true
 end
 
 function ai:ConsumeWorkerRequest(name)
 	local request = self.WorkerRequests[name]
-	if not request or tick() < (request.runAfter or 0) then
+	if not request or request.consumer ~= "Supervisor"
+		or tick() < (request.runAfter or 0) then
 		return false, nil
 	end
 	self.WorkerRequests[name] = nil
+	if not self:WorkerRequestCurrent(request) then return false, request end
 	return true, request
+end
+
+function ai:DispatchWorkerRequest(name, request, callback)
+	if not self:WorkerRequestCurrent(request) then return false end
+	self.WorkerDispatch[name] = {
+		generation = request.generation,
+		owner = request.owner,
+		reason = request.reason,
+		expiresAt = tick() + 1.5,
+	}
+	mmbTaskDefer(function()
+		if not self:WorkerRequestCurrent(request) then
+			if self.WorkerDispatch[name]
+				and self.WorkerDispatch[name].generation == request.generation then
+				self.WorkerDispatch[name] = nil
+			end
+			return
+		end
+		if self.Authority then
+			self.Authority:AdvanceTransaction(
+				request.owner,
+				request.transactionGeneration,
+				"EXECUTING",
+				request.reason
+			)
+		end
+		pcall(callback)
+		if self.WorkerDispatch[name]
+			and self.WorkerDispatch[name].generation == request.generation then
+			self.WorkerDispatch[name] = nil
+		end
+	end)
+	return true
 end
 
 ai.QuestTracker = {
@@ -72648,8 +73944,10 @@ function ai.QuestTracker:WaitingReason(quest, context)
 		or state.questSlots.busy or questSwitchingAnimal then
 		return "waiting for safety/slot transaction"
 	end
-	if context.water <= 60 and state.autoDrink then return "waiting for Water" end
-	if context.food <= 50 and state.autoEat then return "waiting for Food" end
+	local survivalOwner = state.activeAuthoritativeSurvivalTransaction()
+	if survivalOwner then
+		return "waiting for authoritative " .. survivalOwner .. " transaction"
+	end
 	return nil
 end
 
@@ -72984,6 +74282,7 @@ local ai = state.MMBAI
 
 ai.RecoveryManager = {
 	activeModule = nil,
+	activeGeneration = 0,
 	lastRecovery = nil,
 }
 
@@ -73006,6 +74305,7 @@ function ai.RecoveryManager:EnterVitalFallback(module, reason, context)
 	runtime.watchdogFailureAt = nil
 	runtime.failureReason = tostring(reason or "vital strategy exhausted")
 	runtime.status = "vital_fallback"
+	runtime.recoveryGeneration = (runtime.recoveryGeneration or 0) + 1
 	if self.activeModule == module.name then self.activeModule = nil end
 	if ai.WatchdogManager
 		and type(ai.WatchdogManager.ResetModuleProbe) == "function" then
@@ -73078,6 +74378,7 @@ function ai.RecoveryManager:OpenCircuit(module, reason, context, baseCooldown)
 		reason or runtime.failureReason or "repeated recovery failure"
 	)
 	runtime.status = "circuit_open"
+	runtime.recoveryGeneration = (runtime.recoveryGeneration or 0) + 1
 	runtime.active = false
 	runtime.verificationDeadline = 0
 	runtime.levelZeroAt = nil
@@ -73166,6 +74467,7 @@ function ai.RecoveryManager:Reset(module, reason)
 	runtime.circuitProbeStartedAt = 0
 	runtime.circuitReason = nil
 	runtime.vitalFallbackUntil = 0
+	runtime.recoveryGeneration = (runtime.recoveryGeneration or 0) + 1
 	if circuitWasActive then
 		runtime.circuitTrips = 0
 		ai.Memory:MarkSuccess("module", module.name)
@@ -73186,9 +74488,68 @@ function ai.RecoveryManager:Reset(module, reason)
 	end
 end
 
+function state.questWakeAfterSurvival(kind, reason)
+	if not state.autoQuests then return false end
+	local activeOwner = state.activeAuthoritativeSurvivalTransaction()
+	if activeOwner then return false end
+	local authority = ai.Authority
+	if DAMAGE.active
+		or state.questGrowthReset.exclusive
+		or state.questSlots.busy
+		or questSwitchingAnimal
+		or state.slotSwitchStagingActive == true
+		or (state.slotParkingAudit and state.slotParkingAudit.active == true)
+		or state.coinFarmSwitching == true
+		or state.coinFarmMenuRecovering == true
+		or authority and authority.exclusive
+			and (authority.currentOwner == "Safety" or authority.currentOwner == "Slots") then
+		return false
+	end
+
+	local module = ai.ModuleRegistry:Get("AutoQuests"); local runtime = module and module.runtime
+	local expectedOwner = kind == "food" and "Food" or "Water"
+	if runtime then
+		local waitSince = tonumber(runtime.survivalWaitSince) or 0
+		local sameVerifiedPause = runtime.survivalWaitOwner == expectedOwner
+			and waitSince > 0
+		local recoveryDuringPause = sameVerifiedPause
+			and (tonumber(runtime.lastRecoveryAt) or 0) >= waitSince - 1
+		local recoveryOrCircuit = (tonumber(runtime.recoveryLevel) or 0) > 0
+			or (tonumber(runtime.circuitOpenUntil) or 0) > 0
+			or runtime.circuitHalfOpen == true
+		if recoveryDuringPause and recoveryOrCircuit then
+			ai.RecoveryManager:Reset(module,
+				"verified Survival completion; Quest stall was intentional")
+		end
+		runtime.survivalWaitOwner = nil; runtime.survivalWaitSince = 0
+	end
+
+	state.questForceFastRecheckUntil = tick() + 20
+	ai:RequestWorker(
+		"AutoQuests",
+		reason or "Survival complete; resume pending quests",
+		0.05
+	)
+end
+
 function ai.RecoveryManager:Trigger(module, reason, context)
 	if not module or not module.runtime then return false end
 	context = context or ai.Blackboard
+	local runtime = module.runtime
+	local activeName = self.activeModule
+	if activeName and activeName ~= module.name then
+		local activeModule = ai.ModuleRegistry:Get(activeName)
+		if module.owner ~= "Safety" then return false end
+		if activeModule and activeModule.runtime then
+			activeModule.runtime.recoveryGeneration =
+				(activeModule.runtime.recoveryGeneration or 0) + 1
+			activeModule.runtime.verificationDeadline = 0
+			activeModule.runtime.status = "waiting_supervisor_authority"
+			activeModule.runtime.failureReason =
+				"recovery serialized behind Safety"
+		end
+		self.activeModule = nil
+	end
 	if module.needsMovement and ai.Authority
 		and not ai.Authority:RequestController(
 			module.owner,
@@ -73203,8 +74564,8 @@ function ai.RecoveryManager:Trigger(module, reason, context)
 			"Waiting for " .. tostring(ai.Authority.currentOwner) .. " control release"
 		return false
 	end
-	local runtime = module.runtime
 	local now = tick()
+	if now < (runtime.verificationDeadline or 0) then return false end
 	if now < (runtime.vitalFallbackUntil or 0) then return false end
 	local circuitBlocked = ai.ModuleRegistry:CircuitBlocked(module, now)
 	local authorityBypass = ai.Authority
@@ -73227,11 +74588,16 @@ function ai.RecoveryManager:Trigger(module, reason, context)
 	-- L0 is a real, non-destructive diagnosis pass. A persistent failure must
 	-- survive one fresh observation before any controller is touched.
 	if runtime.levelZeroAt == nil then
+		self.activeGeneration += 1
+		runtime.recoveryGeneration = (runtime.recoveryGeneration or 0) + 1
 		runtime.levelZeroAt = now
 		runtime.lastRecoveryAt = now
 		runtime.failureReason = tostring(reason or "no verified progress")
 		runtime.status = "diagnosing"
-		runtime.verificationDeadline = now + 2
+		runtime.verificationDeadline = now + math.max(
+			2,
+			ai.Policy.Recovery.minimumVerification
+		)
 		self.activeModule = module.name
 		self.lastRecovery = {
 			module = module.name,
@@ -73253,12 +74619,26 @@ function ai.RecoveryManager:Trigger(module, reason, context)
 	end
 
 	runtime.recoveryLevel = math.min(8, (runtime.recoveryLevel or 0) + 1)
+	self.activeGeneration += 1
+	runtime.recoveryGeneration = (runtime.recoveryGeneration or 0) + 1
+	local recoveryGeneration = runtime.recoveryGeneration
 	runtime.consecutiveFailures = (runtime.consecutiveFailures or 0) + 1
 	runtime.lastRecoveryAt = now
 	runtime.failureReason = tostring(reason or "no verified progress")
 	runtime.status = "recovering"
-	runtime.verificationDeadline = now + math.max(5, minimumGap)
+	runtime.verificationDeadline = now + math.max(
+		ai.Policy.Recovery.minimumVerification,
+		minimumGap
+	)
 	self.activeModule = module.name
+	if ai.Authority then
+		ai.Authority:AdvanceTransaction(
+			module.owner,
+			nil,
+			"RECOVERING",
+			runtime.failureReason
+		)
+	end
 	self.lastRecovery = {
 		module = module.name,
 		level = runtime.recoveryLevel,
@@ -73292,6 +74672,9 @@ function ai.RecoveryManager:Trigger(module, reason, context)
 		)
 	else
 		ok, result = false, "no recovery callback"
+	end
+	if runtime.recoveryGeneration ~= recoveryGeneration then
+		return false
 	end
 
 	ai.Memory:Remember("recoveries", strategy, runtime.failureReason, 600)
@@ -73619,6 +75002,19 @@ ai.SanityAudit = {
 	lastFixAt = {},
 }
 
+ai.Invariants = {
+	A = "one semantic physical movement owner",
+	B = "lower priority cannot cancel a healthy owner",
+	C = "verified progress retains ownership",
+	D = "outgoing owner releases before incoming drive",
+	E = "Authority alone decides cross-owner preemption",
+	F = "legacy Survival mirrors Authority",
+	G = "Safety requires fresh verified evidence",
+	H = "completed Survival releases promptly",
+	I = "suspended objectives resume exactly once",
+	J = "healthy transactions are not repeatedly recovered",
+}
+
 function ai.SanityAudit:Mature(key, condition, seconds)
 	if not condition then
 		self.timers[key] = nil
@@ -73802,6 +75198,50 @@ function ai.SanityAudit:Run(context)
 		pcall(state.questReleaseStaleRecoveryLock)
 	end
 
+	local authoritativeVital = ai.Authority.exclusive
+		and (ai.Authority.currentOwner == "Food"
+			or ai.Authority.currentOwner == "Water")
+		and ai.Authority.currentOwner:lower()
+		or nil
+	local legacyVital = state.survivalArbiter and state.survivalArbiter.owner
+	if self:Mature(
+		"legacy-authority-mismatch",
+		authoritativeVital ~= nil and legacyVital ~= authoritativeVital,
+		0.5
+	) then
+		self:Fix(
+			"legacy-authority-mismatch",
+			"legacy Survival mirror reconciled to Authority",
+			function()
+				ai.Authority:SyncLegacySurvival(context)
+				return true
+			end
+		)
+	end
+
+	local transaction = ai.Authority.transaction
+	local completedVitalStillOwns = transaction
+		and transaction.phase == "COMPLETED"
+		and transaction.owner == ai.Authority.currentOwner
+		and (transaction.owner == "Food" or transaction.owner == "Water")
+	if self:Mature("completed-vital-owner", completedVitalStillOwns, 0.6) then
+		self:Fix(
+			"completed-vital-owner",
+			"completed Survival ownership released",
+			function()
+				ai.Authority:SyncLegacySurvival(context)
+				ai.Authority:Elect(context)
+				return true
+			end
+		)
+	end
+
+	for name, request in pairs(ai.WorkerRequests) do
+		if tick() - (request.requestedAt or 0) > 8 then
+			ai.WorkerRequests[name] = nil
+		end
+	end
+
 	ai.MovementManager:Reconcile(context)
 end
 end)()
@@ -73949,9 +75389,12 @@ ai:RegisterModule("Safety", {
 			return "safety worker requested"
 		elseif level == 3 and state.safeMove.active
 			and ai.MovementManager:OwnerForPurpose(state.safeMove.reason) ~= "Safety" then
-			ai.MovementManager:CancelOwner(
-				ai.MovementManager:OwnerForPurpose(state.safeMove.reason),
-				"Safety recovery"
+			local outgoing = ai.MovementManager:OwnerForPurpose(state.safeMove.reason)
+			ai.Authority:RequestHandoff(
+				outgoing,
+				"Safety",
+				"Safety recovery",
+				context
 			)
 			return "lower-priority movement release requested"
 		elseif level == 4 then
@@ -73960,7 +75403,12 @@ ai:RegisterModule("Safety", {
 			return "local safety route retried"
 		elseif level == 5 then
 			if ai.MovementManager.lease and ai.MovementManager.lease.owner ~= "Safety" then
-				ai.MovementManager:CancelOwner(ai.MovementManager.lease.owner, "Safety handoff")
+				ai.Authority:RequestHandoff(
+					ai.MovementManager.lease.owner,
+					"Safety",
+					"Safety handoff",
+					context
+				)
 			end
 			ai:RequestWorker("Safety", reason)
 			return "Safety received exclusive emergency handoff"
@@ -74059,7 +75507,12 @@ ai:RegisterModule("Movement", {
 		elseif level == 5 then
 			local urgent = ai.MovementManager:StrongestUrgentOwner(context or ai.Blackboard)
 			if urgent and urgent ~= lease.owner then
-				ai.MovementManager:CancelOwner(lease.owner, "verified priority handoff")
+				ai.Authority:RequestHandoff(
+					lease.owner,
+					urgent,
+					"verified priority handoff",
+					context
+				)
 				requestUnderlyingWorker(urgent, reason)
 				return "movement yielded to verified higher-priority owner"
 			end
@@ -74095,8 +75548,8 @@ ai:RegisterModule("AutoDrink", {
 			and ai.Capabilities.Current.surfaceDrink == true
 	end,
 	expectedProgress = function(context)
-		return (context.water < 70 or drinkingToFull)
-			and context.water < 98
+		return (context.water < ai.Policy.Survival.waterNeed or drinkingToFull)
+			and context.water < ai.Policy.Survival.waterRelease
 			and "Water attribute"
 			or false
 	end,
@@ -74109,7 +75562,9 @@ ai:RegisterModule("AutoDrink", {
 			and state.undergroundDrinkWaterLock(context.character) then
 			return { healthy = true, waiting = true, reason = "Underground Drink dedicated progress watchdog owns Water" }
 		end
-		if context.water >= 98 then return { healthy = true } end
+		if context.water >= ai.Policy.Survival.waterRelease then
+			return { healthy = true }
+		end
 		if state.authoritativeSurvivalOwner() == "food" then
 			return { healthy = true, waiting = true, reason = "Supervisor Food owns survival" }
 		end
@@ -74159,7 +75614,12 @@ ai:RegisterModule("AutoDrink", {
 			if ai.MovementManager.lease
 				and ai.MovementManager.lease.owner ~= "Water"
 				and ai.MovementManager.lease.owner ~= "Safety" then
-				ai.MovementManager:CancelOwner(ai.MovementManager.lease.owner, "Water survival handoff")
+				ai.Authority:RequestHandoff(
+					ai.MovementManager.lease.owner,
+					"Water",
+					"Water survival handoff",
+					context
+				)
 			end
 			state.survivalArbiterReset("AI Water handoff")
 			state.survivalArbiterAcquire("water", context.food, context.water, reason)
@@ -74224,8 +75684,8 @@ ai:RegisterModule("AutoEat", {
 			-- Food is not expected to rise until the destination is reached.
 			return false
 		end
-		return (context.food < 80 or eatingToFull)
-			and context.food < 92
+		return (context.food < ai.Policy.Survival.foodNeed or eatingToFull)
+			and context.food < ai.Policy.Survival.foodRelease
 			and "Food attribute"
 			or false
 	end,
@@ -74234,7 +75694,9 @@ ai:RegisterModule("AutoEat", {
 		if not context.characterAlive then
 			return { healthy = true, waiting = true, reason = "waiting for character" }
 		end
-		if context.food >= 92 then return { healthy = true } end
+		if context.food >= ai.Policy.Survival.foodRelease then
+			return { healthy = true }
+		end
 		if state.herbivoreFoodRecovery
 			and state.herbivoreFoodRecovery.active
 			and state.herbivoreFoodRecovery.character == context.character then
@@ -74246,7 +75708,7 @@ ai:RegisterModule("AutoEat", {
 		if state.questGrowthReset.exclusive or DAMAGE.active then
 			return { healthy = true, waiting = true, reason = "higher-priority recovery" }
 		end
-		if state.autoDrink and context.water <= 45 then
+		if state.autoDrink and context.water <= ai.Policy.Survival.emergency then
 			return { healthy = true, waiting = true, reason = "critical Water owns survival" }
 		end
 		if context.food <= 50 and not context.eating and not context.goingToFood then
@@ -74364,6 +75826,11 @@ ai:RegisterModule("GrowSlots", {
 		if context.food <= 60 or context.water <= 60 then
 			return { healthy = true, waiting = true, reason = "waiting for survival" }
 		end
+		local survivalOwner = state.activeAuthoritativeSurvivalTransaction()
+		if survivalOwner then
+			return { healthy = true, waiting = true,
+				reason = "Growth suspended by active " .. survivalOwner .. " transaction" }
+		end
 		if state.questSlots.busy or questSwitchingAnimal or state.slotParkingAudit.active then
 			return { healthy = true, waiting = true, reason = "verified slot transaction" }
 		end
@@ -74375,13 +75842,17 @@ ai:RegisterModule("GrowSlots", {
 		end
 		local lease = ai.MovementManager.lease
 		if lease and lease.owner ~= "Growth" then
+			if lease.owner == "Food" or lease.owner == "Water" then
+				return { healthy = false, reason = "Growth blocked by stale Survival movement owner" }
+			end
 			if ai.MovementManager:IsOwnerEnabled(lease.owner, context) then
 				return { healthy = true, waiting = true, reason = "Growth suspended by " .. lease.owner }
 			end
 			return { healthy = false, reason = "Growth blocked by disabled movement owner" }
 		end
+		local questOwnsMovement = state.questLocomotionOwnsGrowth()
 		if isSavannahLife and state.growthPrideRestrictionActive(context.character)
-			and not state.autoQuests and typeof(context.position) == "Vector3" then
+			and not questOwnsMovement and typeof(context.position) == "Vector3" then
 			local distance = Vector3.new(
 				context.position.X - state.growthPride.home.X,
 				0,
@@ -74390,6 +75861,7 @@ ai:RegisterModule("GrowSlots", {
 			if distance > state.growthPride.radius
 				and not context.goingToFood and not context.goingToWater
 				and not (state.safeMove.active and state.safeMove.reason == "growth_home") then
+				state.growthPride.returnRequested = true
 				return { healthy = false, reason = "Growth outside home without a Growth route" }
 			end
 		end
@@ -74472,15 +75944,28 @@ ai:RegisterModule("AutoQuests", {
 		if not context.characterAlive then
 			return { healthy = true, waiting = true, reason = "waiting for character/slot" }
 		end
+		local survivalOwner = state.activeAuthoritativeSurvivalTransaction()
+		if survivalOwner then
+			local module = ai.ModuleRegistry:Get("AutoQuests")
+			local runtime = module and module.runtime
+			if runtime and runtime.survivalWaitOwner ~= survivalOwner then
+				runtime.survivalWaitOwner = survivalOwner
+				runtime.survivalWaitSince = tick()
+			end
+			return {
+				healthy = true,
+				waiting = true,
+				reason = "waiting for authoritative " .. survivalOwner .. " transaction",
+			}
+		end
 		if context.water <= 60 and not state.autoDrink then
 			return { healthy = false, reason = "Water dependency is OFF while quest survival is unsafe" }
 		end
 		if context.food <= 50 and not state.autoEat then
 			return { healthy = false, reason = "Food dependency is OFF while quest survival is unsafe" }
 		end
-		if context.water <= 60 or context.food <= 50 or DAMAGE.active
-			or state.questGrowthReset.exclusive then
-			return { healthy = true, waiting = true, reason = "survival or slot dependency" }
+		if DAMAGE.active or state.questGrowthReset.exclusive then
+			return { healthy = true, waiting = true, reason = "safety or slot dependency" }
 		end
 		local stalled, _, diagnosis = ai.QuestTracker:StalledQuest(tick(), context)
 		if stalled then
@@ -75140,6 +76625,7 @@ function ai:CriticalObserve()
 	local character, root, humanoid = characterParts()
 	if not character or not root or not humanoid or humanoid.Health <= 0 then return end
 	local board = self.Blackboard
+	board.timestamp = tick()
 	board.character = character
 	board.root = root
 	board.humanoid = humanoid
@@ -75215,31 +76701,9 @@ function ai:CriticalObserve()
 
 	board.dinoRockTrapped =
 		state.dinoRockSafetyHazardLive()
-	local undergroundDrinkProtected =
-		state.undergroundDrinkTerrainProtected
-		and state.undergroundDrinkTerrainProtected(character)
+	local severe = self.Authority
+		and self.Authority:SafetyHazard(board)
 		or false
-
-	local severe =
-		(board.inVoid and not undergroundDrinkProtected)
-		or (
-			not undergroundDrinkProtected
-			and (
-				board.buried
-				or (board.dangerousWater and not board.intentionalWaterTransit)
-			)
-		)
-		or (
-			board.healthFraction <= 0.35
-			and not (
-				state.survivalCriticalVitalOwnsLowHealth
-				and state.survivalCriticalVitalOwnsLowHealth(character, board)
-			)
-		)
-		or board.dinoRockTrapped
-		or board.dinoShorelineFoodDeadlock
-		or forcingPostDrinkMove
-		or (state.dinoPostDrinkExit and state.dinoPostDrinkExit.active)
 
 	if severe then
 		if self.Authority then
@@ -75265,63 +76729,31 @@ function ai:CoordinationStep()
 	local context = self.Context:Update(true)
 	self.Phase = "UNDERSTAND"
 	self.WatchdogManager:Refresh(context)
-	if self.Authority then self.Authority:Tick(context) end
 	self.Phase = "PRIORITIZE"
 	local choice = self.GoalManager:Update(context)
+	if self.Authority then self.Authority:Tick(context) end
 	self.Phase = "ACT"
-	local safetyRequested = self:ConsumeWorkerRequest("Safety")
-	local autoDrinkRequested = self:ConsumeWorkerRequest("AutoDrink")
-	local autoEatRequested = self:ConsumeWorkerRequest("AutoEat")
+	local safetyRequested, safetyRequest = self:ConsumeWorkerRequest("Safety")
+	local autoDrinkRequested, autoDrinkRequest = self:ConsumeWorkerRequest("AutoDrink")
+	local autoEatRequested, autoEatRequest = self:ConsumeWorkerRequest("AutoEat")
 
 	if autoDrinkRequested
 		and self.Authority
 		and self.Authority.currentOwner == "Water" then
-		mmbTaskDefer(function()
-			pcall(autoDrinkStep)
-		end)
+		self:DispatchWorkerRequest("AutoDrink", autoDrinkRequest, autoDrinkStep)
 	end
 
 	if autoEatRequested
 		and self.Authority
 		and self.Authority.currentOwner == "Food" then
-		mmbTaskDefer(function()
-			pcall(autoEatStep)
-		end)
+		self:DispatchWorkerRequest("AutoEat", autoEatRequest, autoEatStep)
 	end
 
-	local undergroundDrinkProtected =
-		state.undergroundDrinkTerrainProtected
-		and state.undergroundDrinkTerrainProtected(context.character)
+	local verifiedSafetyNeed = self.Authority
+		and self.Authority:SafetyHazard(context)
 		or false
-
-	local verifiedSafetyNeed = not undergroundDrinkProtected and (
-		(context.inVoid and not undergroundDrinkProtected)
-		or context.buried
-		or (
-			context.dangerousWater
-				and not context.intentionalWaterTransit
-				and not context.drinkingProtected
-		)
-		or context.dinoRockTrapped
-		or context.dinoShorelineFoodDeadlock
-		or forcingPostDrinkMove
-		or (state.dinoPostDrinkExit and state.dinoPostDrinkExit.active)
-		or (
-			context.healthFraction <= 0.35
-			and not (
-				state.survivalCriticalVitalOwnsLowHealth
-				and state.survivalCriticalVitalOwnsLowHealth(context.character, context)
-			)
-		)
-		or (
-			context.healthRate < -0.8
-			and not (
-				state.survivalCriticalVitalOwnsLowHealth
-				and state.survivalCriticalVitalOwnsLowHealth(context.character, context)
-			)
-		)
-	)
 	if safetyRequested
+		and self:WorkerRequestCurrent(safetyRequest)
 		and verifiedSafetyNeed
 		and self.MovementManager:IsOwnerEnabled("Safety", context) then
 		self.SurvivalManager:Act(
@@ -75440,7 +76872,7 @@ ai.Telemetry:Push("Supervisor", "decision", {
 	reason = "local heuristic agent initialized",
 	result = ai.Capabilities.Game,
 	debounce = 4,
-}, "ai-online", "Supervisor Authority 4.0 online - single-owner movement + serialized handoffs")
+}, "ai-online", "Supervisor Authority 5.5 online - stable single-owner transactions")
 end)()
 
 -- Current watchdog adapters added after the Codex branch.
@@ -82874,20 +84306,25 @@ task.spawn(function()
 			local loopDt = state.questSwimActive and 0.03 or 0.05
 
 			if landMove and humanoid then
-				local velocity = root.AssemblyLinearVelocity
-				local planarSpeed = Vector3.new(velocity.X, 0, velocity.Z).Magnitude
 				local movementState = state.getCharacterMovementState(character)
 				local correctLandState = type(movementState) == "string"
 					and state.questLandMovementStates[movementState] == true
+				local validLandSteer = state.questLandPermanentWHasFreshSteer
+					and state.questLandPermanentWHasFreshSteer(character, 0.30)
 
-				if planarSpeed >= 3
-					and not correctLandState
+				if validLandSteer
+					and state.questLandPermanentWAllowed()
+					and (not correctLandState or root.Anchored or humanoid.PlatformStand
+						or character:GetAttribute("MovementDisabled") == true)
 					and tick() - autoRunLastLocomotionRepairAt >= 0.35 then
 
 					autoRunLastLocomotionRepairAt = tick()
 					pcall(function()
-						humanoid.PlatformStand = false
-						character:SetAttribute("MovementDisabled", false)
+						if root.Anchored then root.Anchored = false end
+						if humanoid.PlatformStand then humanoid.PlatformStand = false end
+						if character:GetAttribute("MovementDisabled") == true then
+							character:SetAttribute("MovementDisabled", false)
+						end
 					end)
 					blockClientSubState = false
 					setSubState(state.questMoveSubState or "Running")
